@@ -13748,6 +13748,34 @@ class EVBotSpec(MixFiles):
         self.assertEqual(_arbbot.parlay_slip_link(cfg, "DraftKings", legs),
                          "https://sportsbook.draftkings.com/event/31234?outcomes=0QA1%2311_1+0QA2%2322_2")
 
+    def test_draftkings_links_can_join_their_legs_four_ways(self):
+        legs = ["https://sportsbook.draftkings.com/event/31234?outcomes=0QA1%2311_1",
+                "https://sportsbook.draftkings.com/event/31299?outcomes=0QA2%2322_2"]
+        base = "https://sportsbook.draftkings.com/event/31234?"
+        want = {"plus": "outcomes=0QA1%2311_1+0QA2%2322_2", "encoded": "outcomes=0QA1%2311_1%2B0QA2%2322_2",
+                "comma": "outcomes=0QA1%2311_1,0QA2%2322_2", "repeat": "outcomes=0QA1%2311_1&outcomes=0QA2%2322_2"}
+        for how, query in want.items():
+            cfg = Config(parlay_link_books="draftkings", parlay_dk_format=how)
+            self.assertEqual(_arbbot.parlay_slip_link(cfg, "DraftKings", legs), base + query)
+        with self.assertRaises(ValueError):
+            Config(parlay_dk_format="semicolon").check()
+
+    def test_the_draftkings_link_test_uses_two_real_bets_from_different_games(self):
+        def game(gid, oid):
+            return {"id": gid, "sport_key": "basketball_nba", "commence_time": "2026-10-20T23:00:00Z",
+                    "home_team": "H", "away_team": "A",
+                    "bookmakers": [{"key": "draftkings", "title": "DraftKings", "sid": f"ev{gid}", "markets": [
+                        {"key": "h2h", "outcomes": [{"name": "H", "price": 1.9, "sid": oid}]}]}]}
+        class Api:
+            calls = []
+            def odds(self, sport, until, markets=None, since=None, kind="odds"):
+                Api.calls.append((sport, markets))
+                return [game("g1", "o1"), game("g1", "o9"), game("g2", "o2")] if sport == "americanfootball_nfl" else []
+        found = _arbbot.test_dk_links(Config(sports=["americanfootball_nfl", "basketball_nba"]), Api())
+        self.assertEqual([how for how, _ in found], list(_arbbot.DK_FORMATS))
+        self.assertEqual(dict(found)["comma"], "https://sportsbook.draftkings.com/event/evg1?outcomes=o1,o2")
+        self.assertEqual(Api.calls, [("americanfootball_nfl", "h2h")])                     # found in the first sport
+
     def test_the_parlay_card_shows_the_one_link(self):
         legs = [ev_leg(g, {"FanDuel": 2.20}) for g in ("g1", "g2")]
         [p] = find_parlays(legs, Config(parlay_min_ev_pct=1, parlay_leg_min_ev_pct=1, parlay_max_legs=2))

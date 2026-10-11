@@ -440,6 +440,9 @@ class Config:
     # Parlay cards at these books get one link that puts every leg in the bet slip (PARLAY_LINK_BOOKS=fanduel,draftkings).
     # The books don't document a multi-leg link, so each can be turned off here if its link stops working. Empty = off.
     parlay_link_books: str = ""
+    # How a DraftKings parlay link joins its legs' outcome ids (DraftKings doesn't document it; --test-dk-links posts
+    # one link of each kind to try): plus ("a+b"), encoded ("a%2Bb"), comma ("a,b") or repeat ("outcomes=a&outcomes=b").
+    parlay_dk_format: str = "plus"
     results_site_repo: str = ""
     results_site_token: str = ""
     reaction_minutes: int = 10
@@ -712,6 +715,7 @@ class Config:
             backup_webhook_url=e("DISCORD_BACKUP_WEBHOOK_URL", ""),
             results_site_repo=e("RESULTS_SITE_REPO", "").strip(),
             parlay_link_books=e("PARLAY_LINK_BOOKS", "").strip().lower(),
+            parlay_dk_format=(e("PARLAY_DK_FORMAT") or "plus").strip().lower(),
             results_site_token=e("RESULTS_SITE_TOKEN", "").strip(),
             reaction_minutes=num("REACTION_MINUTES", d.reaction_minutes, int),
             tune_slow_still_pct=num("TUNE_SLOW_STILL_PCT", d.tune_slow_still_pct, float),
@@ -856,6 +860,8 @@ class Config:
                              f"and TUNE_CLV_BOOST={self.tune_clv_boost:g} at least 1")
         if not 0 < self.same_game_stake <= 1 or self.same_game_full < 0 or self.same_game_max < 0:
             raise ValueError("SAME_GAME_STAKE should be over 0 and at most 1, SAME_GAME_FULL and SAME_GAME_MAX 0 or more")
+        if self.parlay_dk_format not in DK_FORMATS:
+            raise ValueError(f"PARLAY_DK_FORMAT={self.parlay_dk_format} should be one of {', '.join(DK_FORMATS)}")
         if self.tune_since:
             try:
                 date.fromisoformat(self.tune_since)
@@ -1643,14 +1649,19 @@ def _fanduel_slip(links: list[str]) -> str:
     return "https://sportsbook.fanduel.com/addToBetslip?" + urllib.parse.urlencode(params)
 
 
-def _draftkings_slip(links: list[str]) -> str:
-    """DraftKings: every leg's outcome id in one link's outcomes, joined with "+"."""
+DK_FORMATS = ("plus", "encoded", "comma", "repeat")
+
+
+def _draftkings_slip(links: list[str], how: str = "plus") -> str:
+    """DraftKings: every leg's outcome id in one link (on the first leg's game page), joined the PARLAY_DK_FORMAT way."""
     outcomes = [_query(link).get("outcomes") for link in links]
     if not all(outcomes):
         return ""
-    game = urllib.parse.urlsplit(links[0]).path.rstrip("/").rsplit("/", 1)[-1]
-    joined = "+".join(urllib.parse.quote(o, safe="") for o in outcomes)
-    return f"https://sportsbook.draftkings.com/event/{urllib.parse.quote(game, safe='')}?outcomes={joined}"
+    game = urllib.parse.quote(urllib.parse.urlsplit(links[0]).path.rstrip("/").rsplit("/", 1)[-1], safe="")
+    ids = [urllib.parse.quote(o, safe="") for o in outcomes]
+    query = ("&".join(f"outcomes={i}" for i in ids) if how == "repeat"
+             else "outcomes=" + {"plus": "+", "encoded": "%2B", "comma": ","}[how].join(ids))
+    return f"https://sportsbook.draftkings.com/event/{game}?{query}"
 
 
 # One bet-slip link for a whole parlay, from its legs' own bet-slip links, by book (PARLAY_LINK_BOOKS turns each on).
@@ -1663,7 +1674,31 @@ def parlay_slip_link(cfg: Config, book: str, links: list[str]) -> str:
     build = SLIP_BUILDERS.get(slug)
     if not build or slug not in {book_slug(b) for b in _csv(cfg.parlay_link_books)} or not all(links):
         return ""
-    return build(links)
+    return _draftkings_slip(links, cfg.parlay_dk_format) if slug == "draftkings" else build(links)
+
+
+def test_dk_links(cfg: Config, api: "OddsAPI") -> list[tuple[str, str]]:
+    """--test-dk-links: two real DraftKings bets from different upcoming games (moneylines, 1 credit per sport asked),
+    joined into one bet-slip link each PARLAY_DK_FORMAT way, to find the one that fills the slip. [(format, link)]."""
+    dk = replace(cfg, bookmakers="draftkings")
+    now = datetime.now(timezone.utc)
+    legs: list[tuple[str, str]] = []   # (game id, the bet's own link)
+    for sport in [sp for sp in cfg.sports if not sp.startswith("mma")]:
+        for ev in api.odds(sport, now + timedelta(hours=72), markets="h2h", since=now, kind="test"):
+            for bm in ev.get("bookmakers", []):
+                for mkt in bm.get("markets", []):
+                    oc = (mkt.get("outcomes") or [None])[0]
+                    link = book_link(ev, bm, mkt, oc, dk) if oc else ""
+                    if _query(link).get("outcomes") and ev["id"] not in {g for g, _ in legs}:
+                        legs.append((ev["id"], link))
+            if len(legs) >= 2:
+                break
+        if len(legs) >= 2:
+            break
+    if len(legs) < 2:
+        return []
+    links = [link for _, link in legs[:2]]
+    return [(how, _draftkings_slip(links, how)) for how in DK_FORMATS]
 
 
 def _feed_link_only(ev: dict, bm: dict, mkt: dict, oc: dict) -> str:
@@ -11441,6 +11476,8 @@ def main() -> None:
     p.add_argument("--demo", action="store_true", help="use bundled sample data (no API key needed)")
     p.add_argument("--dry-run", action="store_true", help="print alerts instead of sending to Discord")
     p.add_argument("--test-discord", action="store_true", help="send one sample alert to Discord and exit")
+    p.add_argument("--test-dk-links", action="store_true",
+                   help="post 4 DraftKings parlay links (each joining 2 real bets a different way) to the testing channel")
     p.add_argument("--set", metavar="KEY=VALUE", action="append",
                    help="change a setting in .env, e.g. --set MY_BOOKS=fanduel,draftkings (repeatable)")
     p.add_argument("--set-webhook", choices=sorted(WEBHOOK_SETTINGS), metavar="CHANNEL",
@@ -11512,7 +11549,7 @@ def main() -> None:
                     if u.startswith("https://")), "")   # a placeholder status URL falls back, like Status
         interactive = (args.dry_run, args.demo, args.once, args.plan, args.results, args.test_discord,
                        args.post_guide, args.post_results, args.check_kalshi, args.check_props, args.check_upcoming,
-                       args.weekly, args.post_weekly)
+                       args.weekly, args.post_weekly, args.test_dk_links)
         if url.startswith("https://") and not any(interactive):   # the service: say why it stopped
             try:
                 _webhook(url, {"username": BOT_NAME, "content": f"🔴 Bot stopped: bad setting in .env: {ex}. "
@@ -11541,6 +11578,20 @@ def main() -> None:
 
     if args.test_discord:
         send_samples(cfg)
+        return
+
+    if args.test_dk_links:
+        found = test_dk_links(cfg, OddsAPI(replace(cfg, bookmakers="draftkings")))
+        if not found:
+            sys.exit("Couldn't find two DraftKings bets with bet-slip links in upcoming games. Try again later.")
+        text = ("🧪 **DraftKings parlay link test** (2 real bets from different games; don't place it, just look at the "
+                "slip). Tap each and tell Claude which one puts BOTH bets in the slip:\n"
+                + "\n".join(f"**{i}. {how}:** <{link}>" for i, (how, link) in enumerate(found, 1)))
+        url = cfg.test_webhook_url or cfg.status_webhook_url or cfg.webhook_url
+        print(re.sub(r"\*\*|<|>", "", text))
+        if url:
+            _webhook(url, {"username": BOT_NAME, "content": text[:1990]})
+            print("Posted to the testing channel." if cfg.test_webhook_url else "Posted to the status channel.")
         return
 
     if not args.demo and not cfg.api_key:
