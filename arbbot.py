@@ -441,7 +441,9 @@ class Config:
     # The books don't document a multi-leg link, so each can be turned off here if its link stops working. Empty = off.
     parlay_link_books: str = ""
     # How a DraftKings parlay link joins its legs' outcome ids (DraftKings doesn't document it; --test-dk-links posts
-    # one link of each kind to try): plus ("a+b"), encoded ("a%2Bb"), comma ("a,b") or repeat ("outcomes=a&outcomes=b").
+    # one link of each kind to try). Web links: plus ("a+b"), encoded ("a%2Bb"), comma ("a,b"), repeat
+    # ("outcomes=a&outcomes=b"). App links (dksb://, through the results site's go.html, since Discord only links
+    # web addresses): app-plus, app-comma, app-encoded.
     parlay_dk_format: str = "plus"
     results_site_repo: str = ""
     results_site_token: str = ""
@@ -1649,18 +1651,29 @@ def _fanduel_slip(links: list[str]) -> str:
     return "https://sportsbook.fanduel.com/addToBetslip?" + urllib.parse.urlencode(params)
 
 
-DK_FORMATS = ("plus", "encoded", "comma", "repeat")
+DK_FORMATS = ("plus", "encoded", "comma", "repeat", "app-plus", "app-comma", "app-encoded")
+DK_JOIN = {"plus": "+", "encoded": "%2B", "comma": ","}
 
 
-def _draftkings_slip(links: list[str], how: str = "plus") -> str:
-    """DraftKings: every leg's outcome id in one link (on the first leg's game page), joined the PARLAY_DK_FORMAT way."""
+def dk_app_link(outcomes: list[str], how: str, go: str) -> str:
+    """The DraftKings app's own add-to-slip link (dksb://sb/addbet/...) for these outcome ids, joined the `how` way,
+    wrapped in the results site's go.html (go: its address), which opens the app: Discord doesn't link dksb:// itself."""
+    ids = [urllib.parse.quote(o, safe="") for o in outcomes]
+    app = "dksb://sb/addbet/" + DK_JOIN[how.removeprefix("app-")].join(ids)
+    return f"{go}?to={urllib.parse.quote(app, safe='')}" if go else ""
+
+
+def _draftkings_slip(links: list[str], how: str = "plus", go: str = "") -> str:
+    """DraftKings: every leg's outcome id in one link (on the first leg's game page, or the app's own link through
+    go.html), joined the PARLAY_DK_FORMAT way."""
     outcomes = [_query(link).get("outcomes") for link in links]
     if not all(outcomes):
         return ""
+    if how.startswith("app-"):
+        return dk_app_link(outcomes, how, go)
     game = urllib.parse.quote(urllib.parse.urlsplit(links[0]).path.rstrip("/").rsplit("/", 1)[-1], safe="")
     ids = [urllib.parse.quote(o, safe="") for o in outcomes]
-    query = ("&".join(f"outcomes={i}" for i in ids) if how == "repeat"
-             else "outcomes=" + {"plus": "+", "encoded": "%2B", "comma": ","}[how].join(ids))
+    query = ("&".join(f"outcomes={i}" for i in ids) if how == "repeat" else "outcomes=" + DK_JOIN[how].join(ids))
     return f"https://sportsbook.draftkings.com/event/{game}?{query}"
 
 
@@ -1674,7 +1687,9 @@ def parlay_slip_link(cfg: Config, book: str, links: list[str]) -> str:
     build = SLIP_BUILDERS.get(slug)
     if not build or slug not in {book_slug(b) for b in _csv(cfg.parlay_link_books)} or not all(links):
         return ""
-    return _draftkings_slip(links, cfg.parlay_dk_format) if slug == "draftkings" else build(links)
+    if slug == "draftkings":
+        return _draftkings_slip(links, cfg.parlay_dk_format, go_url(cfg))
+    return build(links)
 
 
 def test_dk_links(cfg: Config, api: "OddsAPI") -> list[tuple[str, str]]:
@@ -1698,7 +1713,12 @@ def test_dk_links(cfg: Config, api: "OddsAPI") -> list[tuple[str, str]]:
     if len(legs) < 2:
         return []
     links = [link for _, link in legs[:2]]
-    return [(how, _draftkings_slip(links, how)) for how in DK_FORMATS]
+    go = go_url(cfg)
+    if not go:   # (no results site: only the web links can be tried)
+        return [(how, _draftkings_slip(links, how)) for how in DK_FORMATS if not how.startswith("app-")]
+    first = _query(links[0])["outcomes"]
+    return ([("app, 1 bet (does the app open with it in the slip?)", dk_app_link([first], "app-plus", go))]
+            + [(how, _draftkings_slip(links, how, go)) for how in DK_FORMATS if how.startswith("app-")])
 
 
 def _feed_link_only(ev: dict, bm: dict, mkt: dict, oc: dict) -> str:
@@ -11229,12 +11249,19 @@ def send_backup(cfg: Config, day: date) -> None:
 
 SITE_AT = dtime(1, 20)   # New York time: after the day's results card and the backup
 SITE_PAGE = "site/index.html"   # the page itself, kept with the code so it changes with it
+SITE_FILES = ("index.html", "go.html")   # site/ files uploaded with it (go.html: opens app links from Discord)
 
 
 def site_url(cfg: Config) -> str:
     """The public results page's address (GitHub Pages of RESULTS_SITE_REPO), or "" when there's none."""
     owner, _, name = cfg.results_site_repo.partition("/")
     return f"https://{owner.lower()}.github.io/{name}/" if owner and name else ""
+
+
+def go_url(cfg: Config) -> str:
+    """The results site's go.html (opens app links Discord can't), or "" without a results site."""
+    url = site_url(cfg)
+    return f"{url}go.html" if url else ""
 
 
 def site_link(cfg: Config) -> str:
@@ -11305,9 +11332,10 @@ def site_due(cfg: Config, now: datetime) -> date | None:
 def publish_site(cfg: Config, day: date, now: datetime | None = None) -> int:
     """Upload the page and its data to RESULTS_SITE_REPO; returns how many bets it shows."""
     data = site_data(cfg, now)
-    page = HERE / SITE_PAGE
-    if page.exists():
-        github_put(cfg, "index.html", page.read_bytes(), f"Page updated ({day})")
+    for name in SITE_FILES:
+        page = HERE / "site" / name
+        if page.exists():
+            github_put(cfg, name, page.read_bytes(), f"{name} updated ({day})")
     github_put(cfg, "results.json", json.dumps(data, indent=1).encode(), f"Results through {day}")
     marker = data_path(cfg.state_dir) / "site_day.txt"
     marker.parent.mkdir(parents=True, exist_ok=True)
@@ -11584,8 +11612,9 @@ def main() -> None:
         found = test_dk_links(cfg, OddsAPI(replace(cfg, bookmakers="draftkings")))
         if not found:
             sys.exit("Couldn't find two DraftKings bets with bet-slip links in upcoming games. Try again later.")
-        text = ("🧪 **DraftKings parlay link test** (2 real bets from different games; don't place it, just look at the "
-                "slip). Tap each and tell Claude which one puts BOTH bets in the slip:\n"
+        text = ("🧪 **DraftKings parlay link test** (real bets from different games; don't place it, just look at the "
+                "slip). Tap each on your phone and tell Claude which ones open the DraftKings app, and which puts BOTH "
+                "bets in the slip:\n"
                 + "\n".join(f"**{i}. {how}:** <{link}>" for i, (how, link) in enumerate(found, 1)))
         url = cfg.test_webhook_url or cfg.status_webhook_url or cfg.webhook_url
         print(re.sub(r"\*\*|<|>", "", text))

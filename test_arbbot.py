@@ -13632,7 +13632,8 @@ class EVBotSpec(MixFiles):
         with mock.patch("arbbot._github", gh):
             _arbbot.publish_site(cfg, date(2026, 10, 10), now)
         self.assertEqual([(m, p.rsplit("/", 1)[1]) for m, p, _ in calls],
-                         [("GET", "index.html"), ("PUT", "index.html"), ("GET", "results.json"), ("PUT", "results.json")])
+                         [("GET", "index.html"), ("PUT", "index.html"), ("GET", "go.html"), ("PUT", "go.html"),
+                          ("GET", "results.json"), ("PUT", "results.json")])
         self.assertEqual(calls[1][2], ["content", "message", "sha"])
         self.assertIsNone(_arbbot.site_due(cfg, now))                               # done today
         self.assertIsNone(_arbbot.site_due(cfg, datetime(2026, 10, 11, 4, 0, tzinfo=timezone.utc)))   # midnight NY
@@ -13772,9 +13773,30 @@ class EVBotSpec(MixFiles):
                 Api.calls.append((sport, markets))
                 return [game("g1", "o1"), game("g1", "o9"), game("g2", "o2")] if sport == "americanfootball_nfl" else []
         found = _arbbot.test_dk_links(Config(sports=["americanfootball_nfl", "basketball_nba"]), Api())
-        self.assertEqual([how for how, _ in found], list(_arbbot.DK_FORMATS))
+        self.assertEqual([how for how, _ in found], ["plus", "encoded", "comma", "repeat"])   # no results site: web only
         self.assertEqual(dict(found)["comma"], "https://sportsbook.draftkings.com/event/evg1?outcomes=o1,o2")
         self.assertEqual(Api.calls, [("americanfootball_nfl", "h2h")])                     # found in the first sport
+        site = Config(sports=["americanfootball_nfl"], results_site_repo="joeybuffo10-wq/ev-bot-results")
+        app = dict(_arbbot.test_dk_links(site, Api()))
+        go = "https://joeybuffo10-wq.github.io/ev-bot-results/go.html?to="
+        self.assertEqual(len(app), 4)
+        self.assertEqual(app["app, 1 bet (does the app open with it in the slip?)"], go + "dksb%3A%2F%2Fsb%2Faddbet%2Fo1")
+        self.assertEqual(app["app-comma"], go + "dksb%3A%2F%2Fsb%2Faddbet%2Fo1%2Co2")
+        self.assertEqual(app["app-plus"], go + "dksb%3A%2F%2Fsb%2Faddbet%2Fo1%2Bo2")
+
+    def test_draftkings_app_links_go_through_the_results_site(self):
+        import urllib.parse
+        legs = ["https://sportsbook.draftkings.com/event/31234?outcomes=0QA1%2311_1",
+                "https://sportsbook.draftkings.com/event/31299?outcomes=0QA2%2322_2"]
+        cfg = Config(parlay_link_books="draftkings", parlay_dk_format="app-comma",
+                     results_site_repo="joeybuffo10-wq/ev-bot-results")
+        link = _arbbot.parlay_slip_link(cfg, "DraftKings", legs)
+        to = urllib.parse.parse_qs(urllib.parse.urlsplit(link).query)["to"][0]
+        self.assertTrue(link.startswith("https://joeybuffo10-wq.github.io/ev-bot-results/go.html?to="))
+        self.assertEqual(to, "dksb://sb/addbet/0QA1%2311_1,0QA2%2322_2")                # (ids kept intact)
+        self.assertEqual(_arbbot.parlay_slip_link(replace(cfg, results_site_repo=""), "DraftKings", legs), "")
+        page = (Path(_arbbot.__file__).parent / "site" / "go.html").read_text()
+        self.assertIn("^dksb:\\/\\/sb\\/addbet\\/", page)                          # only DraftKings app links
 
     def test_the_parlay_card_shows_the_one_link(self):
         legs = [ev_leg(g, {"FanDuel": 2.20}) for g in ("g1", "g2")]
