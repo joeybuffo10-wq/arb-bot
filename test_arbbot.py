@@ -161,7 +161,7 @@ class FindArbs(unittest.TestCase):
     def test_guide(self):
         from arbbot import guide_payload
         g = guide_payload()["embeds"][0]
-        for word in ("+EV", "Outlier", "Parlay", "GONE", "Units", "Confidence"):
+        for word in ("+EV", "Outlier", "Parlay", "GONE", "Stake", "Confidence"):
             self.assertIn(word, g["description"])
 
     def test_live_arb_needs_fresh_prices_on_both_sides(self):
@@ -625,9 +625,9 @@ class PlusEV(unittest.TestCase):
         [b] = find_evs([ev], EVCFG, NOW)
         self.assertEqual("📈 Home ML +110 · B", ev_payload(b)["embeds"][0]["title"])
         desc = ev_payload(b)["embeds"][0]["description"]
-        # Oct 11, short: the game and when, the bet, its units (1u = 1% of $1,000) and confidence. Nothing else.
+        # Oct 11, short: the game and when, the bet, its stake in dollars and units (1u = 1% of $1,000) and confidence.
         self.assertEqual(desc, "🏟️ **Test** · Away @ Home\n⏰ Starts <t:1791050400:t> (<t:1791050400:R>)\n\n"
-                               "**Home ML +110**\n**1.1u** · 🟡 Confidence: Medium")
+                               "**Home ML +110**\n**$11 (1.1u)** · 🟡 Confidence: Medium")
         for gone in ("DO THIS", "won't win every time", "+EV = better price", "Can't use that book",
                      "skip if the price", "other books mostly agree"):
             self.assertNotIn(gone, desc)
@@ -6104,7 +6104,7 @@ class PropsInLocks(MixFiles):
         self.assertIn("🟢 Confidence: High", card["description"])                  # (just the rating on the card)
         self.assertEqual(_arbbot.sources_line(b), "Sources: median of 5 books (no Pinnacle price)")
         self.assertEqual(b.stake, kelly_stake(0.5, 2.20, self.locks(), 0.7))   # 30% smaller, high = full
-        self.assertIn("Lower confidence already means fewer units.", _arbbot.GUIDE)
+        self.assertIn("Lower confidence already means a smaller stake.", _arbbot.GUIDE)
         # ...and only a lock when every point is there.
         five = {k: v for k, v in LOCK_SIX.items() if k != "BetRivers"}             # 5 sportsbooks
         apart = dict(LOCK_SIX, BetMGM=(1.944, 1.869), **{"ESPN BET": (1.944, 1.869)}, Caesars=(1.869, 1.944),
@@ -8046,7 +8046,7 @@ class KalshiDepth(unittest.TestCase):
         [b] = find_evs([ev], cfg, NOW, kalshi={"e1": {"Home": KalshiQuote(0.445, 0.44, 0.45, 30)}})   # $13.50 there
         self.assertEqual(b.stake, 10.0)                                    # rounded down to $5s, never over
         desc = ev_payload(b)["embeds"][0]["description"]
-        self.assertIn("**Home ML +114**\n**1u**", desc)
+        self.assertIn("**Home ML +114**\n**$10 (1u)**", desc)
         self.assertIn("↳ Kalshi only has about $13 at this price; the rest would fill at a worse price.",
                       _arbbot.kalshi_room_line(b.kalshi_room))
         [deep] = find_evs([ev], cfg, NOW, kalshi={"e1": {"Home": KalshiQuote(0.445, 0.44, 0.45, 1000)}})
@@ -9290,14 +9290,14 @@ class UnitsOnCards(MixFiles):
     def test_every_bet_card_shows_units_and_arbs_stay_in_dollars(self):
         ev = ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"B": [("Home", 2.10, None)]})
         [b] = find_evs([ev], EVCFG, NOW)
-        self.assertIn("**Home ML +110**\n**1.1u**", ev_payload(b)["embeds"][0]["description"])
+        self.assertIn("**Home ML +110**\n**$11 (1.1u)**", ev_payload(b)["embeds"][0]["description"])
         self.assertIn("→ stake $11 (1.1u)", _arbbot.format_ev_text(b))
         [o] = find_outliers([outlier_event(1.85, 1.95)], Config(round_stakes=0), NOW)
-        self.assertRegex(outlier_payload(o)["embeds"][0]["description"], r"\*\*\d+(\.\d)?u\*\*")
+        self.assertRegex(outlier_payload(o)["embeds"][0]["description"], r"\*\*\$\d+ \(\d+(\.\d)?u\)\*\*")
         [p] = find_parlays([ev_leg("g1", {"DK": 2.20}), ev_leg("g2", {"DK": 2.20})],
                            Config(parlay_min_ev_pct=1, parlay_leg_min_ev_pct=1, round_stakes=0))
         self.assertEqual(p.stake_label, f"${p.stake:g} ({p.stake / 10:g}u)")
-        self.assertIn(f"**{_arbbot.units(p.stake, p.unit_size)}**", parlay_payload(p)["embeds"][0]["description"])
+        self.assertIn(f"**{p.stake_label}**", parlay_payload(p)["embeds"][0]["description"])
         [arb] = find_arbs(demo_events(live_arb=False), Config())
         self.assertNotRegex(discord_payload(arb)["embeds"][0]["description"], r"\du\b")
 
@@ -13201,7 +13201,7 @@ class EVBotSpec(MixFiles):
         self.main(t, [self.game({"B": 2.50})], 60)                               # +25%: was a new ping
         self.assertEqual([(m, c) for m, _, c, *_ in sent], [("POST", ""), ("PATCH", "")])   # no new alert...
         self.assertEqual(sent[1][1], sent[0][1])                                 # ...the card as it went out,
-        self.assertIn("**Home ML +120**\n**1.6u**", self.bodies[1])              # at its odds and stake,
+        self.assertIn("**Home ML +120**\n**$16 (1.6u)**", self.bodies[1])       # at its odds and stake,
         self.assertNotIn("+150", self.bodies[1])                                # not the better price
         self.assertIn("✅ **Still good** at B", self.bodies[1])                  # only its ✅ line is new
         self.main(t, [self.game({"B": 2.50})], 90)
@@ -13845,6 +13845,88 @@ class EVBotSpec(MixFiles):
         [b] = find_evs([ev], Config(min_ev_pct=3), NOW)
         a.handle([b], now=1000)
         self.assertEqual(_arbbot.parlay_bets(a), [])
+
+    # ---- Oct 11: last call, morning digest, free channel, weekly social post
+    def test_a_still_good_card_says_starts_soon_near_kickoff(self):
+        sent = []
+        t = self.live(sent, one_alert_per_bet=True, outliers_enabled=False, last_call_minutes=30)
+        self.main(t, [self.game({"B": 2.20})], 0)                                  # 6h before the game
+        self.main(t, [self.game({"B": 2.20})], 60)                                 # ✅ line
+        self.assertNotIn("Starts soon", self.bodies[-1])
+        self.main(t, [self.game({"B": 2.20})], 6 * 3600 - 20 * 60)               # 20 minutes to go
+        self.assertIn("✅ **Still good** at B\n⏰ **Starts soon**", self.bodies[-1])
+        n = len(sent)
+        self.main(t, [self.game({"B": 2.20})], 6 * 3600 - 10 * 60)
+        self.assertEqual(len(sent), n)                                             # said once: no more edits
+        self.assertEqual([c for _, _, c, *_ in sent[1:]], [""] * (len(sent) - 1))  # edits never ping
+        self.assertEqual(_arbbot.status_line("moved soon", "B"), _arbbot.status_line("moved", "B"))
+
+    def test_the_morning_digest_lists_the_bets_still_good(self):
+        sent = []
+        t = self.live(sent, one_alert_per_bet=True, outliers_enabled=False, digest_hour=10)
+        self.main(t, [self.game({"B": 2.20}), self.game({"B": 2.20}, ev_id="e2")], 0)
+        self.main(t, [self.game({"B": 2.20}), self.game({"B": 1.95, "C": 2.10}, ev_id="e2")], 60)   # e2 moved at B
+        text = _arbbot.digest_text(t.cfg, t, at(120))
+        self.assertTrue(text.startswith("☀️ **Still good this morning** (1 bet, earliest first):"), text)
+        self.assertIn("Home ML +120", text)
+        self.assertIn("**$16 (1.6u)** — Away @ Home", text)
+        self.assertEqual(_arbbot.digest_text(t.cfg, t, _parse(self.PRE) + timedelta(minutes=1)), "")   # started
+        nine, ten = datetime(2026, 10, 3, 13, 0, tzinfo=timezone.utc), datetime(2026, 10, 3, 14, 5, tzinfo=timezone.utc)
+        self.assertIsNone(_arbbot.digest_due(t.cfg, nine))                         # 9am New York: not yet
+        self.assertEqual(_arbbot.digest_due(t.cfg, ten), date(2026, 10, 3))
+        from unittest import mock
+        posts = []
+        with mock.patch("arbbot._webhook", lambda url, payload, *a, **k: posts.append((url, payload))):
+            self.assertEqual(_arbbot.send_digest(t.cfg, t, date(2026, 10, 3), at(120)), 1)
+        self.assertEqual(posts[0][1]["allowed_mentions"], {"parse": []})           # no ping
+        self.assertIsNone(_arbbot.digest_due(t.cfg, ten))                          # once a day
+        self.assertIsNone(_arbbot.digest_due(replace(t.cfg, digest_hour=-1), ten))
+
+    def test_the_free_channel_only_gets_picks_once_their_games_started(self):
+        cfg, res, sent = self.results(free_webhook_url="https://free", free_cta="Join: example.com")
+        ev = ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"B": [("Home", 2.20, None)]},
+                      start="2026-10-03T18:00:00Z")
+        ev["id"], ev["sport_key"] = "g1", "icehockey_nhl"
+        [b] = find_evs([ev], cfg, _parse("2026-10-03T17:00:00Z"))
+        EVAlerter(cfg, dry_run=True).handle([b], now=_parse("2026-10-03T17:00:00Z").timestamp())   # alerted 1h before
+        before = _parse("2026-10-03T17:59:00Z")
+        self.assertEqual(_arbbot.free_teasers(cfg, before), [])                    # still bettable: never
+        lines = _arbbot.free_teasers(cfg, _parse("2026-10-03T18:05:00Z"))
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(lines[0], "🔒 Members got **Home ML +120** at B 1h before the game (Away @ Home)")
+        self.assertEqual(_arbbot.free_teasers(cfg, _parse("2026-10-03T18:10:00Z")), [])  # once
+        from unittest import mock
+        posts = []
+        with mock.patch("arbbot._webhook", lambda url, payload, *a, **k: posts.append((url, payload))):
+            _arbbot.send_teasers(cfg, lines)
+        self.assertEqual(posts[0][0], "https://free")
+        self.assertTrue(posts[0][1]["content"].endswith("\n\nJoin: example.com"))
+
+    def test_the_free_channel_gets_the_results_card_without_members(self):
+        from unittest import mock
+        cfg, res, sent = self.results(free_webhook_url="https://free", free_cta="Join: example.com")
+        self.log(cfg, "g1", "2026-10-03T18:00:00Z")
+        Path(cfg.state_dir).mkdir(parents=True, exist_ok=True)
+        _arbbot.taken_path(cfg).write_text(json.dumps({"g1|h2h|Home|": {"start": "2026-10-03T18:00:00Z",
+                                                                         "users": {"u1": "Joey"}}}))
+        free = []
+        with mock.patch("arbbot._webhook", lambda url, payload, *a, **k: free.append((url, payload))):
+            res.daily(self.scores({"g1": (4, 2)}), date(2026, 10, 3), datetime(2026, 10, 4, 4, 40, tzinfo=timezone.utc))
+        self.assertIn("Joey", sent[0]["description"])                              # members' card: the leaderboard
+        [(url, payload)] = [x for x in free if x[0] == "https://free"]
+        self.assertNotIn("Joey", payload["embeds"][0]["description"])             # free: no members' names
+        self.assertTrue(payload["embeds"][0]["description"].endswith("Join: example.com"))
+
+    def test_the_weekly_social_post_is_ready_to_copy(self):
+        cfg, res, sent = self.results(results_site_repo="joeybuffo10-wq/ev-bot-results")
+        self.log(cfg, "g1", "2026-10-03T18:00:00Z")
+        settle_pending(cfg, self.scores({"g1": (4, 2)}), datetime(2026, 10, 4, 4, 0, tzinfo=timezone.utc))
+        text = _arbbot.social_text(cfg, date(2026, 10, 5))
+        self.assertIn("EV BOT · week of Sep 28–Oct 4", text)
+        self.assertIn("1-0 · +", text)
+        self.assertIn("https://joeybuffo10-wq.github.io/ev-bot-results/", text)
+        self.assertTrue(text.startswith("📣 **Weekly post, ready to copy:**\n```"))
+        self.assertIn("no graded bets", _arbbot.social_text(cfg, date(2026, 9, 1)))
 
     # ---- Tuning from the record (TUNE_ENABLED)
     def tuned(self, markouts=(), clv=(), **kw):

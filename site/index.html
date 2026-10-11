@@ -45,6 +45,8 @@
   .r-push { color: var(--push); }
   .fine { color: var(--muted); font-size: 13px; }
   .empty { color: var(--muted); padding: 24px 0; text-align: center; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin-bottom: 16px; }
+  .grid .card { margin-bottom: 0; }
 </style>
 </head>
 <body>
@@ -61,6 +63,13 @@
     <h2>Profit over time (units)</h2>
     <svg id="chart" viewBox="0 0 600 180" preserveAspectRatio="none" role="img" aria-label="Cumulative profit in units"></svg>
   </div>
+
+  <div class="card">
+    <h2>Closing-line value over time (average so far)</h2>
+    <svg id="clvchart" viewBox="0 0 600 180" preserveAspectRatio="none" role="img" aria-label="Average CLV over time"></svg>
+  </div>
+
+  <div class="grid" id="breakdowns"></div>
 
   <div class="card tablewrap">
     <table>
@@ -165,6 +174,77 @@
     svg.appendChild(line);
   }
 
+  function line(svgId, pts, color) {
+    var svg = document.getElementById(svgId);
+    svg.textContent = "";
+    if (pts.length < 2) return;
+    var lo = Math.min(0, Math.min.apply(null, pts)), hi = Math.max(0, Math.max.apply(null, pts));
+    var span = hi - lo || 1, W = 600, H = 180, pad = 8;
+    function x(i) { return i / (pts.length - 1) * W; }
+    function y(v) { return pad + (hi - v) / span * (H - 2 * pad); }
+    var zero = document.createElementNS("http://www.w3.org/2000/svg", "line");
+    [["x1", 0], ["x2", W], ["y1", y(0)], ["y2", y(0)], ["stroke", "var(--muted)"], ["stroke-opacity", ".4"],
+     ["stroke-dasharray", "4 4"], ["vector-effect", "non-scaling-stroke"]].forEach(function (a) {
+      zero.setAttribute(a[0], a[1]);
+    });
+    svg.appendChild(zero);
+    var path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    path.setAttribute("d", pts.map(function (v, i) { return (i ? "L" : "M") + x(i).toFixed(1) + "," + y(v).toFixed(1); }).join(""));
+    path.setAttribute("fill", "none");
+    path.setAttribute("stroke", color);
+    path.setAttribute("stroke-width", "2");
+    path.setAttribute("vector-effect", "non-scaling-stroke");
+    svg.appendChild(path);
+  }
+
+  function clvChart(bets) {
+    var sum = 0, n = 0, pts = [];
+    bets.forEach(function (b) {
+      if (b.clv === null || b.clv === undefined) return;
+      sum += b.clv; n++; pts.push(sum / n);
+    });
+    line("clvchart", pts, pts.length && pts[pts.length - 1] >= 0 ? "var(--win)" : "var(--loss)");
+  }
+
+  var MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  function breakdowns(bets) {
+    var box = document.getElementById("breakdowns");
+    box.textContent = "";
+    [["By bet type", function (b) { return b.type; }],
+     ["By sport", function (b) { return b.sport; }],
+     ["By book", function (b) { return b.book; }],
+     ["By month", function (b) { return MONTHS[+b.date.slice(5, 7) - 1] + " " + b.date.slice(0, 4); }]
+    ].forEach(function (spec) {
+      var groups = {};
+      bets.forEach(function (b) {
+        var k = spec[1](b), g = groups[k] || (groups[k] = { w: 0, l: 0, p: 0, staked: 0, profit: 0 });
+        if (b.result === "win") g.w++; else if (b.result === "loss") g.l++; else g.p++;
+        if (b.result !== "push") g.staked += b.units;
+        g.profit += b.profit;
+      });
+      var names = Object.keys(groups);
+      if (!names.length) return;
+      if (spec[0] === "By month") names.sort(function (a, b) {
+        return a.slice(-4) - b.slice(-4) || MONTHS.indexOf(a.slice(0, 3)) - MONTHS.indexOf(b.slice(0, 3)); });
+      else names.sort(function (a, b) { return groups[b].profit - groups[a].profit; });
+      var card = el("div", { "class": "card tablewrap" });
+      card.appendChild(el("h2", null, spec[0]));
+      var t = el("table"), head = el("tr");
+      ["", "Record", "Units", "ROI"].forEach(function (h, i) { head.appendChild(el("th", i > 1 ? { "class": "num" } : null, h)); });
+      var thead = el("thead"); thead.appendChild(head); t.appendChild(thead);
+      var body = el("tbody");
+      names.forEach(function (k) {
+        var g = groups[k], tr = el("tr");
+        tr.appendChild(el("td", null, k));
+        tr.appendChild(el("td", null, g.w + "-" + g.l + (g.p ? "-" + g.p : "")));
+        tr.appendChild(el("td", { "class": "num " + cls(g.profit) }, units(g.profit)));
+        tr.appendChild(el("td", { "class": "num " + cls(g.profit) }, g.staked ? pct(g.profit / g.staked * 100) : "—"));
+        body.appendChild(tr);
+      });
+      t.appendChild(body); card.appendChild(t); box.appendChild(card);
+    });
+  }
+
   function table(bets) {
     var body = document.getElementById("rows");
     body.textContent = "";
@@ -190,7 +270,7 @@
     buttons("types", TYPES, state.type, function (v) { state.type = v; });
     buttons("ranges", RANGES, state.days, function (v) { state.days = v; });
     var bets = chosen();
-    stats(bets); chart(bets); table(bets);
+    stats(bets); chart(bets); clvChart(bets); breakdowns(bets); table(bets);
   }
 
   fetch("results.json", { cache: "no-store" }).then(function (r) { return r.json(); }).then(function (data) {

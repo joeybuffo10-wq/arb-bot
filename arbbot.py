@@ -182,6 +182,7 @@ WEBHOOK_SETTINGS = {
     "results": ("DISCORD_RESULTS_WEBHOOK_URL", "bet results (what hit and what missed)"),
     "test": ("DISCORD_TEST_WEBHOOK_URL", "sample alerts from --test-discord (nothing else)"),
     "backup": ("DISCORD_BACKUP_WEBHOOK_URL", "a nightly copy of the betting record (keep this channel private)"),
+    "free": ("DISCORD_FREE_WEBHOOK_URL", "the free preview: nightly results, and picks once their games start"),
 }
 
 
@@ -440,6 +441,18 @@ class Config:
     # Parlay cards at these books get one link that puts every leg in the bet slip (PARLAY_LINK_BOOKS=fanduel,draftkings).
     # The books don't document a multi-leg link, so each can be turned off here if its link stops working. Empty = off.
     parlay_link_books: str = ""
+    # ONE_ALERT_PER_BET: this many minutes before its game, a still-good card gets "⏰ Starts soon" (an edit: no ping).
+    last_call_minutes: int = 0
+    # A morning message (this New York hour) in the +EV channel listing every open bet still at a good price, no
+    # ping (-1 = off).
+    digest_hour: int = -1
+    # A free preview channel (DISCORD_FREE_WEBHOOK_URL): each night's results card (without members' names), and each
+    # pick once its game has started ("🔒 members got this 3h before the game"), never while it can still be bet.
+    # FREE_CTA: a line added to those posts, e.g. how to join.
+    free_webhook_url: str = ""
+    free_cta: str = ""
+    # Mondays: a short copy-ready summary of last week for social media, in the testing (else status) channel.
+    social_weekly: bool = False
     # How a DraftKings parlay link joins its legs' outcome ids (DraftKings doesn't document it; --test-dk-links posts
     # one link of each kind to try). Web links: plus ("a+b"), encoded ("a%2Bb"), comma ("a,b"), repeat
     # ("outcomes=a&outcomes=b"). App links (dksb://, through the results site's go.html, since Discord only links
@@ -717,6 +730,11 @@ class Config:
             backup_webhook_url=e("DISCORD_BACKUP_WEBHOOK_URL", ""),
             results_site_repo=e("RESULTS_SITE_REPO", "").strip(),
             parlay_link_books=e("PARLAY_LINK_BOOKS", "").strip().lower(),
+            last_call_minutes=num("LAST_CALL_MINUTES", d.last_call_minutes, int),
+            digest_hour=num("DIGEST_HOUR", d.digest_hour, int),
+            free_webhook_url=e("DISCORD_FREE_WEBHOOK_URL", ""),
+            free_cta=e("FREE_CTA", "").strip(),
+            social_weekly=e("SOCIAL_WEEKLY", "false").lower() in ("1", "true", "yes"),
             parlay_dk_format=(e("PARLAY_DK_FORMAT") or "plus").strip().lower(),
             results_site_token=e("RESULTS_SITE_TOKEN", "").strip(),
             reaction_minutes=num("REACTION_MINUTES", d.reaction_minutes, int),
@@ -1044,7 +1062,8 @@ class Config:
                           ("status_webhook_url", "DISCORD_STATUS_WEBHOOK_URL"),
                           ("results_webhook_url", "DISCORD_RESULTS_WEBHOOK_URL"),
                           ("test_webhook_url", "DISCORD_TEST_WEBHOOK_URL"),
-                          ("backup_webhook_url", "DISCORD_BACKUP_WEBHOOK_URL")):
+                          ("backup_webhook_url", "DISCORD_BACKUP_WEBHOOK_URL"),
+                          ("free_webhook_url", "DISCORD_FREE_WEBHOOK_URL")):
             value = getattr(self, attr)
             if value and not value.startswith(("https://", "http://")):
                 bad.append(env)
@@ -3172,6 +3191,10 @@ class Alerter:
             return
         price = next((pr for bk, pr, *_ in item.board if bk == sent.book), None)
         status = "ok" if price is not None and _printed(price) >= _printed(item.worst_ok_price()) else "moved"
+        mins = self.cfg.last_call_minutes   # (LAST_CALL_MINUTES: "⏰ Starts soon" once the game is that close)
+        if status == "ok" and mins and not getattr(item, "is_live", False) and getattr(item, "commence_time", ""):
+            if _parse_time(item.commence_time).timestamp() - now <= mins * 60:
+                status += " soon"
         if status != op.status:
             op.status, op.edited = status, now
             self._discord(op.render(sent, first_seen=op.first_seen, status=status), op.message_id, op.url)
@@ -4525,15 +4548,18 @@ STATUS_LINES = {"ok": "✅ **Still good** at {book}",
 
 
 def status_line(status: str, book: str) -> str:
-    return STATUS_LINES[status].format(book=book) if status in STATUS_LINES else ""
+    """The card's ✅ / ⚠️ line ("ok" / "moved"), with "⏰ Starts soon" under a still-good one near kickoff ("ok soon")."""
+    base, *more = status.split() or [""]
+    if base not in STATUS_LINES:
+        return ""
+    return STATUS_LINES[base].format(book=book) + ("\n⏰ **Starts soon**" if base == "ok" and "soon" in more else "")
 
 
 def bet_lines(b: EVBet, status: str = "", note: str = "") -> str:
-    """A bet card's whole text: the game and when it starts, the bet and its odds, the units (dollars without a unit
-    size) and confidence, then the ✅ / ⚠️ line once it has one, and a warning when there is one."""
+    """A bet card's whole text: the game and when it starts, the bet and its odds, the stake ("$11 (1.1u)") and
+    confidence, then the ✅ / ⚠️ line once it has one, and a warning when there is one."""
     game = f"{sport_icon(b.sport_key)} **{b.sport}** · {b.matchup}\n{_when(b.is_live, b.commence_time)}"
-    size = units(b.stake, b.unit_size) if b.unit_size > 0 else money(b.stake)
-    bet = (f"**{b.pick} {odds(b.price)}**{ALT_NOTE if b.alt else ''}\n**{size}**"
+    bet = (f"**{b.pick} {odds(b.price)}**{ALT_NOTE if b.alt else ''}\n**{b.stake_label}**"
            + (f" · {confidence_line(b.confidence)}" if b.confidence else ""))
     return "\n\n".join(x for x in (game, bet, status_line(status, b.book), note) if x)
 
@@ -5900,8 +5926,7 @@ def parlay_payload(p: Parlay, mention: str = "", gone_after: float | None = None
         + ("🔴 LIVE" if b.is_live else f"<t:{int(_parse_time(b.commence_time).timestamp())}:t>")
         for i, (b, pr, ln) in enumerate(p.legs))
     one = f"🔗 **[Add all {len(p.legs)} legs to the {p.book} bet slip]({slip})**\n\n" if slip else ""
-    size = units(p.stake, p.unit_size) if p.unit_size > 0 else money(p.stake)
-    return _card(f"📦 {len(p.legs)}-leg parlay · {p.book} · {odds(p.price)}", f"{one}{legs}\n\n**{size}**",
+    return _card(f"📦 {len(p.legs)}-leg parlay · {p.book} · {odds(p.price)}", f"{one}{legs}\n\n**{p.stake_label}**",
                  0x9B59B6, url=slip, mention=mention)
 
 
@@ -7228,7 +7253,7 @@ def day_clv_line(rows: list[dict]) -> str:
 
 
 def results_payload(cfg: Config, title_prefix: str, rows: list[dict], day_rows: list[dict],
-                    day, now: datetime | None = None) -> dict:
+                    day, now: datetime | None = None, members: bool = True, cta: str = "") -> dict:
     """A results card: the given bets one by one, then the day's record."""
     now = now or datetime.now(timezone.utc)
     shown = rows[:20]
@@ -7241,8 +7266,8 @@ def results_payload(cfg: Config, title_prefix: str, rows: list[dict], day_rows: 
                                  if graded else "")
     arbs = arbs_on(cfg, day)
     clv = day_clv_line(day_rows)
-    members = members_lines(cfg, day_rows)
-    link = site_link(cfg)
+    members = members_lines(cfg, day_rows) if members else ""   # (the free channel: no members' names)
+    link = site_link(cfg) + (f"\n{cta}" if cta else "")
     desc = (body + DIVIDER + f"**{day:%a %b %-d}** (every alert at the stake it showed)\n"
             + day_summary(day_rows, cfg, now) + (f"\n{clv}" if clv else "") + (f"\n{arbs}" if arbs else "")
             + (f"\n\n{members}" if members else "") + (f"\n\n{link}" if link else ""))
@@ -7527,6 +7552,13 @@ class Results:
             if not self.send(results_payload(self.cfg, f"📅 Results for {day:%a %b %-d}", rows, rows, day, now)):
                 return "failed"
             outcome = "sent"
+            if finished and self.cfg.free_webhook_url and not self.dry_run:   # (the free preview: the same card)
+                try:
+                    _webhook(self.cfg.free_webhook_url, results_payload(
+                        self.cfg, f"📅 Results for {day:%a %b %-d}", rows, rows, day, now, members=False,
+                        cta=self.cfg.free_cta))
+                except Exception as e:  # noqa: BLE001 - the free channel never holds up the members' card
+                    print(f"  ! Free channel: {e!r:.150}", file=sys.stderr)
         self.mark([r for r in _read_csv(self.cfg.ev_results_file) if local_day(self.cfg, r["commence_time"]) == day])
         if finished:
             self.recap_days = sorted(set(self.recap_days) | {day.isoformat()})[-14:]
@@ -7546,6 +7578,11 @@ class Results:
         self.weekly_tried = time.time()
         if not self.send(weekly_payload(self.cfg, day, held)):
             return "failed"
+        if self.cfg.social_weekly and not self.dry_run and (url := self.cfg.test_webhook_url or self.cfg.status_webhook_url):
+            try:
+                _webhook(url, {"username": BOT_NAME, "content": social_text(self.cfg, day)[:1990]})
+            except Exception as e:  # noqa: BLE001
+                print(f"  ! Weekly social post: {e!r:.150}", file=sys.stderr)
         self.weekly_days = sorted(set(self.weekly_days) | {day.isoformat()})[-8:]
         self._save(now)
         return "sent"
@@ -9861,7 +9898,7 @@ GUIDE = """**Each alert is one bet. Tap the title to open it at the book, bet th
 📦 **Parlay** (purple): 2-3 bets on one ticket at one book. Tap 🔗 to put every leg in the slip at once. Every leg must win.
 "1H" / "1Q" means first half / first quarter. Team totals are a team's own points.
 
-**Units:** bet the units shown (1u = your unit). Lower confidence already means fewer units.
+**Stake:** bet the amount shown, e.g. $11 (1.1u): the same stake in dollars and units. Lower confidence already means a smaller stake.
 **Confidence:** 🟢 High, 🟡 Medium. Each card says which.
 **✅ Still good / ⚠️ Price moved:** the line under a card after it goes out. ⚠️ means don't bet it now.
 **✅ reaction:** tap it after you place a bet, so the results show what members took.
@@ -10776,6 +10813,7 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
     beat = 0.0                          # last uptime ping (HEALTHCHECK_URL)
     backup_tried = 0.0                  # last nightly backup attempt (DISCORD_BACKUP_WEBHOOK_URL)
     site_tried = 0.0                    # last public results page update (RESULTS_SITE_*)
+    teased = 0.0                        # last free-channel teaser pass (DISCORD_FREE_WEBHOOK_URL)
 
     def update_parlays() -> int:
         open_bets = parlay_bets(ev_alerter, prop_evs, out_alerter, prop_outs)
@@ -11070,6 +11108,18 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
                 print(f"  🗄️ Backup of the betting record posted for {day}", flush=True)
             except Exception as e:  # noqa: BLE001 - a backup must never stop the bot
                 results_warned = results_trouble(status, e, results_warned, what="post the nightly backup")
+        if not (args.once or args.dry_run) and (day := digest_due(cfg, now)):
+            try:
+                print(f"  ☀️ Morning digest: {send_digest(cfg, t, day, now)} bets still good", flush=True)
+            except Exception as e:  # noqa: BLE001 - never stops the bot
+                results_warned = results_trouble(status, e, results_warned, what="post the morning digest")
+        if not (args.once or args.dry_run) and cfg.free_webhook_url and time.time() - teased > 300:
+            teased = time.time()
+            try:
+                if lines := free_teasers(cfg, now):
+                    send_teasers(cfg, lines)
+            except Exception as e:  # noqa: BLE001
+                results_warned = results_trouble(status, e, results_warned, what="post to the free channel")
         if not (args.once or args.dry_run) and (day := site_due(cfg, now)) and time.time() - site_tried > 3600:
             site_tried = time.time()
             try:
@@ -11175,6 +11225,34 @@ SITE_PAGE = "site/index.html"   # the page itself, kept with the code so it chan
 SITE_FILES = ("index.html", "go.html")   # site/ files uploaded with it (go.html: opens app links from Discord)
 
 
+def week_numbers(cfg: Config, end_day: date) -> dict:
+    """Last week's graded pre-game bets (the 7 days before end_day): record, units, ROI, CLV."""
+    start = end_day - timedelta(days=7)
+    rows = [r for r in bettable(cfg, _graded(cfg)) if start <= local_day(cfg, r["commence_time"]) < end_day]
+    unit = cfg.unit() or 1.0
+    w = sum(r["result"] == "win" for r in rows)
+    l = sum(r["result"] == "loss" for r in rows)
+    staked = sum(float(r["stake"]) for r in rows if r["result"] != "push")
+    profit = sum(float(r["profit"]) for r in rows)
+    clv = [float(r["clv_pct"]) for r in rows if r.get("clv_pct") not in ("", None)]
+    return {"start": start, "end": end_day - timedelta(days=1), "n": len(rows), "w": w, "l": l, "p": len(rows) - w - l,
+            "units": profit / unit, "roi": profit / staked * 100 if staked else 0.0,
+            "clv": sum(clv) / len(clv) if clv else None, "beat": sum(c > 0 for c in clv) / len(clv) * 100 if clv else None}
+
+
+def social_text(cfg: Config, end_day: date) -> str:
+    """SOCIAL_WEEKLY: last week in a few lines, ready to copy to X / Instagram."""
+    n = week_numbers(cfg, end_day)
+    if not n["n"]:
+        return f"📣 Weekly post: no graded bets {n['start']:%b %-d}–{n['end']:%b %-d}."
+    lines = [f"{BOT_NAME} · week of {n['start']:%b %-d}–{n['end']:%b %-d}",
+             f"{n['w']}-{n['l']}" + (f"-{n['p']}" if n["p"] else "") + f" · {n['units']:+.1f} units · ROI {n['roi']:+.1f}%"]
+    if n["clv"] is not None:
+        lines.append(f"Beat the closing line on {n['beat']:.0f}% of bets (avg CLV {n['clv']:+.1f}%)")
+    lines.append("Every bet tracked, wins and losses" + (f": {site_url(cfg)}" if site_url(cfg) else "."))
+    return "📣 **Weekly post, ready to copy:**\n```\n" + "\n".join(lines) + "\n```"
+
+
 def site_url(cfg: Config) -> str:
     """The public results page's address (GitHub Pages of RESULTS_SITE_REPO), or "" when there's none."""
     owner, _, name = cfg.results_site_repo.partition("/")
@@ -11264,6 +11342,114 @@ def publish_site(cfg: Config, day: date, now: datetime | None = None) -> int:
     marker.parent.mkdir(parents=True, exist_ok=True)
     marker.write_text(day.isoformat())
     return len(data["bets"])
+
+
+# --------------------------------------------------------------------------- morning digest, free-channel teasers
+
+def digest_text(cfg: Config, t: "Trackers", now: datetime) -> str:
+    """DIGEST_HOUR: every bet card still open, before its game, and still at a good price (not ⚠️), in one message:
+    "• 🏀 Lakers ML +110 · DraftKings · 1.1u — Nuggets @ Lakers, 7:30 PM". "" when there's none."""
+    lines = []
+    for a in (t.evs, t.prop_evs, t.period_evs, t.outs, t.prop_outs, t.period_outs):
+        for op in a.open.values():
+            b = op.sent_item or op.arb
+            if not (op.sent and op.message_id) or op.status.startswith("moved") or not hasattr(b, "pick"):
+                continue
+            if b.is_live or _parse_time(b.commence_time) <= now:
+                continue
+            ts = int(_parse_time(b.commence_time).timestamp())
+            lines.append((ts, f"• {sport_icon(b.sport_key)} {_link(f'{b.pick} {odds(b.price)}', b.link)} · {b.book} · "
+                              f"**{b.stake_label}** — {b.matchup}, <t:{ts}:t>"))
+    if not lines:
+        return ""
+    lines.sort()
+    shown = [line for _, line in lines[:25]]
+    more = f"\n…and {len(lines) - 25} more in the channel." if len(lines) > 25 else ""
+    return (f"☀️ **Still good this morning** ({len(lines)} bet{'s' if len(lines) != 1 else ''}, earliest first):\n"
+            + "\n".join(shown) + more)[:1990]
+
+
+def _day_marker(cfg: Config, name: str) -> Path | None:
+    return data_path(cfg.state_dir) / name if cfg.state_dir else None
+
+
+def digest_due(cfg: Config, now: datetime) -> date | None:
+    """The day the morning digest is owed for (from DIGEST_HOUR, once a day, remembered across restarts)."""
+    local = now.astimezone(ZoneInfo(cfg.timezone))
+    marker = _day_marker(cfg, "digest_day.txt")
+    if cfg.digest_hour < 0 or local.hour < cfg.digest_hour or marker is None:
+        return None
+    try:
+        return None if marker.exists() and marker.read_text().strip() == local.date().isoformat() else local.date()
+    except OSError:
+        return None
+
+
+def send_digest(cfg: Config, t: "Trackers", day: date, now: datetime) -> int:
+    """Post the morning digest to the +EV channel (no ping) and remember the day; returns how many bets it listed."""
+    text = digest_text(cfg, t, now)
+    if text:
+        _webhook(cfg.ev_webhook_url or cfg.webhook_url, {"username": BOT_NAME, "content": text,
+                                                         "allowed_mentions": {"parse": []}})
+    marker = _day_marker(cfg, "digest_day.txt")
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(day.isoformat())
+    return text.count("\n• ") + text.startswith("• ")
+
+
+FREE_TEASER_HOURS = 3   # a pick is shown in the free channel up to this many hours after its game started
+
+
+def free_teasers(cfg: Config, now: datetime) -> list[str]:
+    """DISCORD_FREE_WEBHOOK_URL: picks whose games have just started (never before: nothing a free member could bet),
+    each once (state/free_posted.json): "🔒 Members got Lakers ML +110 at DraftKings 3h 20m before the game"."""
+    if not (cfg.free_webhook_url and cfg.state_dir):
+        return []
+    path = data_path(cfg.state_dir) / "free_posted.json"
+    try:
+        posted = json.loads(path.read_text()) if path.exists() else {}
+    except (OSError, ValueError):
+        posted = {}
+    lines = []
+    for bid, r in logged_bets(cfg, since=now - timedelta(hours=FREE_TEASER_HOURS)).items():
+        start = _parse_time(r["commence_time"])
+        if bid in posted or not (start <= now < start + timedelta(hours=FREE_TEASER_HOURS)):
+            continue
+        posted[bid] = r["commence_time"]
+        if str(r.get("live")).lower() == "true" or not r.get("first_seen"):
+            continue
+        ahead = (start - _parse_time(r["first_seen"])).total_seconds()
+        if ahead <= 0:
+            continue
+        pick = r.get("outcome", "") if r.get("kind") == "parlay" else row_pick(r)
+        lines.append(f"🔒 Members got **{pick} {odds(float(r['price']))}** at {r['book']} "
+                     f"{_fmt_ahead(ahead)} before the game ({r.get('matchup', '')})")
+    cutoff = now - timedelta(days=3)
+    posted = {k: v for k, v in posted.items() if _parse_time(v) > cutoff}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(posted))
+    tmp.replace(path)
+    return lines
+
+
+def _fmt_ahead(secs: float) -> str:
+    """"45 min", "3h 20m", "2 days"."""
+    if secs < 3600:
+        return f"{max(1, round(secs / 60))} min"
+    if secs < 86400:
+        h, m = divmod(round(secs / 60), 60)
+        return f"{h}h {m:02d}m" if m else f"{h}h"
+    return f"{secs / 86400:.0f} days"
+
+
+def send_teasers(cfg: Config, lines: list[str]) -> None:
+    """Post the free channel's teasers, up to 15 lines a message, with FREE_CTA under the last one."""
+    for i in range(0, len(lines), 15):
+        chunk = lines[i:i + 15]
+        last = i + 15 >= len(lines)
+        text = "\n".join(chunk) + (f"\n\n{cfg.free_cta}" if last and cfg.free_cta else "")
+        _webhook(cfg.free_webhook_url, {"username": BOT_NAME, "content": text[:1990], "allowed_mentions": {"parse": []}})
 
 
 HEARTBEAT_SECONDS = 300
