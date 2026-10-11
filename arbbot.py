@@ -4555,13 +4555,19 @@ def status_line(status: str, book: str) -> str:
     return STATUS_LINES[base].format(book=book) + ("\n⏰ **Starts soon**" if base == "ok" and "soon" in more else "")
 
 
+def fair_value_line(fair_prob: float) -> str:
+    """"📊 Fair value **+100** · 50.0% to win": what the bet's odds should be, from the sharp price (or the other books')."""
+    return f"📊 Fair value **{odds(1 / fair_prob)}** · {fair_prob:.1%} to win" if fair_prob > 0 else ""
+
+
 def bet_lines(b: EVBet, status: str = "", note: str = "") -> str:
     """A bet card's whole text: the game and when it starts, the bet and its odds, the stake ("$11 (1.1u)") and
     confidence, then the ✅ / ⚠️ line once it has one, and a warning when there is one."""
     game = f"{sport_icon(b.sport_key)} **{b.sport}** · {b.matchup}\n{_when(b.is_live, b.commence_time)}"
     # (The stake as a heading: big, so it's the first thing anyone sees.)
     bet = (f"**{b.pick} {odds(b.price)}**{ALT_NOTE if b.alt else ''}\n## {b.stake_label}"
-           + (f"\n{confidence_line(b.confidence)}" if b.confidence else ""))
+           + (f"\n{confidence_line(b.confidence)}" if b.confidence else "")
+           + f"\n{fair_value_line(b.fair_prob)}")
     return "\n\n".join(x for x in (game, bet, status_line(status, b.book), note) if x)
 
 
@@ -5927,7 +5933,7 @@ def parlay_payload(p: Parlay, mention: str = "", gone_after: float | None = None
         + ("🔴 LIVE" if b.is_live else f"<t:{int(_parse_time(b.commence_time).timestamp())}:t>")
         for i, (b, pr, ln) in enumerate(p.legs))
     one = f"🔗 **[Add all {len(p.legs)} legs to the {p.book} bet slip]({slip})**\n\n" if slip else ""
-    return _card(f"📦 {len(p.legs)}-leg parlay · {p.book} · {odds(p.price)}", f"{one}{legs}\n## {p.stake_label}",
+    return _card(f"📦 {len(p.legs)}-leg parlay · {p.book} · {odds(p.price)}", f"{one}{legs}\n## {p.stake_label}\n{fair_value_line(p.fair_prob)}",
                  0x9B59B6, url=slip, mention=mention)
 
 

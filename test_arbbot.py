@@ -627,7 +627,8 @@ class PlusEV(unittest.TestCase):
         desc = ev_payload(b)["embeds"][0]["description"]
         # Oct 11, short: the game and when, the bet, its stake in dollars and units (1u = 1% of $1,000) and confidence.
         self.assertEqual(desc, "🏟️ **Test** · Away @ Home\n⏰ Starts <t:1791050400:t> (<t:1791050400:R>)\n\n"
-                               "**Home ML +110**\n## $11 (1.1u)\n🟡 Confidence: Medium")
+                               "**Home ML +110**\n## $11 (1.1u)\n🟡 Confidence: Medium\n"
+                               "📊 Fair value **+100** · 50.0% to win")
         for gone in ("DO THIS", "won't win every time", "+EV = better price", "Can't use that book",
                      "skip if the price", "other books mostly agree"):
             self.assertNotIn(gone, desc)
@@ -13772,6 +13773,16 @@ class EVBotSpec(MixFiles):
         page = (Path(_arbbot.__file__).parent / "site" / "go.html").read_text()
         self.assertIn("^dksb:\\/\\/sb\\/addbet\\/", page)                          # only DraftKings app links
 
+    def test_every_bet_card_shows_its_fair_value(self):
+        odds = _arbbot.odds
+        [o] = find_outliers([outlier_event(1.85, 1.95)], Config(round_stakes=0), NOW)
+        self.assertIn(f"📊 Fair value **{odds(o.fair_odds)}** · {o.fair_prob:.1%} to win",
+                      outlier_payload(o)["embeds"][0]["description"])
+        legs = [ev_leg(g, {"FanDuel": 2.20}) for g in ("g1", "g2")]
+        [p] = find_parlays(legs, Config(parlay_min_ev_pct=1, parlay_leg_min_ev_pct=1, parlay_max_legs=2))
+        self.assertIn("📊 Fair value **+300** · 25.0% to win", parlay_payload(p)["embeds"][0]["description"])
+        self.assertEqual(_arbbot.fair_value_line(0), "")
+
     def test_the_parlay_card_shows_the_one_link(self):
         legs = [ev_leg(g, {"FanDuel": 2.20}) for g in ("g1", "g2")]
         [p] = find_parlays(legs, Config(parlay_min_ev_pct=1, parlay_leg_min_ev_pct=1, parlay_max_legs=2))
@@ -13975,7 +13986,7 @@ class EVBotSpec(MixFiles):
         [b] = _arbbot.tune_bets([b], cfg, tuning, (EVAlerter(cfg, dry_run=True),))
         self.assertEqual(b.stake, round_stake_for(before * 1.25, cfg))           # book (and its sport) boost: capped
         self.assertTrue(b.tune_note.startswith("Stake ×1.25: B beats the close (+2.2% avg CLV, 50 bets)"), b.tune_note)
-        self.assertNotIn("📊", ev_payload(b)["embeds"][0]["description"])            # (the card stays short)
+        self.assertNotIn("Stake ×", ev_payload(b)["embeds"][0]["description"])      # (the card stays short)
         cut = replace(find_evs([self.game({"B": 2.20})], cfg, NOW)[0], book="C", sport_key="icehockey_nhl")
         self.assertEqual(tuning.stake_mult(cfg, cut)[0], 0.5)
         mixed = [3.0, -3.0] * 30                                                  # no clear answer: unchanged
