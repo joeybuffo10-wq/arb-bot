@@ -1937,6 +1937,7 @@ MARKET_NAMES = {
     "player_pass_interceptions": "Interceptions Thrown", "player_rush_attempts": "Rush Attempts",
     "player_rush_reception_yds": "Rush + Rec Yards", "player_anytime_td": "Anytime TD",
     "player_rush_tds": "Rushing TDs", "player_reception_tds": "Receiving TDs",
+    "team_totals": "Team Total",
     "player_rush_longest": "Longest Rush", "player_reception_longest": "Longest Reception",
     "player_pass_rush_yds": "Pass + Rush Yards", "player_pass_rush_reception_yds": "Pass + Rush + Rec Yards",
     "player_pass_rush_reception_tds": "Pass + Rush + Rec TDs", "player_sacks": "Sacks",
@@ -6125,7 +6126,8 @@ def settle_pending(cfg: Config, api: "OddsAPI", now: datetime | None = None,
             continue   # already lost through a leg's own alert: no scores needed
         last = max(end(l) for l in legs)
         for leg in legs:
-            if leg.get("player") or is_period(leg.get("market", "")) or (r["kind"] == "parlay" and _bet_id(leg) in known):
+            if (leg.get("player") or is_period(leg.get("market", "")) or leg.get("sport_key", "").startswith("mma")
+                    or (r["kind"] == "parlay" and _bet_id(leg) in known)):
                 continue   # (props and period bets: graded from the free box score, not the paid scores)
             if recent(end(leg)) or (end(leg) <= now and recent(last)):
                 sports.add(leg["sport_key"])
@@ -6151,6 +6153,14 @@ def settle_pending(cfg: Config, api: "OddsAPI", now: datetime | None = None,
             if not recent(end(r)):
                 continue
             res, said = grade_prop(r)
+            if res is None:
+                continue
+            extra = {"actual": said}
+        elif r.get("sport_key", "").startswith("mma") and r["kind"] != "parlay":
+            # MMA: ESPN's UFC results (free; the Odds API has no MMA scores), once the card should be over.
+            if not recent(end(r)):
+                continue
+            res, said = grade_fight(r)
             if res is None:
                 continue
             extra = {"actual": said}
@@ -6374,6 +6384,8 @@ def box_supported(leg: dict) -> bool:
         return False
     if leg.get("market") == "batter_total_bases":
         return sport in BOX_SOURCES   # only MLB's own box score has total bases
+    if leg.get("market") == "team_totals":
+        return sport in ESPN_LEAGUES  # the team's final score
     return (_family(sport), leg.get("market")) in BOX_STATS
 
 
@@ -6983,6 +6995,41 @@ def grade_period(row: dict) -> tuple[tuple[str, float], str] | tuple[None, str]:
     return settle(row, home, away), f"{away:g}-{home:g}"
 
 
+def same_fighter(a: str, b: str) -> bool:
+    """The same fighter, however the two feeds spell it: the same name, or the same last name and first initial."""
+    wa, wb = _words(a), _words(b)
+    return bool(wa and wb) and (wa == wb or (wa[-1] == wb[-1] and wa[0][:1] == wb[0][:1]))
+
+
+def grade_fight(row: dict) -> tuple[tuple[str, float], str] | tuple[None, str]:
+    """An MMA moneyline from ESPN's UFC results (the Odds API has no MMA scores): ((result, profit), who won), or
+    (None, why not yet). A draw or no contest refunds a 2-way bet. Fights ESPN doesn't list wait (then: by hand)."""
+    start = _parse_time(row["commence_time"])
+    days = sorted({(start + timedelta(hours=h)).date() for h in (-12, 0, 12)})
+    for d in days:
+        try:
+            data = _espn(f"mma/ufc/scoreboard?dates={d:%Y%m%d}", ttl=600)
+        except Exception as e:  # noqa: BLE001 - ESPN down: later
+            return None, f"ESPN error: {e!r:.120}"
+        for ev in data.get("events", []):
+            for comp in ev.get("competitions", []):
+                fighters = [(c.get("athlete", {}).get("displayName", ""), bool(c.get("winner")))
+                            for c in comp.get("competitors", [])]
+                names = [n for n, _ in fighters]
+                if not (any(same_fighter(row["home_team"], n) for n in names)
+                        and any(same_fighter(row["away_team"], n) for n in names)):
+                    continue
+                if not comp.get("status", {}).get("type", {}).get("completed"):
+                    return None, "fight not over yet"
+                won = [n for n, w in fighters if w]
+                stake, price = float(row["stake"]), float(row["price"])
+                if not won:
+                    return ("push", 0.0), "draw / no contest"
+                res = "win" if same_fighter(row["outcome"], won[0]) else "loss"
+                return (res, round(stake * (price - 1) if res == "win" else -stake, 2)), f"{won[0]} won"
+    return None, "fight not found on ESPN"
+
+
 def settle_prop(row: dict, value: float) -> tuple[str, float]:
     """Over/Under the line, or Yes/No (anytime TD: at least one)."""
     point = float(row["point"]) if row.get("point") not in ("", None) else None
@@ -7004,6 +7051,12 @@ def grade_prop(row: dict) -> tuple[tuple[str, float], str] | tuple[None, str]:
         return None, f"ESPN error: {e!r:.120}"
     if box is None:
         return None, why
+    if row["market"] == "team_totals":   # (its "player" is the team: home or away, by the row's own names)
+        home = {row["home_team"]: True, row["away_team"]: False}.get(row["player"])
+        team = next((t for t in box["teams"].values() if t.get("home") is home), None) if home is not None else None
+        if team is None or team["score"] is None:
+            return None, f"no score for {row['player']} in the box score"
+        return settle_prop(row, team["score"]), f"{team['score']:g}"
     p = find_player(box, row["player"])
     if p is None:
         return None, f"{row['player']} isn't in the box score"
@@ -10724,8 +10777,10 @@ def prop_guard_text(prices_held: dict[str, int], missed: list[list[str]], sharp:
 def parlay_bets(*alerters: Alerter) -> list:
     """The bets parlays are built from: every open card of these alerters, outliers too (a leg that grew
     into an outlier is still the same bet; find_parlays applies the +EV price limits to every leg). Not a bet
-    whose own post is held because its odds were too old by then: those odds are too old for a parlay too."""
-    return [op.arb for a in alerters for op in a.open.values() if not op.deferred]
+    whose own post is held because its odds were too old by then: those odds are too old for a parlay too. Nor MMA:
+    a parlay's legs are graded from the paid scores, which have no MMA."""
+    return [op.arb for a in alerters for op in a.open.values()
+            if not op.deferred and not op.arb.sport_key.startswith("mma")]
 
 
 def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:

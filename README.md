@@ -569,6 +569,10 @@ bets (`MIN_EV_PCT`, `SPORT_MIN_EV`), the +EV channel, their own trackers, and gr
 scores (ESPN). A first-half moneyline is only compared with the sharp book's when both have the same number of
 outcomes (a 2-way line refunds a tie; a 3-way one has the draw as its own bet). Cards say "1H" / "1Q".
 
+**Team totals and MMA.** `team_totals` (a team's own points) can be a prop type; it's graded from that team's final
+score. MMA (`mma_mixed_martial_arts`) fight moneylines are graded from ESPN's UFC results, since the Odds API has no
+MMA scores (fights ESPN doesn't list are left to check by hand), and MMA never goes into parlays.
+
 **Keeping it safe.** `HEALTHCHECK_URL` (healthchecks.io) tells you when the bot stops checking in.
 `DISCORD_BACKUP_WEBHOOK_URL` gets a zipped copy of the betting record every night. The health channel is told when
 results can't be graded, when Discord refuses cards, and when updates stop reaching the server.

@@ -13761,6 +13761,67 @@ class EVBotSpec(MixFiles):
         self.assertNotIn("Add all", plain["description"])
         self.assertNotIn("url", plain)
 
+    # ---- Oct 11: team totals and MMA
+    def test_a_team_total_is_graded_from_that_teams_score(self):
+        from unittest import mock
+        box = {"final": True, "teams": {"1": {"home": True, "score": 115, "name": "LA Clippers"},
+                                        "2": {"home": False, "score": 101, "name": "Denver Nuggets"}}}
+        row = {"sport_key": "basketball_nba", "home_team": "Los Angeles Clippers", "away_team": "Denver Nuggets",
+               "commence_time": "2026-10-03T23:00:00Z", "market": "team_totals", "player": "Los Angeles Clippers",
+               "outcome": "Over", "point": "112.5", "stake": "10", "price": "1.91"}
+        with mock.patch("arbbot.game_box", return_value=(box, "")):
+            self.assertEqual(_arbbot.grade_prop(row), (("win", 9.1), "115"))     # the home team, whatever ESPN calls it
+            away = dict(row, player="Denver Nuggets", outcome="Under", point="100.5")
+            self.assertEqual(_arbbot.grade_prop(away)[0][0], "loss")              # 101
+            self.assertIsNone(_arbbot.grade_prop(dict(row, player="Somebody"))[0])
+        self.assertTrue(_arbbot.box_supported(row))
+        self.assertEqual(_arbbot.row_pick(row), "Los Angeles Clippers Over 112.5 Team Total")
+
+    def fight_data(self, completed=True, winner="Eric Nolan"):
+        return {"events": [{"competitions": [{"status": {"type": {"completed": completed}}, "competitors": [
+            {"athlete": {"displayName": "Court McGee"}, "winner": winner == "Court McGee"},
+            {"athlete": {"displayName": "Eric Nolan"}, "winner": winner == "Eric Nolan"}]}]}]}
+
+    def test_an_mma_moneyline_is_graded_from_espns_ufc_results(self):
+        from unittest import mock
+        row = {"sport_key": "mma_mixed_martial_arts", "home_team": "Eric Nolan", "away_team": "Court McGee",
+               "commence_time": "2026-10-03T22:00:00Z", "market": "h2h", "outcome": "Eric Nolan", "stake": "10",
+               "price": "2.5"}
+        with mock.patch("arbbot._espn", return_value=self.fight_data()):
+            self.assertEqual(_arbbot.grade_fight(row), (("win", 15.0), "Eric Nolan won"))
+            self.assertEqual(_arbbot.grade_fight(dict(row, outcome="Court McGee"))[0], ("loss", -10.0))
+        with mock.patch("arbbot._espn", return_value=self.fight_data(winner="")):
+            self.assertEqual(_arbbot.grade_fight(row)[0], ("push", 0.0))                 # draw / no contest
+        with mock.patch("arbbot._espn", return_value=self.fight_data(completed=False)):
+            self.assertEqual(_arbbot.grade_fight(row), (None, "fight not over yet"))
+        with mock.patch("arbbot._espn", return_value={"events": []}):
+            self.assertEqual(_arbbot.grade_fight(row), (None, "fight not found on ESPN"))
+        self.assertTrue(_arbbot.same_fighter("Alexander Hernandez", "Alex Hernandez"))
+        self.assertFalse(_arbbot.same_fighter("Alexander Hernandez", "Beneil Hernandez"))
+
+    def test_mma_bets_are_graded_without_paying_for_scores(self):
+        from unittest import mock
+        cfg, res, sent = self.results()
+        ev = ev_event([("Eric Nolan", 1.91, None), ("Court McGee", 1.91, None)], {"B": [("Eric Nolan", 2.20, None)]},
+                      start="2026-10-03T22:00:00Z")
+        ev.update(id="f1", sport_key="mma_mixed_martial_arts", home_team="Eric Nolan", away_team="Court McGee")
+        [b] = find_evs([ev], cfg, _parse("2026-10-03T21:00:00Z"))
+        EVAlerter(cfg, dry_run=True).handle([b], now=1000)
+        class Api:
+            def scores(self, sport, days_from=3):
+                raise AssertionError("no paid scores for MMA")
+        with mock.patch("arbbot._espn", return_value=self.fight_data()):
+            [row] = settle_pending(cfg, Api(), datetime(2026, 10, 4, 6, 0, tzinfo=timezone.utc))
+        self.assertEqual((row["result"], row["actual"]), ("win", "Eric Nolan won"))
+
+    def test_mma_bets_stay_out_of_parlays(self):
+        a = EVAlerter(self.cfg(Config()), dry_run=True)
+        ev = ev_event([("A", 1.91, None), ("B", 1.91, None)], {"X": [("A", 2.2, None)]})
+        ev["sport_key"] = "mma_mixed_martial_arts"
+        [b] = find_evs([ev], Config(min_ev_pct=3), NOW)
+        a.handle([b], now=1000)
+        self.assertEqual(_arbbot.parlay_bets(a), [])
+
     # ---- Tuning from the record (TUNE_ENABLED)
     def tuned(self, markouts=(), clv=(), **kw):
         from unittest import mock
