@@ -161,7 +161,7 @@ class FindArbs(unittest.TestCase):
     def test_guide(self):
         from arbbot import guide_payload
         g = guide_payload()["embeds"][0]
-        for word in ("ARB", "+EV", "OUTLIER", "GONE", "skip"):
+        for word in ("+EV", "Outlier", "Parlay", "GONE", "Units", "Confidence"):
             self.assertIn(word, g["description"])
 
     def test_live_arb_needs_fresh_prices_on_both_sides(self):
@@ -491,10 +491,10 @@ class PlusEV(unittest.TestCase):
         self.assertEqual(b.sharp_quotes, [("Pinnacle", [1.91, 1.91])])
         self.assertEqual([r[0] for r in b.board], ["B", "C", "D"])   # every book, best price first
         self.assertAlmostEqual(b.board[2][2], (0.5 * 1.80 - 1) * 100)  # negative EV shown too
-        desc = ev_payload(b)["embeds"][0]["description"]
-        self.assertIn("**Pinnacle** -110 / -110", desc)
-        self.assertIn("🟢 B — **+110** · +5.0%", desc)
-        self.assertIn("⚪ D — **-125**", desc)
+        board = _arbbot._board_lines(b)
+        self.assertEqual(b.sharp_quotes[0][0], "Pinnacle")
+        self.assertIn("🟢 B — **+110** · +5.0%", board)
+        self.assertIn("⚪ D — **-125**", board)
 
     def test_every_book_row_links_to_its_bet(self):
         ev = ev_event([("Home", 1.91, None), ("Away", 1.91, None)],
@@ -504,8 +504,8 @@ class PlusEV(unittest.TestCase):
         [b] = find_evs([ev], EVCFG, NOW)
         p = ev_payload(b)["embeds"][0]
         self.assertEqual(p["url"], "https://b.example/slip")              # title opens the best bet
-        self.assertIn("[B](https://b.example/slip) — **+110**", p["description"])
-        self.assertIn("[C](https://c.example/game) — **-105**", p["description"])
+        self.assertIn("[B](https://b.example/slip) — **+110**", _arbbot._board_lines(b))
+        self.assertIn("[C](https://c.example/game) — **-105**", _arbbot._board_lines(b))
 
     def test_fair_movement_carried(self):
         ev1 = ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"B": [("Home", 2.20, None)]})
@@ -516,7 +516,7 @@ class PlusEV(unittest.TestCase):
         a.handle([b2], now=1060)
         cur = a.open[b2.key].arb
         self.assertAlmostEqual(cur.first_fair_prob, 0.5)
-        self.assertIn("→", ev_payload(cur)["embeds"][0]["description"])
+        self.assertIn("→", _arbbot._fair_line(cur))
 
     def test_feed_freshness(self):
         from arbbot import feed_freshness
@@ -599,7 +599,7 @@ class PlusEV(unittest.TestCase):
         note_related([([ml, sp, other], a, set())])
         self.assertEqual(ml.related, ["Home -3.5"])
         self.assertEqual(other.related, [])
-        self.assertIn("Also alerted on this game: Home -3.5", ev_payload(ml)["embeds"][0]["description"])
+        self.assertNotIn("Also alerted", ev_payload(ml)["embeds"][0]["description"])   # (the console says it)
 
     def test_related_only_names_alerts_that_will_exist(self):
         from arbbot import note_related
@@ -623,13 +623,11 @@ class PlusEV(unittest.TestCase):
     def test_payload(self):
         ev = ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"B": [("Home", 2.10, None)]})
         [b] = find_evs([ev], EVCFG, NOW)
-        self.assertEqual("📈 +EV 5.0% · Home ML +110 at B", ev_payload(b)["embeds"][0]["title"])
+        self.assertEqual("📈 Home ML +110 · B", ev_payload(b)["embeds"][0]["title"])
         desc = ev_payload(b)["embeds"][0]["description"]
-        # The game and when first, the divider, then the bet: stake (1u = 1% of $1,000), odds, the pick alone.
-        self.assertEqual(desc.split("**Fair value**")[0],
-                         "🏟️ **Test** · Away @ Home\n⏰ Starts <t:1791050400:t> (<t:1791050400:R>)\n"
-                         "⏱ price was 0s old when sent\n\n\n───────────────\n\n\n"
-                         "**BET SIZE: $11 (1.1u)**\n**ODDS: +110**\n\n**Home ML**\n\n\n🟡 Confidence: Medium\n\n")
+        # Oct 11, short: the game and when, the bet, its units (1u = 1% of $1,000) and confidence. Nothing else.
+        self.assertEqual(desc, "🏟️ **Test** · Away @ Home\n⏰ Starts <t:1791050400:t> (<t:1791050400:R>)\n\n"
+                               "**Home ML +110**\n**1.1u** · 🟡 Confidence: Medium")
         for gone in ("DO THIS", "won't win every time", "+EV = better price", "Can't use that book",
                      "skip if the price", "other books mostly agree"):
             self.assertNotIn(gone, desc)
@@ -736,10 +734,9 @@ class Outliers(unittest.TestCase):
         self.assertEqual(outs[0].hedge[0][:2], ("Away", "DK"))   # best other-side price, not Pinnacle
         self.assertAlmostEqual(outs[0].hedge_pct, (1 / (1 / 1.85 + 1 / 4.00) - 1) * 100)
         title = outlier_payload(outs[0])["embeds"][0]["title"]
-        self.assertTrue(title.startswith("🚨 OUTLIER"))
+        self.assertTrue(title.startswith("🚨 ") and title.endswith(" · Stale"), title)
         d = outlier_payload(outs[0])["embeds"][0]["description"]
-        self.assertTrue(d.startswith("👉 **DO THIS NOW, before Stale fixes its price.**"))
-        self.assertIn("Want a sure profit instead?", d)
+        self.assertNotIn("sure profit", d)                       # (the card is short: no lock-in; the console has it)
 
     def test_needs_enough_books_and_edge(self):
         ev = outlier_event(1.30, 3.60)                     # only slightly off: not an outlier
@@ -1027,8 +1024,8 @@ class Parlays(unittest.TestCase):
         legs = [ev_leg("g1", {"DK": 2.40}), ev_leg("g2", {"DK": 2.40})]
         [p] = find_parlays(legs, Config(parlay_min_ev_pct=5))
         d = parlay_payload(p)["embeds"][0]
-        self.assertTrue(d["title"].startswith("📦 PARLAY"))
-        self.assertTrue(d["description"].startswith("👉 **DO THIS: one parlay ticket at DK.**"))
+        self.assertTrue(d["title"].startswith("📦 2-leg parlay · DK"), d["title"])
+        self.assertNotIn("DO THIS", d["description"])
         a = ParlayAlerter(Config(webhook_url="main", ev_webhook_url="ev"), dry_run=True)
         self.assertEqual(a.webhook_for(p), "ev")
         a2 = ParlayAlerter(Config(webhook_url="main", ev_webhook_url="ev", parlay_webhook_url="par"), dry_run=True)
@@ -1620,7 +1617,7 @@ class AlertLifecycle(unittest.TestCase):
         back = replace(b, price=2.24)
         hand_over([back], [], ev_alr, out_alr)
         ev_alr.handle([back], ["Test"], now=1200)
-        self.assertTrue(self.pings[-1][0].startswith("📈 +EV 12.0%"))
+        self.assertTrue(self.pings[-1][0].startswith("📈 Home ML +124"))
         self.assertEqual(self.pings[-1][1], "")
         self.assertAlmostEqual(ev_alr.open[b.key].alerted_pct, 15.0)
         ev_alr.handle([replace(b, price=2.32)], ["Test"], now=1300)            # 16%: an edit, no new alert
@@ -2093,8 +2090,8 @@ class ReviewFixes(unittest.TestCase):
         scan(2.10)
         scan(2.10)
         self.assertEqual([m for m, _ in self.sent], ["POST"])            # nothing changed: no edit
-        scan(1.80)                                                       # only the 'every book' list changed
-        self.assertEqual([m for m, _ in self.sent], ["POST", "PATCH"])
+        scan(1.80)                                                       # only another book: not on the card
+        self.assertEqual([m for m, _ in self.sent], ["POST"])
 
     def test_dry_run_still_prints_updates(self):
         import io, contextlib
@@ -2339,14 +2336,12 @@ class CardStability(unittest.TestCase):
             a = make()
             a.handle([bet((1.91, 1.91))], ["Test"], now=t0)
             a.handle([bet((1.89, 1.93))], ["Test"], now=t0 + 60)           # the sharp line moved
-            self.assertIn("(was", sent[-1][1])
             n = len(sent)
             b = make()                                                     # restart
             b.handle([bet((1.89, 1.93))], ["Test"], now=t0 + 120)          # same prices as before
             self.assertEqual(len(sent), n)                                 # no edit, no new alert
             b.handle([bet((1.88, 1.94))], ["Test"], now=t0 + 180)          # a real change...
-            self.assertEqual(sent[-1][0], "PATCH")
-            self.assertIn("(was -110 / -110)", sent[-1][1])                # ...keeps the original line
+            self.assertEqual(sent[-1][0], "PATCH")                         # (its stake moved with the fair price)
 
 
 class SkipLinesNeverLose(unittest.TestCase):
@@ -3289,7 +3284,7 @@ class ConsensusStake(unittest.TestCase):
         [o] = find_outliers([prop_event(books)], cfg, NOW)
         self.assertEqual(o.stake, kelly_stake(o.fair_prob, o.price, cfg, 0.7))
         self.assertLess(o.stake, kelly_stake(o.fair_prob, o.price, cfg))
-        self.assertIn("📉 No Pinnacle price: stake 30% smaller.", outlier_payload(o)["embeds"][0]["description"])
+        self.assertIn("no Pinnacle price: stake 30% smaller", o.confidence_notes)
         # Pinnacle prices it (and agrees): full stake, no note.
         priced = prop_event({"Pinnacle": (1.91, 1.91), **books})
         priced["bookmakers"][0]["key"] = "pinnacle"
@@ -3918,7 +3913,7 @@ class KalshiCrossCheck(unittest.TestCase):
         agree = {"e1": {"Home": (0.51, 0.50, 0.52)}}
         [b] = find_evs([self.ev()], cfg, NOW, kalshi=agree)
         self.assertIn("Kalshi agrees", b.confidence_notes)
-        self.assertIn("**Kalshi** 51.0% to win (buy 52¢ · sell 50¢)", ev_payload(b)["embeds"][0]["description"])
+        self.assertIn("**Kalshi** 51.0% to win (buy 52¢ · sell 50¢)", _arbbot._kalshi_line(b))
         self.assertEqual(find_evs([self.ev()], cfg, NOW, kalshi={"e1": {"Home": (0.44, 0.43, 0.45)}}), [])  # 6 pts off
         self.assertEqual(len(find_evs([self.ev()], cfg, NOW, kalshi={"e1": {"Home": (0.47, 0.46, 0.48)}})), 1)
         # 3.5 points off: too far for a game today, allowed for one more than a day out.
@@ -3937,7 +3932,7 @@ class KalshiCrossCheck(unittest.TestCase):
         self.assertEqual(len(find_outliers([ev], Config(), NOW)), 1)
         self.assertEqual(find_outliers([ev], Config(), NOW, kalshi={"e1": {"Home": (0.52, 0.51, 0.53)}}), [])
         [o] = find_outliers([ev], Config(), NOW, kalshi={"e1": {"Home": (0.77, 0.76, 0.78)}})
-        self.assertIn("**Kalshi** 77.0% to win", outlier_payload(o)["embeds"][0]["description"])
+        self.assertIn("**Kalshi** 77.0% to win", _arbbot._kalshi_line(o))
 
     def test_check_kalshi_report(self):
         import io, contextlib
@@ -4625,7 +4620,7 @@ class Markouts(unittest.TestCase):
         self.assertNotIn("BetOnline", report)
         self.assertIn("book fixed it 100%", report)
         self.assertIn("by time:", report)
-        self.assertIn("its 📏 part shows whether alert prices held up", _arbbot.guide_payload()["embeds"][0]["description"])
+        self.assertIn("pinned 📊 Scoreboard keeps the running record", _arbbot.guide_payload()["embeds"][0]["description"])
 
     def test_bets_not_cards(self):
         tr = _arbbot.MarkoutTracker(self.cfg)
@@ -5140,9 +5135,9 @@ class LiveAlertsHoldUp(MixFiles):
         self.assertIn("⏱ prices were up to 35s old when sent", discord_payload(arb)["embeds"][0]["description"])
         [b] = find_evs([age_book(ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"B": [("Home", 2.20, None)]}),
                                  "B", 20)], EVCFG, NOW)
-        self.assertIn("⏱ price was 20s old when sent", ev_payload(b)["embeds"][0]["description"])
+        self.assertIn("⏱ price was 20s old when sent", _arbbot._age_note(b.age))
         [o] = find_outliers([age_book(outlier_event(1.85, 1.95), "Stale", 40)], Config(), NOW)
-        self.assertIn("⏱ price was 40s old when sent", outlier_payload(o)["embeds"][0]["description"])
+        self.assertIn("⏱ price was 40s old when sent", _arbbot._age_note(o.age))
         self.assertEqual([_arbbot._age_note(s) for s in (600, 7200)],
                          ["\n⏱ price was 10 min old when sent", "\n⏱ price was 2h old when sent"])
         self.assertNotIn("⏱", discord_payload(replace(arb, age=None))["embeds"][0]["description"])
@@ -5648,16 +5643,11 @@ class PriceThatWillMoveFirst(MixFiles):
         self.assertEqual([c.args[0]["id"] for c in spy.call_args_list], ["e1"])
         self.assertEqual({a.market: a.tagged for a in arbs}, {"h2h": True, "totals": False})   # no Pinnacle total
 
-    def test_guide_says_when_to_bet_first_and_when_to_keep(self):
-        g = _arbbot.GUIDE
-        self.assertIn("If a bet says **Bet this one first**, place it first: it's the price that will move.", g)
-        self.assertIn('No "first" note? Place the bets back to back.', g)
-        self.assertIn('the card says when the first is still worth keeping on its own ("keep this one")', g)
-        self.assertNotIn("• Place the bets back to back.", g)
-        self.assertIn("⏱ **Price age** on a card: how long the book had shown that price", g)
-        self.assertIn("Player props don't show one", g)                          # (their books give no time per line)
-        self.assertIn("A live alert only goes out once two checks in a row", g)
-        self.assertIn("Games that haven't started come first; live alerts are kept to a few an hour.", g)
+    def test_the_guide_is_short_like_the_cards(self):
+        g = _arbbot.GUIDE   # (Oct 11: arbs are off, and cards are just the game, the bet, units and confidence)
+        self.assertTrue(g.startswith("**Each alert is one bet. Tap the title to open it at the book, bet the units shown."))
+        self.assertNotIn("ARB", g)
+        self.assertLess(len(g), 1500)
 
 
 class NewYorkCollegeGames(MixFiles):
@@ -6111,11 +6101,10 @@ class PropsInLocks(MixFiles):
                                               "6 sportsbooks price it (2 you can't bet at)",
                                               "no Pinnacle price: stake 30% smaller"])
         card = ev_payload(b)["embeds"][0]
-        self.assertIn("🟢 Confidence: High\n\n**Fair value**", card["description"])   # (just the rating on the card)
-        self.assertIn("**Sources**: median of 5 books (no Pinnacle price)", card["description"])
+        self.assertIn("🟢 Confidence: High", card["description"])                  # (just the rating on the card)
+        self.assertEqual(_arbbot.sources_line(b), "Sources: median of 5 books (no Pinnacle price)")
         self.assertEqual(b.stake, kelly_stake(0.5, 2.20, self.locks(), 0.7))   # 30% smaller, high = full
-        self.assertIn("When Pinnacle doesn't price a prop, its true odds come from the other books: the card names "
-                      "them, and the stake is 30% smaller.", _arbbot.GUIDE)
+        self.assertIn("Lower confidence already means fewer units.", _arbbot.GUIDE)
         # ...and only a lock when every point is there.
         five = {k: v for k, v in LOCK_SIX.items() if k != "BetRivers"}             # 5 sportsbooks
         apart = dict(LOCK_SIX, BetMGM=(1.944, 1.869), **{"ESPN BET": (1.944, 1.869)}, Caesars=(1.869, 1.944),
@@ -6605,7 +6594,7 @@ class PropsInLocks(MixFiles):
         [(m1, t1, _), (m2, t2, c2)] = sent
         self.assertEqual((m1, m2), ("PATCH", "POST"))
         self.assertTrue(t1.startswith("↘️ Back to a normal +EV edge"))
-        self.assertTrue(t2.startswith("📈 +EV 13.0%"))
+        self.assertTrue(t2.startswith("📈 "))
         self.assertNotIn("@here", c2)                                              # medium in locks: no ping
 
 
@@ -8057,8 +8046,9 @@ class KalshiDepth(unittest.TestCase):
         [b] = find_evs([ev], cfg, NOW, kalshi={"e1": {"Home": KalshiQuote(0.445, 0.44, 0.45, 30)}})   # $13.50 there
         self.assertEqual(b.stake, 10.0)                                    # rounded down to $5s, never over
         desc = ev_payload(b)["embeds"][0]["description"]
-        self.assertIn("**BET SIZE: $10 (1u)**\n**ODDS: +114**\n\n**Home ML**", desc)
-        self.assertIn("↳ Kalshi only has about $13 at this price; the rest would fill at a worse price.", desc)
+        self.assertIn("**Home ML +114**\n**1u**", desc)
+        self.assertIn("↳ Kalshi only has about $13 at this price; the rest would fill at a worse price.",
+                      _arbbot.kalshi_room_line(b.kalshi_room))
         [deep] = find_evs([ev], cfg, NOW, kalshi={"e1": {"Home": KalshiQuote(0.445, 0.44, 0.45, 1000)}})
         self.assertEqual((deep.stake, deep.kalshi_room), (15.0, 0.0))     # enough there: unchanged
         # Kalshi's quote on a bet somewhere else is only a second opinion: that stake isn't Kalshi's to cut.
@@ -8076,7 +8066,7 @@ class KalshiDepth(unittest.TestCase):
         self.assertGreater(full.stake, 5.2)
         self.assertEqual((o.stake, o.kalshi_room), (5.0, 10 * 0.52))
         self.assertIn("↳ Kalshi only has about $5 at this price; the rest would fill at a worse price.",
-                      outlier_payload(o)["embeds"][0]["description"])
+                      _arbbot.kalshi_room_line(o.kalshi_room))
 
     def kalshi_arb(self):
         return event({"Kalshi": [("h2h", [("Home", 2.20, None), ("Away", 1.60, None)])],
@@ -8684,11 +8674,12 @@ class ConfirmedPreGame(MixFiles):
         self.assertEqual(b.stake, kelly_stake(0.5, 2.08, self.locks()))     # normal Kelly: the smaller edge makes it
         self.assertEqual(b.stake, 9.0)                                       # smaller (a 5.5% bet: $12)
         card = ev_payload(b)["embeds"][0]
-        self.assertEqual(card["title"], "📈 +EV 4.0% ✅✅ · Home ML +108 at B")
-        self.assertIn("🟢 Confidence: High\n\n"
-                      "**✅✅ Two sharp books agree: Pinnacle and Kalshi**\n"
-                      "A smaller edge than the usual 5% is OK here: both give it almost the same chance to win "
-                      "(Pinnacle 50.0%, Kalshi 50.5%). At least +4.0% by both.", card["description"])
+        self.assertEqual(card["title"], "📈 Home ML +108 · B")
+        self.assertIn("🟢 Confidence: High", card["description"])
+        self.assertEqual("\n".join(_arbbot.confirm_lines(b)),
+                         "✅✅ Two sharp books agree: Pinnacle and Kalshi\n"
+                         "A smaller edge than the usual 5% is OK here: both give it almost the same chance to win "
+                         "(Pinnacle 50.0%, Kalshi 50.5%). At least +4.0% by both.")
         self.assertIn("\n  ✅✅ Two sharp books agree: Pinnacle and Kalshi. A smaller edge than the usual 5%",
                       _arbbot.format_ev_text(b))
         self.assertEqual(self.evs(confirm_event(), self.locks(my_books="c,d"), kalshi=AGREE), ([], {}))  # still your books only
@@ -8740,9 +8731,9 @@ class ConfirmedPreGame(MixFiles):
         [b], misses = self.evs(confirm_event(market="spreads"))
         self.assertEqual((b.pick, b.tier, b.confirm[:3], b.confidence, misses),
                          ("Home -3.5", "confirmed", ("the other books", 0.5, 5.0), "high", {}))
-        self.assertIn("**✅✅ Two sharp books agree: Pinnacle and the other books**\nA smaller edge than the usual 5% "
-                      "is OK here: both give it almost the same chance to win (Pinnacle 50.0%, the other books 50.0%). "
-                      "At least +4.0% by both.", ev_payload(b)["embeds"][0]["description"])
+        self.assertEqual(_arbbot.confirm_lines(b), ("✅✅ Two sharp books agree: Pinnacle and the other books",
+                         "A smaller edge than the usual 5% is OK here: both give it almost the same chance to win "
+                         "(Pinnacle 50.0%, the other books 50.0%). At least +4.0% by both."))
         [t], _ = self.evs(confirm_event(market="totals"))
         self.assertEqual((t.pick, t.tier), ("Over 5.5", "confirmed"))
         both = confirm_event(market="spreads", others=("C", "D", "E", "betonlineag", "lowvig"))
@@ -8768,7 +8759,7 @@ class ConfirmedPreGame(MixFiles):
             self.assertEqual((b.pick, b.tier, b.confirm[0], round(b.confirm[1], 3), misses),
                              (pick, "confirmed", "the other books", 0.568, {}), market)
             self.assertIn("both give it almost the same chance to win (Pinnacle 57.3%, the other books 56.8%). "
-                          "At least +4.0% by both.", ev_payload(b)["embeds"][0]["description"])
+                          "At least +4.0% by both.", _arbbot.confirm_lines(b)[1])
         # Pinnacle has Home at 51.3% (1.90/2.00) and the other books at 48.7%: only the Away side's 51.3%
         # would match, and that's the other side.
         mirrored = confirm_event(market="spreads", pin=(1.90, 2.00), other=(2.00, 1.90), bet=2.03)
@@ -8850,7 +8841,7 @@ class ConfirmedPreGame(MixFiles):
         self.assertEqual(self.evs(ncaa(2.08), kalshi=AGREE), ([], {}))                     # 4.0%
         [b], _ = self.evs(ncaa(2.094), kalshi=AGREE)                                      # 4.7%
         self.assertEqual((b.tier, b.confirm[:3], round(b.confirm[3], 2)), ("confirmed", ("Kalshi", 0.505, 6.0), 4.7))
-        self.assertIn("A smaller edge than the usual 6% is OK here", ev_payload(b)["embeds"][0]["description"])
+        self.assertIn("A smaller edge than the usual 6% is OK here", _arbbot.confirm_lines(b)[1])
 
     def test_the_edge_must_clear_the_floor_by_both_sharp_sources(self):
         low = {"e1": {"Home": (0.49, 0.48, 0.50)}}           # 1 point from Pinnacle's 50%, but +1.9% by its 49%
@@ -8858,7 +8849,7 @@ class ConfirmedPreGame(MixFiles):
         ok = {"e1": {"Home": (0.498, 0.49, 0.505)}}           # +3.6% by Kalshi's 49.8%
         [b], misses = self.evs(confirm_event(extra={"G": (2.075, 1.80)}), kalshi=ok)
         self.assertEqual((b.book, b.tier, round(b.confirm[3], 2), misses), ("B", "confirmed", 3.58, {}))
-        self.assertIn("(Pinnacle 50.0%, Kalshi 49.8%). At least +3.6% by both.", ev_payload(b)["embeds"][0]["description"])
+        self.assertIn("(Pinnacle 50.0%, Kalshi 49.8%). At least +3.6% by both.", _arbbot.confirm_lines(b)[1])
         self.assertEqual(b.also, [])                          # G: +3.75% by Pinnacle, +3.3% by Kalshi: not listed
         [c], _ = self.evs(confirm_event(extra={"G": (2.075, 1.80)}), kalshi=AGREE)
         self.assertEqual(c.also, [("G", 2.075)])              # (Pinnacle's 50% is the lower one: +3.75%)
@@ -9053,20 +9044,21 @@ class ConfirmedPreGame(MixFiles):
         games = [confirm_event(), confirm_event(gid="e2")]           # e2: Kalshi never has it
         self.scan(t, games, -30, AGREE)                                  # (the first look waits)
         res = self.scan(t, games, -15, AGREE)
-        self.assertEqual((res.confirmed_sent, sent), (1, [("POST", "📈 +EV 4.0% ✅✅ · Home ML +108 at B", "@here")]))
+        self.assertEqual((res.confirmed_sent, sent), (1, [("POST", "📈 Home ML +108 · B", "@here")]))
         del sent[:]
         blip = self.scan(t, games, 0, {})                              # Kalshi too slow, or too thin, this once
         self.assertEqual((blip.ev_sent, blip.confirmed_sent, blip.confirm_misses), (0, 0, {"no Kalshi price": 1}))
-        self.assertEqual([(m, title) for m, title, _ in sent], [("PATCH", "📈 +EV 4.0% ✅✅ · Home ML +108 at B")])
+        self.assertEqual(sent, [])                                       # (the card doesn't show its sources)
         [op] = t.evs.open.values()
         self.assertTrue(op.arb.kept)                                     # (no new ping for a better price either)
         self.assertIn("**✅✅ Two sharp books agree: Pinnacle and Kalshi**\nA smaller edge than the usual 5% is OK here: "
                       "both gave it almost the same chance to win when it went out. Kalshi has no price right now "
-                      "(Pinnacle 50.0%).", ev_payload(op.arb)["embeds"][0]["description"])
+                      "(Pinnacle 50.0%).", "\n".join(f"**{x}**" if i == 0 else x
+                                                      for i, x in enumerate(_arbbot.confirm_lines(op.arb))))
         back = self.scan(t, games, 15, AGREE)
         self.assertEqual((back.ev_sent, back.confirmed_sent), (0, 0))
-        self.assertEqual([m for m, *_ in sent], ["PATCH", "PATCH"])              # edits only: no GONE, no ping
-        self.assertIn("(Pinnacle 50.0%, Kalshi 50.5%)", ev_payload(t.evs.open[op.arb.key].arb)["embeds"][0]["description"])
+        self.assertEqual(sent, [])                                               # no edit, no GONE, no ping
+        self.assertIn("(Pinnacle 50.0%, Kalshi 50.5%)", _arbbot.confirm_lines(t.evs.open[op.arb.key].arb)[1])
         self.assertFalse(t.evs.open[op.arb.key].arb.kept)
         self.assertEqual([r["event_id"] for r in _read(self.files["ev_log_file"])], ["e1"])   # logged once
         # Kalshi disagreeing is another matter: the card closes.
@@ -9084,11 +9076,11 @@ class ConfirmedPreGame(MixFiles):
         del sent[:]
         res = self.scan(t, [short], 0, {})                             # F's price is missing this check
         self.assertEqual((res.ev_sent, res.confirm_misses), (0, {}))
-        self.assertEqual([m for m, *_ in sent], ["PATCH"])
+        self.assertEqual(sent, [])                                     # (the card doesn't show its sources)
         self.assertIn("Fewer than 4 other books price it right now (Pinnacle 50.0%).",
-                      ev_payload(next(iter(t.evs.open.values())).arb)["embeds"][0]["description"])
+                      _arbbot.confirm_lines(next(iter(t.evs.open.values())).arb)[1])
         self.scan(t, [full], 15, {})
-        self.assertEqual([m for m, *_ in sent], ["PATCH", "PATCH"])
+        self.assertEqual(sent, [])
         del sent[:]
         self.scan(t, [confirm_event(market="spreads", other=(1.88, 2.02))], 30, {})   # 1.9 points off: closes
         self.assertEqual([title[:6] for _, title, _ in sent if not title.startswith("💰")], ["❌ GONE"])   # (an arb now)
@@ -9160,8 +9152,7 @@ class ConfirmedPreGame(MixFiles):
 
     def test_the_pinned_guide_explains_the_card(self):
         g = _arbbot.guide_payload()["embeds"][0]["description"]
-        self.assertIn("✅✅ **Two sharp books agree** means Pinnacle and Kalshi (or Pinnacle and 4+ other books) give "
-                      "almost the same chance to win, so a smaller edge (from 3.5%) is still a lock.", g)
+        self.assertIn("**✅ Still good / ⚠️ Price moved:** the line under a card after it goes out.", g)
         self.assertLessEqual(len(g), 4096)                                   # a Discord card's limit
 
     def test_parlays_are_built_as_before(self):
@@ -9299,14 +9290,14 @@ class UnitsOnCards(MixFiles):
     def test_every_bet_card_shows_units_and_arbs_stay_in_dollars(self):
         ev = ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"B": [("Home", 2.10, None)]})
         [b] = find_evs([ev], EVCFG, NOW)
-        self.assertIn("**BET SIZE: $11 (1.1u)**\n**ODDS: +110**", ev_payload(b)["embeds"][0]["description"])
+        self.assertIn("**Home ML +110**\n**1.1u**", ev_payload(b)["embeds"][0]["description"])
         self.assertIn("→ stake $11 (1.1u)", _arbbot.format_ev_text(b))
         [o] = find_outliers([outlier_event(1.85, 1.95)], Config(round_stakes=0), NOW)
-        self.assertRegex(outlier_payload(o)["embeds"][0]["description"], r"bet \*\*\$\d+ \(\d+(\.\d)?u\)\*\*")
+        self.assertRegex(outlier_payload(o)["embeds"][0]["description"], r"\*\*\d+(\.\d)?u\*\*")
         [p] = find_parlays([ev_leg("g1", {"DK": 2.20}), ev_leg("g2", {"DK": 2.20})],
                            Config(parlay_min_ev_pct=1, parlay_leg_min_ev_pct=1, round_stakes=0))
         self.assertEqual(p.stake_label, f"${p.stake:g} ({p.stake / 10:g}u)")
-        self.assertIn(f"bet **{p.stake_label}**", parlay_payload(p)["embeds"][0]["description"])
+        self.assertIn(f"**{_arbbot.units(p.stake, p.unit_size)}**", parlay_payload(p)["embeds"][0]["description"])
         [arb] = find_arbs(demo_events(live_arb=False), Config())
         self.assertNotRegex(discord_payload(arb)["embeds"][0]["description"], r"\du\b")
 
@@ -9392,14 +9383,10 @@ class SourcesLine(MixFiles):
         from arbbot import format_ev_text, sources_line
         [b] = find_evs([self.nfl()], EVCFG, NOW, kalshi={"e1": {"Home": (0.52, 0.51, 0.53)}})
         self.assertEqual(sources_line(b), "Sources 2/2 · Pinnacle 50.0% · Kalshi 52.0%")
-        desc = ev_payload(b)["embeds"][0]["description"]
-        self.assertIn("**Fair value** +100 · 50.0% to win\n**Sources** 2/2 · Pinnacle 50.0% · Kalshi 52.0%\n"
-                      "**Pinnacle** -110 / -110", desc)
-        self.assertGreater(desc.index("**Sources**"), desc.index("───"))       # below the divider
+
         self.assertIn("(50.0%, Pinnacle no-vig)\n  Sources 2/2 · Pinnacle 50.0% · Kalshi 52.0%", format_ev_text(b))
         # The sharp's movement since the first alert stays on the card.
-        moved = replace(b, first_sharp_quotes=[("Pinnacle", [2.0, 1.8])])
-        self.assertIn("**Pinnacle** -110 / -110 *(was +100 / -125)*", ev_payload(moved)["embeds"][0]["description"])
+        self.assertNotIn("Sources", ev_payload(b)["embeds"][0]["description"])     # (the card stays short)
 
     def test_a_reference_with_no_usable_price_says_so_and_never_cuts_the_stake(self):
         from arbbot import sources_line
@@ -9459,7 +9446,6 @@ class SourcesLine(MixFiles):
                          "E": (2.20, 1.68)})
         [b] = find_evs([ev], Config().for_props(), NOW)
         self.assertEqual(sources_line(b), "Sources: median of 4 books (no Pinnacle price)")
-        self.assertIn("**Sources**: median of 4 books (no Pinnacle price)", ev_payload(b)["embeds"][0]["description"])
         [o] = find_outliers([outlier_event(1.85, 1.95)], Config(), NOW)
         self.assertEqual(sources_line(o), "")                                   # outliers say "the other N books"
         self.assertNotIn("Sources", outlier_payload(o)["embeds"][0]["description"])
@@ -9494,8 +9480,7 @@ class KalshiTieNote(unittest.TestCase):
         quotes = {"e1": {"Home": (0.445, 0.44, 0.45)}}
         cfg = Config(min_ev_pct=3, round_stakes=0)
         [b] = find_evs([self.ev_at("Kalshi")], cfg, NOW, kalshi=quotes)
-        desc = ev_payload(b)["embeds"][0]["description"]
-        self.assertIn("🟡 Confidence: Medium\n" + self.NOTE, desc)
+        self.assertEqual(_arbbot.kalshi_tie_note(b.sport_key, b.market, b.book), "\n" + self.NOTE)
         self.assertEqual(b.ev_pct, find_evs([self.ev_at("Kalshi", sport="basketball_nba")], cfg, NOW, kalshi=quotes)[0].ev_pct)
         for other in (self.ev_at("B"), self.ev_at("Kalshi", sport="basketball_nba"),
                       self.ev_at("Kalshi", market="spreads")):
@@ -9505,7 +9490,7 @@ class KalshiTieNote(unittest.TestCase):
         out["sport_key"] = "americanfootball_nfl"
         out["bookmakers"][-1].update(key="kalshi", title="Kalshi")
         [o] = find_outliers([out], Config(), NOW, kalshi={"e1": {"Home": (0.515, 0.51, 0.52)}})
-        self.assertIn(self.NOTE, outlier_payload(o)["embeds"][0]["description"])
+        self.assertEqual(_arbbot.kalshi_tie_note(o.sport_key, o.market, o.book), "\n" + self.NOTE)
 
     def test_an_arb_with_a_kalshi_nfl_moneyline_bet_says_it_on_that_bet(self):
         ev = KalshiDepth.kalshi_arb(self)
@@ -9641,8 +9626,8 @@ class KalshiBlend(MixFiles):
         self.assertAlmostEqual(b.ev_pct, (b.fair_prob * 2.10 - 1) * 100)
         self.assertEqual(b.stake, kelly_stake(b.fair_prob, 2.10, EVCFG))
         card = ev_payload(b)["embeds"][0]
-        self.assertIn("**Fair value** -102 · 50.5% to win\n**Sources** 2/2 · Pinnacle 50.0% · Kalshi 52.0%",
-                      card["description"])
+        self.assertEqual((_arbbot.odds(b.fair_odds), _arbbot.sources_line(b)),
+                         ("-102", "Sources 2/2 · Pinnacle 50.0% · Kalshi 52.0%"))
         self.assertNotIn("footer", card)                                   # (no "+EV = ..." footer any more)
         self.assertIn("(50.5%, Pinnacle + Kalshi no-vig)", _arbbot.format_ev_text(b))
 
@@ -9838,7 +9823,6 @@ class OddSourceLeftOut(MixFiles):
         self.assertEqual(b.left_out[0], "LowVig")
         self.assertAlmostEqual(b.left_out[1], 5.8)                              # 56.0 vs the others' middle 50.2
         self.assertEqual(sources_line(b), "Sources 2/3 · Pinnacle 50.0% · BetOnline 50.4% · LowVig left out (5.8 pts off)")
-        self.assertIn("LowVig left out (5.8 pts off)", ev_payload(b)["embeds"][0]["description"])
         self.assertEqual(b.stake, kelly_stake(b.fair_prob, 2.20, cfg))          # 2 of 3 priced it: no cut
         a = EVAlerter(cfg, dry_run=True)
         a.handle([b], now=1000)
@@ -10052,7 +10036,6 @@ class KalshiOnly(MixFiles):
         self.assertEqual(b.stake, kelly_stake(0.5, 2.10, LONE, 0.5))            # half the Pinnacle-priced stake
         self.assertIn("Kalshi's price alone: stake 50% smaller", b.confidence_notes)
         self.assertEqual(sources_line(b), "Sources 1/2 · Kalshi 50.0% (no Pinnacle price)")
-        self.assertIn("**Sources** 1/2 · Kalshi 50.0% (no Pinnacle price)", ev_payload(b)["embeds"][0]["description"])
         self.assertNotIn(("e1", "h2h", None, "Home"), history.points)           # not a sharp price: not kept
         self.assertEqual(find_evs(self.games(), replace(LONE, kalshi_only_stake=1), NOW, kalshi=EVEN)[0].stake,
                          same.stake)
@@ -10678,24 +10661,15 @@ class CardEditThrottle(unittest.TestCase):
     def methods(self):
         return [m for m, _ in self.sent]
 
-    def test_other_books_prices_wait(self):
-        a = self.alerter()
-        self.scan(a, 0)
-        self.scan(a, 60, b_price=1.80)                     # only the "every book" list changed
-        self.assertEqual(self.methods(), ["POST"])
-        self.scan(a, 300, b_price=1.85)
-        self.assertEqual(self.methods(), ["POST"])
-        self.scan(a, 601, b_price=1.85)                    # 10 minutes on: edited, with the newest prices
-        self.assertEqual(self.methods(), ["POST", "PATCH"])
-        self.assertIn("B — **-118**", self.sent[-1][1]["description"])   # (1.85: the newest price)
-        self.scan(a, 700, b_price=1.90)                    # the clock starts again from that edit
-        self.assertEqual(self.methods(), ["POST", "PATCH"])
-        # 0 (the default): every change at once.
-        self.sent.clear()
-        a = self.alerter(cfg=replace(self.cfg, card_edit_min_seconds=0))
-        self.scan(a, 0)
-        self.scan(a, 60, b_price=1.80)
-        self.assertEqual(self.methods(), ["POST", "PATCH"])
+    def test_other_books_prices_never_edit_the_card(self):
+        # Oct 11: the card is short (the game, the bet, units, confidence), so other books' prices aren't on it.
+        for limit in (600, 0):
+            self.sent.clear()
+            a = self.alerter(cfg=replace(self.cfg, card_edit_min_seconds=limit))
+            self.scan(a, 0)
+            for at, price in ((60, 1.80), (300, 1.85), (601, 1.85), (700, 1.90)):
+                self.scan(a, at, b_price=price)
+            self.assertEqual(self.methods(), ["POST"], limit)
 
     def test_the_bets_own_price_and_gone_dont_wait(self):
         a = self.alerter()
@@ -10711,7 +10685,7 @@ class CardEditThrottle(unittest.TestCase):
     def test_live_bets_outliers_arbs(self):
         a = self.alerter()
         self.scan(a, 0, live=True)
-        self.scan(a, 60, b_price=1.80, live=True)          # live: at once
+        self.scan(a, 60, a_price=2.12, live=True)          # the bet's own price, live: at once
         self.assertEqual(self.methods(), ["POST", "PATCH"])
         self.assertTrue(OutlierAlerter.throttle_edits and EVAlerter.throttle_edits)
         self.assertFalse(Alerter.throttle_edits or _arbbot.ParlayAlerter.throttle_edits)
@@ -11062,7 +11036,7 @@ class AlternateLines(MixFiles):
         self.assertEqual((b.sharp_book, round(b.fair_prob, 3)), ("Pinnacle", 0.5))   # Pinnacle's full-confidence price
         self.assertEqual(b.link, "draftkings/player_pass_yds_alternate/245.5/over")
         self.assertEqual(b.key, _arbbot.ev_key("q1", "player_pass_yds", ("Josh Allen", 245.5), "Over"))
-        self.assertIn("**ODDS: +130**\n\n**Josh Allen Over 245.5 Passing Yards** *(alternate line)*",
+        self.assertIn("**Josh Allen Over 245.5 Passing Yards +130** *(alternate line)*",
                       ev_payload(b)["embeds"][0]["description"])
         self.assertIn("on DraftKings (alternate line)", _arbbot.format_ev_text(b))
         self.assertNotEqual(b.fingerprint, replace(b, alt=False).fingerprint)
@@ -11231,8 +11205,7 @@ class AlternateLines(MixFiles):
         ocfg = Config(alert_mode="balanced").with_mode()
         [h] = find_outliers([alt_game({**flat, "draftkings": [(245.5, 1.91, 1.91)]},
                                       {"draftkings": [(245.5, 2.40, None)], "fanatics": [(245.5, 1.70, 2.05)]})], ocfg, NOW)
-        lock_in = outlier_payload(h)["embeds"][0]["description"].split("Want a sure profit instead?")[1]
-        self.assertEqual((h.hedge_alt, lock_in.count("*(alternate line)*")), ({"Under"}, 2))
+        self.assertEqual(h.hedge_alt, {"Under"})                                # (the lock-in is in the console)
         self.assertEqual(h.alt_books, {"DraftKings", "Fanatics"})               # (an outlier's board is parlay legs too)
         [plain] = find_outliers([alt_game({**flat, "draftkings": [(245.5, 2.40, 1.55)], "fanatics": [(245.5, 1.70, 2.05)]})],
                                 ocfg, NOW)
@@ -11732,7 +11705,7 @@ class SendTimeChecks(MixFiles):
         a.handle([live(2.26)], ["basketball_nba"], now=1060, fetched={"e1": time.time() - 2})     # sent at 13%
         self.assertAlmostEqual(a.open[live(2.26).key].alerted_pct, 13.0)
         a.handle([live(2.26)], ["basketball_nba"], now=1120, fetched={"e1": time.time() - 2})     # the same price
-        self.assertEqual([(t.split(" · ")[0], m) for t, m in self.pings], [("📈 +EV 13.0%", "@ev")])
+        self.assertEqual([(t.split(" · ")[0], m) for t, m in self.pings], [("📈 Home ML +126", "@ev")])
         self.sent, self.pings = [], []
         a, cfg = self.ev_alerter(live_confirm_checks=2, ev_live=True)           # it keeps rising after it's sent:
         a.handle([live(2.20)], ["basketball_nba"], now=1000, fetched={"e1": time.time() - 100})
@@ -11740,7 +11713,7 @@ class SendTimeChecks(MixFiles):
         a.handle([live(2.32)], ["basketball_nba"], now=1120, fetched={"e1": time.time() - 2})     # 16%: one sighting
         self.assertEqual(len(self.pings), 1)
         a.handle([live(2.32)], ["basketball_nba"], now=1180, fetched={"e1": time.time() - 2})     # two: re-alerted
-        self.assertEqual([t.split(" · ")[0] for t, _ in self.pings], ["📈 +EV 13.0%", "📈 +EV 16.0%"])
+        self.assertEqual([t.split(" · ")[0] for t, _ in self.pings], ["📈 Home ML +126", "📈 Home ML +132"])
         self.sent, self.pings = [], []
         a, cfg = self.ev_alerter()                                              # before the game, the same
         a.handle([self.bet(2.20)], ["basketball_nba"], now=1000, fetched={"e1": time.time() - 700})
@@ -13228,7 +13201,7 @@ class EVBotSpec(MixFiles):
         self.main(t, [self.game({"B": 2.50})], 60)                               # +25%: was a new ping
         self.assertEqual([(m, c) for m, _, c, *_ in sent], [("POST", ""), ("PATCH", "")])   # no new alert...
         self.assertEqual(sent[1][1], sent[0][1])                                 # ...the card as it went out,
-        self.assertIn("**ODDS: +120**", self.bodies[1])                         # at its odds and stake,
+        self.assertIn("**Home ML +120**\n**1.6u**", self.bodies[1])              # at its odds and stake,
         self.assertNotIn("+150", self.bodies[1])                                # not the better price
         self.assertIn("✅ **Still good** at B", self.bodies[1])                  # only its ✅ line is new
         self.main(t, [self.game({"B": 2.50})], 90)
@@ -13245,7 +13218,7 @@ class EVBotSpec(MixFiles):
         self.main(t, [self.game({"B": 2.20, "C": 2.10})], 0)                     # posted for B
         self.main(t, [self.game({"B": 1.95, "C": 2.10})], 60)                    # B moved; C has it (same bet)
         self.assertIn("⚠️ **Price moved** at B", self.bodies[-1])
-        self.assertIn("**ODDS: +120**", self.bodies[-1])                        # the card as sent otherwise
+        self.assertIn("**Home ML +120**", self.bodies[-1])                       # the card as sent otherwise
         self.main(t, [self.game({"B": 2.15, "C": 2.10})], 120)                   # back
         self.assertIn("✅ **Still good** at B", self.bodies[-1])
         self.assertEqual([(m, c) for m, _, c, *_ in sent], [("POST", "")] + [("PATCH", "")] * 2)   # edits: no ping
@@ -13473,7 +13446,7 @@ class EVBotSpec(MixFiles):
 
     def test_a_huge_outlier_edge_warns_the_book_may_void_it(self):
         [o] = find_outliers([outlier_event(1.85, 1.95)], Config(round_stakes=0), NOW)     # +44.8%
-        self.assertIn("may be a pricing error: Stale can void the bet", outlier_payload(o)["embeds"][0]["description"])
+        self.assertIn("⚠️ May be a pricing error the book can void.", outlier_payload(o)["embeds"][0]["description"])
         small = replace(o, price=1.40)
         self.assertLess(small.ev_pct, _arbbot.VOID_WARN_PCT)
         self.assertNotIn("pricing error", outlier_payload(small)["embeds"][0]["description"])
@@ -13529,12 +13502,13 @@ class EVBotSpec(MixFiles):
         self.main(t, [ml], 0)
         self.main(t, [totals], 60)                     # (each check closes the card it didn't see: GONE as always)
         self.assertEqual(len(posts()), 2)
-        self.assertNotIn("alert #", "".join(posts()))                            # two at full stake
+        self.assertEqual(len(posts()), 2)                                          # two at full stake
         self.main(t, [spreads], 120)                                              # the third: half
-        self.assertIn("Stake ×0.5: alert #3 on this game", posts()[-1])
+        third = next(op.arb for op in t.evs.open.values() if op.arb.market == "spreads")
+        self.assertIn("Stake ×0.5: alert #3 on this game", third.tune_note)            # (said in the console)
         other = game("e9", [("Home", 2.30)])
         self.main(t, [other], 180)
-        self.assertNotIn("alert #", posts()[-1])                                  # another game: full again
+        self.assertEqual(next(op.arb for op in t.evs.open.values() if op.arb.event_id == "e9").tune_note, "")
         evs = [b for b in find_evs([game("e1", [("Away", 2.40)])], t.cfg, NOW)]
         self.assertEqual(_arbbot.same_game(evs, t.cfg, t, (t.evs, t.outs)), [])   # fourth on e1: over the cap
         self.assertEqual(t.evs.held_counts.get("same game"), 1)
@@ -13695,7 +13669,7 @@ class EVBotSpec(MixFiles):
         self.assertEqual(p.n_period, 1)
         [op] = t.period_evs.open.values()
         self.assertEqual((op.arb.pick, op.url), ("1H Home -3.5", "https://ev"))          # +EV channel, not props
-        self.assertTrue(sent[-1][1].startswith("📈 +EV") and "1H Home -3.5 +115 at B" in sent[-1][1])
+        self.assertEqual(sent[-1][1], "📈 1H Home -3.5 +115 · B")
         self.assertEqual(len(t.evs.open), 1)                                             # the full-game card: untouched
         self.assertEqual((t.prop_evs.open, t.prop_outs.open), ({}, {}))
         self.assertEqual(_arbbot.market_label("spreads_h1", -3.5), "1st Half Spread -3.5")
@@ -13919,7 +13893,7 @@ class EVBotSpec(MixFiles):
         [b] = _arbbot.tune_bets([b], cfg, tuning, (EVAlerter(cfg, dry_run=True),))
         self.assertEqual(b.stake, round_stake_for(before * 1.25, cfg))           # book (and its sport) boost: capped
         self.assertTrue(b.tune_note.startswith("Stake ×1.25: B beats the close (+2.2% avg CLV, 50 bets)"), b.tune_note)
-        self.assertIn("📊 Stake ×1.25", ev_payload(b)["embeds"][0]["description"])
+        self.assertNotIn("📊", ev_payload(b)["embeds"][0]["description"])            # (the card stays short)
         cut = replace(find_evs([self.game({"B": 2.20})], cfg, NOW)[0], book="C", sport_key="icehockey_nhl")
         self.assertEqual(tuning.stake_mult(cfg, cut)[0], 0.5)
         mixed = [3.0, -3.0] * 30                                                  # no clear answer: unchanged

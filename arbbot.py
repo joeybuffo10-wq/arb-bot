@@ -4528,41 +4528,25 @@ def status_line(status: str, book: str) -> str:
     return STATUS_LINES[status].format(book=book) if status in STATUS_LINES else ""
 
 
+def bet_lines(b: EVBet, status: str = "", note: str = "") -> str:
+    """A bet card's whole text: the game and when it starts, the bet and its odds, the units (dollars without a unit
+    size) and confidence, then the ✅ / ⚠️ line once it has one, and a warning when there is one."""
+    game = f"{sport_icon(b.sport_key)} **{b.sport}** · {b.matchup}\n{_when(b.is_live, b.commence_time)}"
+    size = units(b.stake, b.unit_size) if b.unit_size > 0 else money(b.stake)
+    bet = (f"**{b.pick} {odds(b.price)}**{ALT_NOTE if b.alt else ''}\n**{size}**"
+           + (f" · {confidence_line(b.confidence)}" if b.confidence else ""))
+    return "\n\n".join(x for x in (game, bet, status_line(status, b.book), note) if x)
+
+
 def ev_payload(b: EVBet, mention: str = "", gone_after: float | None = None,
                 first_seen: float | None = None, status: str = "") -> dict:
-    """+EV card: the game and when first, then the bet itself (stake, odds, pick), then why (fair value,
-    sharp prices), then every book. The title (the bet at its book) opens the bet slip."""
+    """+EV card, short: the game and when, the bet, its units and confidence (the why stays out; the console and
+    the logs keep it). The title (the bet at its book) opens the bet slip."""
     icon = sport_icon(b.sport_key)
     if gone_after is not None:
-        return _gone_card(f"❌ GONE after {_fmt_secs(gone_after)} · ~~+{b.ev_pct:.1f}%~~ {b.pick} {odds(b.price)}",
+        return _gone_card(f"❌ GONE after {_fmt_secs(gone_after)} · ~~{b.pick} {odds(b.price)}~~",
                           f"Ignore this one. {b.book} moved and the value is gone. ({icon} {b.matchup})")
-    game = f"{icon} **{b.sport}** · {b.matchup}\n{_when(b.is_live, b.commence_time, first_seen)}{_age_note(b.age)}"
-    bet = (f"**BET SIZE: {b.stake_label}**\n**ODDS: {odds(b.price)}**\n\n"
-           f"**{b.pick}**{ALT_NOTE if b.alt else ''}")
-    parts = [status_line(status, b.book)] if status else []
-    notes = (confidence_line(b.confidence) + kalshi_room_line(b.kalshi_room)
-             + kalshi_tie_note(b.sport_key, b.market, b.book)
-             + (f"\n📊 {b.tune_note}" if b.tune_note else "")).strip("\n")
-    if notes:
-        parts.append(notes)
-    agree, why = confirm_lines(b)
-    if agree:
-        parts.append(f"**{agree}**\n{why}")
-    if b.related:
-        parts.append(f"⚠️ Also alerted on this game: {', '.join(b.related)}. These move together, "
-                     f"so treat them as one bet, not separate ones.")
-    parts.append(f"**Fair value** {_fair_line(b)} · {b.fair_prob:.1%} to win"
-                 + (f"\n{sources_line(b, bold=True)}" if b.refs else "")
-                 + (f"\n**{b.sharp_quotes[0][0]}** {' / '.join(odds(x) for x in b.sharp_quotes[0][1])}"
-                    if b.sharp_quotes else "")
-                 + (f" *(was {' / '.join(odds(x) for x in b.first_sharp_quotes[0][1])})*"
-                    if b.first_sharp_quotes and b.first_sharp_quotes != b.sharp_quotes else "")
-                 + _kalshi_line(b))
-    if b.board:
-        parts.append("**Every book**\n" + _board_lines(b))
-    desc = game + EV_DIVIDER + bet + "\n\n\n" + "\n\n".join(parts)
-    return _card(f"📈 +EV {b.ev_pct:.1f}%{' ✅✅' if agree else ''} · {b.pick} {odds(b.price)} at {b.book}", desc,
-                 0x3498DB, url=b.link, mention=mention)
+    return _card(f"📈 {b.pick} {odds(b.price)} · {b.book}", bet_lines(b, status), 0x3498DB, url=b.link, mention=mention)
 
 
 EV_LOG_FIELDS = ["first_seen", "event_id", "sport", "sport_key", "matchup",
@@ -5737,43 +5721,14 @@ def without_outliers(evs: list[EVBet], outs: list[EVBet]) -> list[EVBet]:
 
 def outlier_payload(b: EVBet, mention: str = "", gone_after: float | None = None,
                     first_seen: float | None = None, status: str = "") -> dict:
-    """Outlier card: bet-now instruction, optional lock-in, then why and every book."""
+    """Outlier card, short like a +EV one (outliers have no confidence rating), plus one line when the edge is so big
+    the book may void it."""
     icon = sport_icon(b.sport_key)
     if gone_after is not None:
-        return _gone_card(f"❌ GONE after {_fmt_secs(gone_after)} · ~~🚨 +{b.ev_pct:.0f}%~~ {b.pick} {odds(b.price)}",
+        return _gone_card(f"❌ GONE after {_fmt_secs(gone_after)} · ~~🚨 {b.pick} {odds(b.price)}~~",
                           f"Ignore this one. {b.book} fixed its price. ({icon} {b.matchup})")
-    parts = [
-        f"👉 **DO THIS NOW, before {b.book} fixes its price.**\n\n"
-        f"Open **{_link(b.book, b.link)}** → bet **{b.stake_label}** on **{b.pick} {odds(b.price)}**"
-        f"{ALT_NOTE if b.alt else ''}\n"
-        f"↳ skip if the price is worse than **{odds(b.worst_ok_price())}**" + kalshi_room_line(b.kalshi_room)
-        + kalshi_tie_note(b.sport_key, b.market, b.book) + (f"\n📊 {b.tune_note}" if b.tune_note else ""),
-    ]
-    if status:
-        parts.insert(0, status_line(status, b.book))
-    if b.ev_pct >= VOID_WARN_PCT:
-        parts.append(f"⚠️ An edge this big may be a pricing error: {b.book} can void the bet. Bet a normal stake, "
-                     f"not more.")
-    if b.related:
-        parts.append(f"⚠️ Also alerted on this game: {', '.join(b.related)}.")
-    if b.hedge:
-        legs = ([(b.pick, b.book, b.price, b.link, b.alt)]
-                + [(o, bk, pr, ln, o in b.hedge_alt) for o, bk, pr, ln in b.hedge])
-        margin = sum(1 / pr for _, _, pr, _, _ in legs)
-        lines = [f"• Open **{_link(bk, ln)}** → bet **{money(round(100 / pr / margin, 2))}** on {o} {odds(pr)}"
-                 f"{ALT_NOTE if alt else ''}" for o, bk, pr, ln, alt in legs]
-        parts.append(f"🔒 **Want a sure profit instead?** Place all of these for **+{b.hedge_pct:.1f}% "
-                     f"guaranteed** (per $100 total):\n" + "\n".join(lines))
-    details = (f"{icon} **{b.sport}** · {b.matchup}\n{_when(b.is_live, b.commence_time, first_seen)}"
-               f"{_age_note(b.age)}\n\n**Why:** {b.book} has {b.pick} at **{odds(b.price)}**, but the other {b.sources_used} books "
-               f"say **{odds(b.fair_odds)}** ({b.fair_prob:.1%} to win)." + _kalshi_line(b)
-               + "".join(f"\n📉 {n[0].upper()}{n[1:]}." for n in b.confidence_notes if "smaller" in n))
-    desc = "\n\n".join(parts) + DIVIDER + details
-    if b.board:
-        desc += "\n\n**Every book**\n" + _board_lines(b)
-    return _card(f"🚨 OUTLIER +{b.ev_pct:.0f}% · {b.pick} {odds(b.price)} at {b.book}", desc,
-                 0xE67E22, url=b.link,
-                 footer="OUTLIER = one book is way off. Bet fast; books can void obvious pricing errors.",
+    void = "⚠️ May be a pricing error the book can void." if b.ev_pct >= VOID_WARN_PCT else ""
+    return _card(f"🚨 {b.pick} {odds(b.price)} · {b.book}", bet_lines(b, status, void), 0xE67E22, url=b.link,
                  mention=mention)
 
 
@@ -5934,8 +5889,9 @@ def format_parlay_text(p: Parlay) -> str:
 
 def parlay_payload(p: Parlay, mention: str = "", gone_after: float | None = None,
                    first_seen: float | None = None, slip: str = "") -> dict:
+    """Parlay card, short: one link for the whole ticket (when the book has one), each leg with its game, the units."""
     if gone_after is not None:
-        return _gone_card(f"❌ GONE after {_fmt_secs(gone_after)} · ~~📦 +{p.ev_pct:.1f}%~~ parlay at {p.book}",
+        return _gone_card(f"❌ GONE after {_fmt_secs(gone_after)} · ~~📦 parlay at {p.book}~~",
                           "Ignore this one. A leg's price moved and the parlay isn't worth it anymore.")
     nums = ["1️⃣", "2️⃣", "3️⃣", "4️⃣"]
     legs = "\n".join(
@@ -5943,17 +5899,10 @@ def parlay_payload(p: Parlay, mention: str = "", gone_after: float | None = None
         f"\n     {sport_icon(b.sport_key)} {b.matchup} · "
         + ("🔴 LIVE" if b.is_live else f"<t:{int(_parse_time(b.commence_time).timestamp())}:t>")
         for i, (b, pr, ln) in enumerate(p.legs))
-    worst = (1 + OK_EDGE_PCT / 100) / p.fair_prob
-    one = (f"🔗 **[Add all {len(p.legs)} legs to the {p.book} bet slip]({slip})** (or tap each leg below)\n\n"
-           if slip else "")
-    desc = (f"👉 **DO THIS: one parlay ticket at {p.book}.** Every leg must win. Pays big, wins less often.\n\n"
-            f"{one}Open **{p.book}** → add these {len(p.legs)} legs → bet **{p.stake_label}**\n\n{legs}\n\n"
-            f"Ticket should pay about **{odds(p.price)}** · skip if it's worse than **{odds(worst)}**"
-            f"{DIVIDER}**Chance all legs win:** {p.fair_prob:.1%} (fair) · each leg is +EV on its own.\n"
-            f"Legs are from different games, so they don't affect each other.")
-    return _card(f"📦 PARLAY +{p.ev_pct:.1f}% EV · {len(p.legs)} legs at {p.book} · {odds(p.price)}", desc,
-                 0x9B59B6, url=slip, footer="PARLAY = several +EV bets on one ticket. Small stake: parlays swing a lot.",
-                 mention=mention)
+    one = f"🔗 **[Add all {len(p.legs)} legs to the {p.book} bet slip]({slip})**\n\n" if slip else ""
+    size = units(p.stake, p.unit_size) if p.unit_size > 0 else money(p.stake)
+    return _card(f"📦 {len(p.legs)}-leg parlay · {p.book} · {odds(p.price)}", f"{one}{legs}\n\n**{size}**",
+                 0x9B59B6, url=slip, mention=mention)
 
 
 PARLAY_FIELDS = ["first_seen", "book", "legs", "price", "fair_prob", "best_ev_pct", "stake", "games", "legs_json"]
@@ -9905,46 +9854,20 @@ def feed_freshness(events: list[dict], now: datetime | None = None) -> str:
     return "; ".join(parts) or "no prices"
 
 
-GUIDE = """**When an alert pops up, do what its 👉 line says. That's it.**
-The bot only sends strong ones (locks mode), so every alert is worth a look. Games that haven't started come first; live alerts are kept to a few an hour.
+GUIDE = """**Each alert is one bet. Tap the title to open it at the book, bet the units shown. That's it.**
 
-💰 **ARB** (green, or red if the game is live)
-Bet **every** side shown, each at the book listed, using the exact amounts. You profit no matter who wins.
-• If a bet says **Bet this one first**, place it first: it's the price that will move. Then the other right away.
-• No "first" note? Place the bets back to back.
-• If a price has moved past its "skip" line, don't place the other bet.
-• If the other price is gone after you placed the first, the card says when the first is still worth keeping on its own ("keep this one").
+📈 **+EV** (blue): a better price than it should be. It won't win every time; it pays off over many bets.
+🚨 **Outlier** (orange): one book's price is way off. Bet it fast, before they fix it. ⚠️ means the edge is so big the book may void it: bet a normal amount, not more.
+📦 **Parlay** (purple): 2-3 bets on one ticket at one book. Tap 🔗 to put every leg in the slip at once. Every leg must win.
+"1H" / "1Q" means first half / first quarter. Team totals are a team's own points.
 
-📈 **+EV** (blue)
-Bet **one** side at the book shown, for the amount shown. It's a better price than it should be, but it won't win every time. It pays off over many bets.
-Each one has a **confidence**: 🟢 High, 🟡 Medium or 🟠 Low. Lower confidence already means a smaller stake. When unsure, skip the 🟠 ones.
-✅✅ **Two sharp books agree** means Pinnacle and Kalshi (or Pinnacle and 4+ other books) give almost the same chance to win, so a smaller edge (from 3.5%) is still a lock. Bet it like any other: the stake is already a bit smaller.
+**Units:** bet the units shown (1u = your unit). Lower confidence already means fewer units.
+**Confidence:** 🟢 High, 🟡 Medium. Each card says which.
+**✅ Still good / ⚠️ Price moved:** the line under a card after it goes out. ⚠️ means don't bet it now.
+**✅ reaction:** tap it after you place a bet, so the results show what members took.
+**❌ GONE:** the chance is over. Ignore it.
 
-🚨 **OUTLIER** (orange, pings everyone)
-One book's price is way off from all the others. Bet it fast, before they fix it.
-Optional: also place the 🔒 bets it lists to lock in a guaranteed profit.
-
-📦 **PARLAY** (purple)
-One ticket with 2-3 +EV bets from different games, all at the same book. Every leg must win. Bigger payout, wins less often, so the stake is small.
-
-🏦 **Kalshi** prices in alerts already include Kalshi's trading fee. If Kalshi doesn't have enough on offer at that price for the whole stake, the card says so (a +EV or outlier stake is cut to what's there). On an NFL moneyline the card also notes that Kalshi settles a tie by its own rules (sportsbooks refund one).
-
-⏱ **Price age** on a card: how long the book had shown that price when the alert went out. A live alert only goes out once two checks in a row (about a minute apart) find it and the price is under a minute old, so it's less likely to be gone when you tap. Before a game, a price can sit unchanged for hours: that's normal. Player props don't show one: the book doesn't say when each player's line last moved.
-
-🎯 **Player props** show up as normal +EV, arb or outlier alerts, e.g. "LeBron James Over 25.5 Points". When Pinnacle doesn't price a prop, its true odds come from the other books: the card names them, and the stake is 30% smaller. If its card turns 🟡 later, the edge is still there, just less certain.
-
-❌ **GONE** (grey)
-The chance is over. Ignore it.
-
-📋 **RESULTS** (in the results channel)
-As games finish, the bot posts what hit: ✅ won, ❌ lost, ➖ push, with the profit at the stake shown, and the day's record so far. Props are graded from the box score too. 🎯 means check that one yourself. The pinned 📊 Scoreboard keeps the running record; its 📏 part shows whether alert prices held up a few minutes later. Every Monday morning a 📋 **Weekly report card** sums up the last 7 days for each alert type, with suggestions; it never changes a setting, that's up to you.
-
-**Every time**
-1. Tap the book name to open it. Check the price matches the alert, or is better.
-2. Worse than the "skip" price? Don't bet.
-3. Bet the exact amount shown (the "1.5u" next to it is the same amount in units). Don't go bigger.
-4. 🟢 in "Every book" means that book's price is also good to bet.
-5. Books sometimes cancel bets on obvious mistakes and refund the money. With an arb, the other bet still stands, so you're left with one normal bet."""
+📋 **Results** come once a night (after midnight) in the results channel, and the pinned 📊 Scoreboard keeps the running record."""
 
 
 def spent_line(spent: dict[str, float]) -> str:
