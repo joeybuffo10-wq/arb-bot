@@ -627,7 +627,7 @@ class PlusEV(unittest.TestCase):
         desc = ev_payload(b)["embeds"][0]["description"]
         # Oct 11, short: the game and when, the bet, its stake in dollars and units (1u = 1% of $1,000) and confidence.
         self.assertEqual(desc, "🏟️ **Test** · Away @ Home\n⏰ Starts <t:1791050400:t> (<t:1791050400:R>)\n\n"
-                               "**Home ML +110**\n**$11 (1.1u)** · 🟡 Confidence: Medium")
+                               "**Home ML +110**\n## $11 (1.1u)\n🟡 Confidence: Medium")
         for gone in ("DO THIS", "won't win every time", "+EV = better price", "Can't use that book",
                      "skip if the price", "other books mostly agree"):
             self.assertNotIn(gone, desc)
@@ -8046,7 +8046,7 @@ class KalshiDepth(unittest.TestCase):
         [b] = find_evs([ev], cfg, NOW, kalshi={"e1": {"Home": KalshiQuote(0.445, 0.44, 0.45, 30)}})   # $13.50 there
         self.assertEqual(b.stake, 10.0)                                    # rounded down to $5s, never over
         desc = ev_payload(b)["embeds"][0]["description"]
-        self.assertIn("**Home ML +114**\n**$10 (1u)**", desc)
+        self.assertIn("**Home ML +114**\n## $10 (1u)", desc)
         self.assertIn("↳ Kalshi only has about $13 at this price; the rest would fill at a worse price.",
                       _arbbot.kalshi_room_line(b.kalshi_room))
         [deep] = find_evs([ev], cfg, NOW, kalshi={"e1": {"Home": KalshiQuote(0.445, 0.44, 0.45, 1000)}})
@@ -9290,14 +9290,14 @@ class UnitsOnCards(MixFiles):
     def test_every_bet_card_shows_units_and_arbs_stay_in_dollars(self):
         ev = ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"B": [("Home", 2.10, None)]})
         [b] = find_evs([ev], EVCFG, NOW)
-        self.assertIn("**Home ML +110**\n**$11 (1.1u)**", ev_payload(b)["embeds"][0]["description"])
+        self.assertIn("**Home ML +110**\n## $11 (1.1u)", ev_payload(b)["embeds"][0]["description"])
         self.assertIn("→ stake $11 (1.1u)", _arbbot.format_ev_text(b))
         [o] = find_outliers([outlier_event(1.85, 1.95)], Config(round_stakes=0), NOW)
-        self.assertRegex(outlier_payload(o)["embeds"][0]["description"], r"\*\*\$\d+ \(\d+(\.\d)?u\)\*\*")
+        self.assertRegex(outlier_payload(o)["embeds"][0]["description"], r"\n## \$\d+ \(\d+(\.\d)?u\)")
         [p] = find_parlays([ev_leg("g1", {"DK": 2.20}), ev_leg("g2", {"DK": 2.20})],
                            Config(parlay_min_ev_pct=1, parlay_leg_min_ev_pct=1, round_stakes=0))
         self.assertEqual(p.stake_label, f"${p.stake:g} ({p.stake / 10:g}u)")
-        self.assertIn(f"**{p.stake_label}**", parlay_payload(p)["embeds"][0]["description"])
+        self.assertIn(f"\n## {p.stake_label}", parlay_payload(p)["embeds"][0]["description"])
         [arb] = find_arbs(demo_events(live_arb=False), Config())
         self.assertNotRegex(discord_payload(arb)["embeds"][0]["description"], r"\du\b")
 
@@ -13201,7 +13201,7 @@ class EVBotSpec(MixFiles):
         self.main(t, [self.game({"B": 2.50})], 60)                               # +25%: was a new ping
         self.assertEqual([(m, c) for m, _, c, *_ in sent], [("POST", ""), ("PATCH", "")])   # no new alert...
         self.assertEqual(sent[1][1], sent[0][1])                                 # ...the card as it went out,
-        self.assertIn("**Home ML +120**\n**$16 (1.6u)**", self.bodies[1])       # at its odds and stake,
+        self.assertIn("**Home ML +120**\n## $16 (1.6u)", self.bodies[1])        # at its odds and stake,
         self.assertNotIn("+150", self.bodies[1])                                # not the better price
         self.assertIn("✅ **Still good** at B", self.bodies[1])                  # only its ✅ line is new
         self.main(t, [self.game({"B": 2.50})], 90)

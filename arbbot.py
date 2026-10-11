@@ -4559,8 +4559,9 @@ def bet_lines(b: EVBet, status: str = "", note: str = "") -> str:
     """A bet card's whole text: the game and when it starts, the bet and its odds, the stake ("$11 (1.1u)") and
     confidence, then the ✅ / ⚠️ line once it has one, and a warning when there is one."""
     game = f"{sport_icon(b.sport_key)} **{b.sport}** · {b.matchup}\n{_when(b.is_live, b.commence_time)}"
-    bet = (f"**{b.pick} {odds(b.price)}**{ALT_NOTE if b.alt else ''}\n**{b.stake_label}**"
-           + (f" · {confidence_line(b.confidence)}" if b.confidence else ""))
+    # (The stake as a heading: big, so it's the first thing anyone sees.)
+    bet = (f"**{b.pick} {odds(b.price)}**{ALT_NOTE if b.alt else ''}\n## {b.stake_label}"
+           + (f"\n{confidence_line(b.confidence)}" if b.confidence else ""))
     return "\n\n".join(x for x in (game, bet, status_line(status, b.book), note) if x)
 
 
@@ -5926,7 +5927,7 @@ def parlay_payload(p: Parlay, mention: str = "", gone_after: float | None = None
         + ("🔴 LIVE" if b.is_live else f"<t:{int(_parse_time(b.commence_time).timestamp())}:t>")
         for i, (b, pr, ln) in enumerate(p.legs))
     one = f"🔗 **[Add all {len(p.legs)} legs to the {p.book} bet slip]({slip})**\n\n" if slip else ""
-    return _card(f"📦 {len(p.legs)}-leg parlay · {p.book} · {odds(p.price)}", f"{one}{legs}\n\n**{p.stake_label}**",
+    return _card(f"📦 {len(p.legs)}-leg parlay · {p.book} · {odds(p.price)}", f"{one}{legs}\n## {p.stake_label}",
                  0x9B59B6, url=slip, mention=mention)
 
 
