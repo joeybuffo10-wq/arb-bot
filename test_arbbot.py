@@ -13893,40 +13893,47 @@ class EVBotSpec(MixFiles):
         self.assertIsNone(_arbbot.digest_due(t.cfg, ten))                          # once a day
         self.assertIsNone(_arbbot.digest_due(replace(t.cfg, digest_hour=-1), ten))
 
-    def test_the_free_channel_only_gets_picks_once_their_games_started(self):
+    def log_prop(self, cfg, gid, player, actual_line, won, market="player_receptions"):
+        """A graded prop in the results file, as grading writes it."""
+        row = {"first_seen": "2026-10-03T12:00:00+00:00", "event_id": gid, "sport": "NFL",
+               "sport_key": "americanfootball_nfl", "matchup": "New York Jets @ Buffalo Bills", "home_team": "Buffalo Bills",
+               "away_team": "New York Jets", "commence_time": "2026-10-03T17:00:00Z", "live": False, "market": market,
+               "outcome": "Over", "point": 3.5, "n_outcomes": 2, "book": "DraftKings", "price": 2.2, "stake": 12,
+               "player": player, "kind": "ev", "result": "win" if won else "loss", "profit": 14.4 if won else -12,
+               "actual": actual_line}
+        append_csv(cfg.ev_results_file, _arbbot.RESULT_FIELDS, row)
+
+    def test_the_free_channel_only_gets_winning_props(self):
         cfg, res, sent = self.results(free_webhook_url="https://free", free_cta="Join: example.com")
-        ev = ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"B": [("Home", 2.20, None)]},
-                      start="2026-10-03T18:00:00Z")
-        ev["id"], ev["sport_key"] = "g1", "icehockey_nhl"
-        [b] = find_evs([ev], cfg, _parse("2026-10-03T17:00:00Z"))
-        EVAlerter(cfg, dry_run=True).handle([b], now=_parse("2026-10-03T17:00:00Z").timestamp())   # alerted 1h before
-        before = _parse("2026-10-03T17:59:00Z")
-        self.assertEqual(_arbbot.free_teasers(cfg, before), [])                    # still bettable: never
-        lines = _arbbot.free_teasers(cfg, _parse("2026-10-03T18:05:00Z"))
-        self.assertEqual(len(lines), 1)
-        self.assertEqual(lines[0], "🔒 Members got **Home ML +120** at B 1h before the game (Away @ Home)")
-        self.assertEqual(_arbbot.free_teasers(cfg, _parse("2026-10-03T18:10:00Z")), [])  # once
+        self.log_prop(cfg, "g1", "Khalil Shakir", "5", won=True)
+        self.log_prop(cfg, "g2", "James Cook", "2", won=False)                       # a loss: not shown
+        self.log(cfg, "g3", "2026-10-03T18:00:00Z")                                  # a game line: not shown
+        settle_pending(cfg, self.scores({"g3": (4, 2)}), datetime(2026, 10, 4, 3, 0, tzinfo=timezone.utc))
+        now = datetime(2026, 10, 4, 3, 0, tzinfo=timezone.utc)
+        wins = _arbbot.free_wins(cfg, now)
+        self.assertEqual([r["player"] for r in wins], ["Khalil Shakir"])
+        self.assertEqual(_arbbot.free_wins(cfg, now), [])                            # each once
+        self.assertEqual(_arbbot.free_win_embed(wins[0]),
+                         {"title": "✅ Khalil Shakir Over 3.5 Receptions", "color": 0x2ECC71,
+                          "description": "Members got it at **+120** (DraftKings)\n"
+                                         "🏈 NFL · New York Jets @ Buffalo Bills · finished with 5"})
         from unittest import mock
         posts = []
         with mock.patch("arbbot._webhook", lambda url, payload, *a, **k: posts.append((url, payload))):
-            _arbbot.send_teasers(cfg, lines)
+            _arbbot.send_free_wins(cfg, wins)
         self.assertEqual(posts[0][0], "https://free")
-        self.assertTrue(posts[0][1]["content"].endswith("\n\nJoin: example.com"))
+        self.assertEqual((len(posts[0][1]["embeds"]), posts[0][1]["content"]), (1, "Join: example.com"))
+        self.assertEqual(_arbbot.free_wins(replace(cfg, free_webhook_url=""), now), [])
 
-    def test_the_free_channel_gets_the_results_card_without_members(self):
+    def test_the_free_channel_never_gets_the_results_card(self):
         from unittest import mock
-        cfg, res, sent = self.results(free_webhook_url="https://free", free_cta="Join: example.com")
+        cfg, res, sent = self.results(free_webhook_url="https://free")
         self.log(cfg, "g1", "2026-10-03T18:00:00Z")
-        Path(cfg.state_dir).mkdir(parents=True, exist_ok=True)
-        _arbbot.taken_path(cfg).write_text(json.dumps({"g1|h2h|Home|": {"start": "2026-10-03T18:00:00Z",
-                                                                         "users": {"u1": "Joey"}}}))
-        free = []
-        with mock.patch("arbbot._webhook", lambda url, payload, *a, **k: free.append((url, payload))):
+        calls = []
+        with mock.patch("arbbot._webhook", lambda url, payload, *a, **k: calls.append(url)):
             res.daily(self.scores({"g1": (4, 2)}), date(2026, 10, 3), datetime(2026, 10, 4, 4, 40, tzinfo=timezone.utc))
-        self.assertIn("Joey", sent[0]["description"])                              # members' card: the leaderboard
-        [(url, payload)] = [x for x in free if x[0] == "https://free"]
-        self.assertNotIn("Joey", payload["embeds"][0]["description"])             # free: no members' names
-        self.assertTrue(payload["embeds"][0]["description"].endswith("Join: example.com"))
+        self.assertEqual(len(sent), 1)                                               # the members' results card
+        self.assertNotIn("https://free", calls)
 
     def test_the_weekly_social_post_is_ready_to_copy(self):
         cfg, res, sent = self.results(results_site_repo="joeybuffo10-wq/ev-bot-results")

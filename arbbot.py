@@ -182,7 +182,7 @@ WEBHOOK_SETTINGS = {
     "results": ("DISCORD_RESULTS_WEBHOOK_URL", "bet results (what hit and what missed)"),
     "test": ("DISCORD_TEST_WEBHOOK_URL", "sample alerts from --test-discord (nothing else)"),
     "backup": ("DISCORD_BACKUP_WEBHOOK_URL", "a nightly copy of the betting record (keep this channel private)"),
-    "free": ("DISCORD_FREE_WEBHOOK_URL", "the free preview: nightly results, and picks once their games start"),
+    "free": ("DISCORD_FREE_WEBHOOK_URL", "the free preview: each winning player prop, once it's graded"),
 }
 
 
@@ -446,9 +446,8 @@ class Config:
     # A morning message (this New York hour) in the +EV channel listing every open bet still at a good price, no
     # ping (-1 = off).
     digest_hour: int = -1
-    # A free preview channel (DISCORD_FREE_WEBHOOK_URL): each night's results card (without members' names), and each
-    # pick once its game has started ("🔒 members got this 3h before the game"), never while it can still be bet.
-    # FREE_CTA: a line added to those posts, e.g. how to join.
+    # A free preview channel (DISCORD_FREE_WEBHOOK_URL): each winning player prop, once it's graded ("✅ Members got it
+    # at +120"), never a bet that can still be placed. FREE_CTA: a line added under those posts, e.g. how to join.
     free_webhook_url: str = ""
     free_cta: str = ""
     # Mondays: a short copy-ready summary of last week for social media, in the testing (else status) channel.
@@ -7260,7 +7259,7 @@ def day_clv_line(rows: list[dict]) -> str:
 
 
 def results_payload(cfg: Config, title_prefix: str, rows: list[dict], day_rows: list[dict],
-                    day, now: datetime | None = None, members: bool = True, cta: str = "") -> dict:
+                    day, now: datetime | None = None) -> dict:
     """A results card: the given bets one by one, then the day's record."""
     now = now or datetime.now(timezone.utc)
     shown = rows[:20]
@@ -7273,8 +7272,8 @@ def results_payload(cfg: Config, title_prefix: str, rows: list[dict], day_rows: 
                                  if graded else "")
     arbs = arbs_on(cfg, day)
     clv = day_clv_line(day_rows)
-    members = members_lines(cfg, day_rows) if members else ""   # (the free channel: no members' names)
-    link = site_link(cfg) + (f"\n{cta}" if cta else "")
+    members = members_lines(cfg, day_rows)
+    link = site_link(cfg)
     desc = (body + DIVIDER + f"**{day:%a %b %-d}** (every alert at the stake it showed)\n"
             + day_summary(day_rows, cfg, now) + (f"\n{clv}" if clv else "") + (f"\n{arbs}" if arbs else "")
             + (f"\n\n{members}" if members else "") + (f"\n\n{link}" if link else ""))
@@ -7559,13 +7558,6 @@ class Results:
             if not self.send(results_payload(self.cfg, f"📅 Results for {day:%a %b %-d}", rows, rows, day, now)):
                 return "failed"
             outcome = "sent"
-            if finished and self.cfg.free_webhook_url and not self.dry_run:   # (the free preview: the same card)
-                try:
-                    _webhook(self.cfg.free_webhook_url, results_payload(
-                        self.cfg, f"📅 Results for {day:%a %b %-d}", rows, rows, day, now, members=False,
-                        cta=self.cfg.free_cta))
-                except Exception as e:  # noqa: BLE001 - the free channel never holds up the members' card
-                    print(f"  ! Free channel: {e!r:.150}", file=sys.stderr)
         self.mark([r for r in _read_csv(self.cfg.ev_results_file) if local_day(self.cfg, r["commence_time"]) == day])
         if finished:
             self.recap_days = sorted(set(self.recap_days) | {day.isoformat()})[-14:]
@@ -11123,8 +11115,8 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
         if not (args.once or args.dry_run) and cfg.free_webhook_url and time.time() - teased > 300:
             teased = time.time()
             try:
-                if lines := free_teasers(cfg, now):
-                    send_teasers(cfg, lines)
+                if wins := free_wins(cfg, now):
+                    send_free_wins(cfg, wins)
             except Exception as e:  # noqa: BLE001
                 results_warned = results_trouble(status, e, results_warned, what="post to the free channel")
         if not (args.once or args.dry_run) and (day := site_due(cfg, now)) and time.time() - site_tried > 3600:
@@ -11404,12 +11396,12 @@ def send_digest(cfg: Config, t: "Trackers", day: date, now: datetime) -> int:
     return text.count("\n• ") + text.startswith("• ")
 
 
-FREE_TEASER_HOURS = 3   # a pick is shown in the free channel up to this many hours after its game started
+FREE_WIN_HOURS = 36   # a winning prop is shown in the free channel if its game started within this many hours
 
 
-def free_teasers(cfg: Config, now: datetime) -> list[str]:
-    """DISCORD_FREE_WEBHOOK_URL: picks whose games have just started (never before: nothing a free member could bet),
-    each once (state/free_posted.json): "🔒 Members got Lakers ML +110 at DraftKings 3h 20m before the game"."""
+def free_wins(cfg: Config, now: datetime) -> list[dict]:
+    """DISCORD_FREE_WEBHOOK_URL: player props that won and haven't been shown yet (each once: state/free_posted.json).
+    Only graded bets, so nothing a free member could still bet."""
     if not (cfg.free_webhook_url and cfg.state_dir):
         return []
     path = data_path(cfg.state_dir) / "free_posted.json"
@@ -11417,46 +11409,40 @@ def free_teasers(cfg: Config, now: datetime) -> list[str]:
         posted = json.loads(path.read_text()) if path.exists() else {}
     except (OSError, ValueError):
         posted = {}
-    lines = []
-    for bid, r in logged_bets(cfg, since=now - timedelta(hours=FREE_TEASER_HOURS)).items():
-        start = _parse_time(r["commence_time"])
-        if bid in posted or not (start <= now < start + timedelta(hours=FREE_TEASER_HOURS)):
+    cutoff = now - timedelta(hours=FREE_WIN_HOURS)
+    wins = []
+    for r in _read_csv(cfg.ev_results_file) if cfg.ev_results_file else []:
+        bid = _bet_id(r)
+        if (r.get("result") != "win" or not r.get("player") or bid in posted or not cfg.counts(r.get("book", ""))
+                or _parse_time(r["commence_time"]) < cutoff or str(r.get("live")).lower() == "true"):
             continue
         posted[bid] = r["commence_time"]
-        if str(r.get("live")).lower() == "true" or not r.get("first_seen"):
-            continue
-        ahead = (start - _parse_time(r["first_seen"])).total_seconds()
-        if ahead <= 0:
-            continue
-        pick = r.get("outcome", "") if r.get("kind") == "parlay" else row_pick(r)
-        lines.append(f"🔒 Members got **{pick} {odds(float(r['price']))}** at {r['book']} "
-                     f"{_fmt_ahead(ahead)} before the game ({r.get('matchup', '')})")
-    cutoff = now - timedelta(days=3)
-    posted = {k: v for k, v in posted.items() if _parse_time(v) > cutoff}
+        wins.append(r)
+    posted = {k: v for k, v in posted.items() if _parse_time(v) > now - timedelta(days=4)}
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(posted))
     tmp.replace(path)
-    return lines
+    return wins
 
 
-def _fmt_ahead(secs: float) -> str:
-    """"45 min", "3h 20m", "2 days"."""
-    if secs < 3600:
-        return f"{max(1, round(secs / 60))} min"
-    if secs < 86400:
-        h, m = divmod(round(secs / 60), 60)
-        return f"{h}h {m:02d}m" if m else f"{h}h"
-    return f"{secs / 86400:.0f} days"
+def free_win_embed(r: dict) -> dict:
+    """One winning prop for the free channel: "✅ Ka'imi Fairbairn Over 3.5 Receptions", members got it at its odds."""
+    finished = f" · finished with {r['actual']}" if r.get("actual") not in ("", None, "DNP") else ""
+    return {"title": f"✅ {row_pick(r)}"[:256], "color": 0x2ECC71,
+            "description": (f"Members got it at **{odds(float(r['price']))}** ({r['book']})\n"
+                            f"{sport_icon(r.get('sport_key', ''))} {r.get('sport', '')} · {r.get('matchup', '')}{finished}")}
 
 
-def send_teasers(cfg: Config, lines: list[str]) -> None:
-    """Post the free channel's teasers, up to 15 lines a message, with FREE_CTA under the last one."""
-    for i in range(0, len(lines), 15):
-        chunk = lines[i:i + 15]
-        last = i + 15 >= len(lines)
-        text = "\n".join(chunk) + (f"\n\n{cfg.free_cta}" if last and cfg.free_cta else "")
-        _webhook(cfg.free_webhook_url, {"username": BOT_NAME, "content": text[:1990], "allowed_mentions": {"parse": []}})
+def send_free_wins(cfg: Config, wins: list[dict]) -> None:
+    """Post the free channel's winning props, up to 10 cards a message, with FREE_CTA under the last message."""
+    for i in range(0, len(wins), 10):
+        last = i + 10 >= len(wins)
+        payload = {"username": BOT_NAME, "embeds": [free_win_embed(r) for r in wins[i:i + 10]],
+                   "allowed_mentions": {"parse": []}}
+        if last and cfg.free_cta:
+            payload["content"] = cfg.free_cta[:1990]
+        _webhook(cfg.free_webhook_url, payload)
 
 
 HEARTBEAT_SECONDS = 300
