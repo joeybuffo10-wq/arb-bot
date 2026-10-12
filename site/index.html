@@ -210,7 +210,9 @@
   function breakdowns(bets) {
     var box = document.getElementById("breakdowns");
     box.textContent = "";
-    [["By bet type", function (b) { return b.type; }],
+    var TIER_ORDER = ["🟢 Very confident", "🔵 Confident", "🟡 Somewhat confident", "🟠 Slight chance"];
+    [["By tier (how likely it was to hit)", function (b) { return b.tier || "Before tiers"; }],
+     ["By bet type", function (b) { return b.type; }],
      ["By sport", function (b) { return b.sport; }],
      ["By book", function (b) { return b.book; }],
      ["By month", function (b) { return MONTHS[+b.date.slice(5, 7) - 1] + " " + b.date.slice(0, 4); }]
@@ -224,7 +226,10 @@
       });
       var names = Object.keys(groups);
       if (!names.length) return;
-      if (spec[0] === "By month") names.sort(function (a, b) {
+      if (spec[0].indexOf("By tier") === 0) names.sort(function (a, b) {
+        var ia = TIER_ORDER.indexOf(a), ib = TIER_ORDER.indexOf(b);
+        return (ia < 0 ? 9 : ia) - (ib < 0 ? 9 : ib); });
+      else if (spec[0] === "By month") names.sort(function (a, b) {
         return a.slice(-4) - b.slice(-4) || MONTHS.indexOf(a.slice(0, 3)) - MONTHS.indexOf(b.slice(0, 3)); });
       else names.sort(function (a, b) { return groups[b].profit - groups[a].profit; });
       var card = el("div", { "class": "card tablewrap" });

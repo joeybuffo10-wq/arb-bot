@@ -413,6 +413,11 @@ class Config:
     # Discord role ids by book (BOOK_ROLES=draftkings=123,fanduel=456): a new +EV, prop, outlier or parlay
     # card pings its book's role instead of EV_MENTION / OUTLIER_MENTION / PARLAY_MENTION. Empty = those.
     book_roles: dict = field(default_factory=dict)
+    # Discord role ids by tier (TIER_ROLES=very=1,confident=2,somewhat=3,slight=4): a new bet card also pings its tier's
+    # role. Members who only want the likeliest bets hold just those roles (and no book roles). Empty = off.
+    tier_roles: dict = field(default_factory=dict)
+    # With DIGEST_HOUR: a "Top 3 of the day" post first, today's three most confident bets still good (TOP3=true).
+    top3: bool = False
     # One alert per bet: a bet that went out is never alerted again (not at a better price, not at another
     # book, not after a restart), and its card isn't edited except to mark it GONE.
     one_alert_per_bet: bool = False
@@ -725,6 +730,8 @@ class Config:
             arb_live=e("ARB_LIVE", "true").lower() in ("1", "true", "yes"),
             arbs_enabled=e("ARBS_ENABLED", "true").lower() in ("1", "true", "yes"),
             book_roles=parse_book_roles(e("BOOK_ROLES", "")),
+            tier_roles=parse_tier_roles(e("TIER_ROLES", "")),
+            top3=e("TOP3", "false").lower() in ("1", "true", "yes"),
             one_alert_per_bet=e("ONE_ALERT_PER_BET", "false").lower() in ("1", "true", "yes"),
             results_daily_only=e("RESULTS_DAILY_ONLY", "false").lower() in ("1", "true", "yes"),
             tune_enabled=e("TUNE_ENABLED", "false").lower() in ("1", "true", "yes"),
@@ -2223,6 +2230,21 @@ def book_slug(book: str) -> str:
     return "".join(c for c in book.lower() if c.isalnum())
 
 
+def parse_tier_roles(text: str) -> dict[str, str]:
+    """TIER_ROLES=very=123,confident=456,somewhat=789,slight=012: {tier key: role id} (see TIERS)."""
+    out = {}
+    keys = [key for _, _, _, key in TIERS]
+    for x in text.replace(";", ",").split(","):
+        if not x.strip():
+            continue
+        tier, sep, role = (s.strip().lower() for s in x.partition("="))
+        if not sep or tier not in keys or not role.isdigit():
+            raise ValueError(f"TIER_ROLES: '{x.strip()}' should look like very=123456789012345678 "
+                             f"(one of {', '.join(keys)}, then its Discord role id)")
+        out[tier] = role
+    return out
+
+
 def parse_book_roles(text: str) -> dict[str, str]:
     """BOOK_ROLES=DraftKings=123,FanDuel=456 (commas or semicolons; a book's name as its cards show it):
     {book slug: role id}. A role id is the number Discord copies with Developer Mode on."""
@@ -2797,8 +2819,12 @@ class Alerter:
     def mention_for(self, item) -> str:
         """Who a new card for this item pings: its book's role (BOOK_ROLES; nobody when its book has none),
         or else this alert type's mention."""
-        if self.book_pings and self.cfg.book_roles:
-            return book_role_mention(self.cfg, getattr(item, "book", ""))
+        if self.book_pings and (self.cfg.book_roles or self.cfg.tier_roles):
+            pings = [book_role_mention(self.cfg, getattr(item, "book", "")) if self.cfg.book_roles else ""]
+            if self.cfg.tier_roles and getattr(item, "fair_prob", 0) > 0:   # (and its tier's role: TIER_ROLES)
+                key = TIERS[tier_index(item.fair_prob, getattr(item, "confidence", ""))][3]
+                pings.append(f"<@&{self.cfg.tier_roles[key]}>" if key in self.cfg.tier_roles else "")
+            return " ".join(x for x in pings if x)
         return self.mention()
 
     @property
@@ -4562,18 +4588,31 @@ def status_line(status: str, book: str) -> str:
 
 
 # How likely a bet is to hit, for its card: (fair win chance from, icon, name), most likely first.
-TIERS = ((0.60, "🟢", "Very confident"), (0.50, "🔵", "Confident"), (0.35, "🟡", "Somewhat confident"),
-         (0.0, "🟠", "Slight chance"))
+TIERS = ((0.60, "🟢", "Very confident", "very"), (0.50, "🔵", "Confident", "confident"),
+         (0.35, "🟡", "Somewhat confident", "somewhat"), (0.0, "🟠", "Slight chance", "slight"))
+
+
+def tier_index(fair_prob: float, confidence: str = "") -> int:
+    """The bet's place in TIERS (0 = most likely to hit) by its fair win chance, one lower when the bot is only medium
+    (or low) confident in that price. Outliers and parlays have no confidence rating: their win chance decides."""
+    i = next(i for i, (cut, *_) in enumerate(TIERS) if fair_prob >= cut)
+    return min(i + 1, len(TIERS) - 1) if confidence in ("medium", "low") else i
 
 
 def tier_line(fair_prob: float, confidence: str = "") -> str:
-    """"🟢 **Very confident**": the bet's tier by its fair win chance (TIERS), one lower when the bot is only medium
-    (or low) confident in that price. Outliers and parlays have no confidence rating: their win chance decides."""
-    i = next(i for i, (cut, _, _) in enumerate(TIERS) if fair_prob >= cut)
-    if confidence in ("medium", "low"):
-        i = min(i + 1, len(TIERS) - 1)
-    _, icon, name = TIERS[i]
+    """"🟢 **Very confident**": the card's tier line."""
+    _, icon, name, _ = TIERS[tier_index(fair_prob, confidence)]
     return f"{icon} **{name}**"
+
+
+def row_tier(r: dict) -> str:
+    """A logged bet's tier as its card showed it ("🟢 Very confident"), from its fair odds and confidence ("" if unknown)."""
+    try:
+        p = 1 / float(r.get("fair_odds") or 0)
+    except (ValueError, ZeroDivisionError):
+        return ""
+    _, icon, name, _ = TIERS[tier_index(p, r.get("confidence", ""))]
+    return f"{icon} {name}"
 
 
 def fair_value_line(fair_prob: float) -> str:
@@ -7304,6 +7343,18 @@ def results_payload(cfg: Config, title_prefix: str, rows: list[dict], day_rows: 
                         "score; 🎯 means check that one yourself.")
 
 
+def tier_block(rows: list[dict]) -> str:
+    """Each tier's record ("🟢 Very confident: 12-5 · +$80 on $300 staked (ROI +26.7%) · won 71%"), most likely first:
+    whether the tiers hit as often as they say. "" with no graded bets."""
+    lines = []
+    for _, icon, name, _ in TIERS:
+        group = [r for r in rows if row_tier(r) == f"{icon} {name}"]
+        w, l = sum(r["result"] == "win" for r in group), sum(r["result"] == "loss" for r in group)
+        if group:
+            lines.append(f"{icon} {name}: {record_line(group)}" + (f" · won {w / (w + l):.0%}" if w + l else ""))
+    return "\n".join(lines)
+
+
 def live_off(cfg: Config) -> bool:
     """No live alerts of any kind go out now (live +EV, live outliers and arbs all off)."""
     return not (cfg.ev_live or cfg.outlier_live or (cfg.arbs_enabled and cfg.arb_live))
@@ -7349,6 +7400,8 @@ def scoreboard_text(cfg: Config, now: datetime | None = None) -> str:
     parts = [f"__**Today · {today:%a %b %-d}**__\n" + day_summary(rows, cfg, now) + (f"\n{arbs}" if arbs else ""),
              f"__**Last 7 days{pre}**__\n" + "\n".join(record_block(bettable(cfg, _graded(cfg, now - timedelta(days=7))))),
              f"__**All time{pre}**__\n" + "\n".join(record_block(bettable(cfg, _graded(cfg))))]
+    if by_tier := tier_block(bettable(cfg, _graded(cfg))):
+        parts.append("__**By tier (all time)**__\n" + by_tier)
     ever = clv_rows(cfg)
     if ever:
         good = sum(r["clv_pct"] for r in ever) > 0 and sum(r["beat_close"] for r in ever) * 2 > len(ever)
@@ -9025,6 +9078,8 @@ def weekly_text(cfg: Config, end_day: date, held: dict | None = None) -> tuple[s
     for kind in [k for k in WEEKLY_TYPES if k not in off]:
         parts.append("\n".join(read(f"the {kind} numbers", lambda kind=kind: _weekly_section(
             cfg, kind, start, end_day, graded, clv, marks, whys.get(kind, {})), [f"**{kind}**: couldn't read it"])))
+    if by_tier := read("the tiers", lambda: tier_block(graded), ""):
+        parts.append("🎚️ **By tier**\n" + by_tier)
     tips = read("the suggestions", lambda: weekly_suggestions(cfg, clv, marks), [])
     parts.append("💡 **Suggestions** (nothing changes unless you change it)\n"
                  + ("\n".join(f"• {t}" for t in tips) if tips else "• Nothing to judge yet this week."))
@@ -11337,7 +11392,8 @@ def site_data(cfg: Config, now: datetime | None = None) -> dict:
                      "odds": odds(float(r["price"])), "units": round(float(r["stake"]) / unit, 2),
                      "result": r["result"], "profit": round(float(r["profit"]) / unit, 2),
                      "clv": round(float(clv), 2) if clv not in ("", None) else None,
-                     "type": {"ev": "+EV", "outlier": "Outlier", "prop": "Prop", "parlay": "Parlay"}.get(_kind(r), "+EV")})
+                     "type": {"ev": "+EV", "outlier": "Outlier", "prop": "Prop", "parlay": "Parlay"}.get(_kind(r), "+EV"),
+                     "tier": row_tier(r)})
     return {"name": BOT_NAME, "updated": now.isoformat(timespec="minutes"), "unit": unit, "bets": bets,
             "live": not live_off(cfg)}
 
@@ -11421,6 +11477,33 @@ def digest_text(cfg: Config, t: "Trackers", now: datetime) -> str:
             + "\n".join(shown) + more)[:1990]
 
 
+def top3_text(cfg: Config, t: "Trackers", now: datetime) -> str:
+    """TOP3: today's three most confident bets still at a good price (games today, New York time, not started yet):
+    the highest tier first, then the bot's own confidence in the price, then the higher win chance. "" with none."""
+    today = now.astimezone(ZoneInfo(cfg.timezone)).date()
+    rank = {"high": 0, "medium": 1, "low": 2}
+    picks = []
+    for a in (t.evs, t.prop_evs, t.period_evs, t.outs, t.prop_outs, t.period_outs):
+        for op in a.open.values():
+            b = op.sent_item or op.arb
+            if not (op.sent and op.message_id) or op.status.startswith("moved") or not hasattr(b, "pick"):
+                continue
+            start = _parse_time(b.commence_time)
+            if b.is_live or start <= now or start.astimezone(ZoneInfo(cfg.timezone)).date() != today:
+                continue
+            picks.append(((tier_index(b.fair_prob, b.confidence), rank.get(b.confidence, 1), -b.fair_prob, -b.ev_pct), b))
+    if not picks:
+        return ""
+    picks.sort(key=lambda x: x[0])
+    lines = []
+    for i, (_, b) in enumerate(picks[:3]):
+        ts = int(_parse_time(b.commence_time).timestamp())
+        lines.append(f"{['🥇', '🥈', '🥉'][i]} {tier_line(b.fair_prob, b.confidence)} · "
+                     f"**{_link(f'{b.pick} {odds(b.price)}', b.link)}** · {b.book} · **{b.stake_label}**\n"
+                     f"     {sport_icon(b.sport_key)} {b.matchup}, <t:{ts}:t> · {b.fair_prob:.0%} to win")
+    return "🏆 **Top 3 of the day** (the most confident bets still good today)\n" + "\n".join(lines)
+
+
 def _day_marker(cfg: Config, name: str) -> Path | None:
     return data_path(cfg.state_dir) / name if cfg.state_dir else None
 
@@ -11438,7 +11521,11 @@ def digest_due(cfg: Config, now: datetime) -> date | None:
 
 
 def send_digest(cfg: Config, t: "Trackers", day: date, now: datetime) -> int:
-    """Post the morning digest to the +EV channel (no ping) and remember the day; returns how many bets it listed."""
+    """Post the morning digest to the +EV channel (no ping), after the Top 3 of the day (TOP3), and remember the day;
+    returns how many bets the digest listed."""
+    if cfg.top3 and (top := top3_text(cfg, t, now)):
+        _webhook(cfg.ev_webhook_url or cfg.webhook_url, {"username": BOT_NAME, "content": top[:1990],
+                                                         "allowed_mentions": {"parse": []}})
     text = digest_text(cfg, t, now)
     if text:
         _webhook(cfg.ev_webhook_url or cfg.webhook_url, {"username": BOT_NAME, "content": text,

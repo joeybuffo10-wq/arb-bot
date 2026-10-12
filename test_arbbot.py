@@ -8214,7 +8214,8 @@ class WeeklyReportCard(MixFiles):
         self.assertIn("still there 35%", text)
         self.assertIn("✋ Held back: 2 (2 over the hourly cap)", text)
         self.assertIn("🎯 **Props** · 6-0 · +$144 on $120 staked (ROI +120.0%)", text)
-        self.assertIn("📦 **Parlays** · no graded bets yet\n\n💡 **Suggestions**", text)   # nothing else to say
+        self.assertIn("📦 **Parlays** · no graded bets yet\n\n🎚️ **By tier**\n", text)   # nothing else to say
+        self.assertIn("🔵 Confident: 13-6", text)                                      # (the tiers' own records)
         self.assertIn("• Live outliers: sent +22.0% → -0.4% ~3 min later (still there 35%) → too early to tell "
                       "(40 bets)", text)
         self.assertIn("• Pre-game +EV: CLV +3.4%, beat the close 100% over 8 bets → keep", text)
@@ -13516,6 +13517,47 @@ class EVBotSpec(MixFiles):
         with self.assertRaises(ValueError):
             Config(same_game_stake=0).check()
 
+    def test_a_card_pings_its_book_and_its_tier(self):
+        cfg = Config(book_roles={"b": "111"}, tier_roles={"very": "1", "confident": "2", "somewhat": "3", "slight": "4"})
+        [b] = find_evs([self.game({"B": 2.20})], Config(min_ev_pct=3), NOW)          # 50% to win, medium: somewhat
+        a = EVAlerter(cfg, dry_run=True)
+        self.assertEqual(a.mention_for(b), "<@&111> <@&3>")
+        self.assertEqual(a.mention_for(replace(b, confidence="high", fair_prob=0.62)), "<@&111> <@&1>")
+        self.assertEqual(_arbbot.allowed_mentions("<@&111> <@&3>"), {"parse": [], "roles": ["111", "3"]})
+        self.assertEqual(EVAlerter(Config(tier_roles={"very": "1"}), True).mention_for(replace(b, fair_prob=0.7,
+                                                                                            confidence="high")), "<@&1>")
+        self.assertEqual(Alerter(cfg, True).mention_for(b), "")                     # arbs: neither
+        with self.assertRaises(ValueError):
+            _arbbot.parse_tier_roles("best=5")
+
+    def test_results_say_how_each_tier_did(self):
+        rows = [{"fair_odds": "1.6", "confidence": "high", "result": "win", "stake": "20", "profit": "18"},
+                {"fair_odds": "1.6", "confidence": "high", "result": "loss", "stake": "20", "profit": "-20"},
+                {"fair_odds": "3.5", "confidence": "", "result": "win", "stake": "10", "profit": "25"}]
+        self.assertEqual([_arbbot.row_tier(r) for r in rows], ["🟢 Very confident", "🟢 Very confident", "🟠 Slight chance"])
+        text = _arbbot.tier_block(rows)
+        self.assertTrue(text.startswith("🟢 Very confident: 1-1 · "), text)
+        self.assertIn("won 50%", text)
+        self.assertIn("🟠 Slight chance: 1-0", text)
+        self.assertEqual(_arbbot.row_tier({"fair_odds": ""}), "")
+
+    def test_the_top_3_are_todays_most_confident_bets(self):
+        sent = []
+        t = self.live(sent, one_alert_per_bet=True, outliers_enabled=False, top3=True, digest_hour=10)
+        self.main(t, [self.game({"B": 2.20}, ev_id=g) for g in ("e1", "e2", "e3", "e4")], 0)
+        ops = list(t.evs.open.values())
+        probs = {"e1": 0.45, "e2": 0.62, "e3": 0.55, "e4": 0.58}
+        for op in ops:
+            op.sent_item = replace(op.arb, fair_prob=probs[op.arb.event_id], confidence="high")
+        text = _arbbot.top3_text(t.cfg, t, at(60))
+        self.assertTrue(text.startswith("🏆 **Top 3 of the day**"))
+        order = [line.split(" · ")[0] for line in text.splitlines()[1::2]]
+        self.assertEqual(order, ["🥇 🟢 **Very confident**", "🥈 🔵 **Confident**", "🥉 🔵 **Confident**"])
+        self.assertIn("62% to win", text.splitlines()[2])                              # e2 first
+        self.assertIn("58% to win", text.splitlines()[4])                              # then e4 (58%), then e3 (55%)
+        self.assertNotIn("45%", text)                                                 # e1: 4th, left out
+        self.assertEqual(_arbbot.top3_text(t.cfg, t, _parse(self.PRE) + timedelta(minutes=1)), "")   # started
+
     def test_props_are_limited_per_player_not_per_game(self):
         sent = []
         t = self.live(sent, one_alert_per_bet=True, same_game_full=2, same_game_max=4, same_player_full=1,
@@ -13618,7 +13660,7 @@ class EVBotSpec(MixFiles):
         self.assertEqual(len(data["bets"]), 1)
         self.assertEqual(data["bets"][0], {"date": "2026-10-03", "sport": "NHL", "game": "Away @ Home", "bet": "Home ML",
                                            "book": "BetMGM", "odds": "+120", "units": 2.0, "result": "win",
-                                           "profit": 2.4, "clv": 3.5, "type": "+EV"})
+                                           "profit": 2.4, "clv": 3.5, "type": "+EV", "tier": ""})
         self.assertFalse(data["live"])
 
     def test_the_public_page_is_uploaded_once_a_night(self):
