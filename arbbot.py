@@ -419,7 +419,11 @@ class Config:
     tier_roles: dict = field(default_factory=dict)
     # With DIGEST_HOUR: a "Top 3 of the day" post first, today's three most confident bets still good (TOP3=true).
     top3: bool = False
-    top3_webhook_url: str = ""   # the Top 3's own channel (only the Top 3 goes there); empty = the +EV channel
+    # The top picks' own channel: each 🟢 Very confident bet (not outliers or parlays) is also posted there the moment it
+    # goes out, "🏆 Top pick #1 of the day", at most TOP_PICKS a New York day, with the same ✅ / GONE updates. Nothing
+    # else goes there. Without it, TOP3 is a 10am post of the day's top TOP_PICKS in the +EV channel instead.
+    top3_webhook_url: str = ""
+    top_picks: int = 3
     # One alert per bet: a bet that went out is never alerted again (not at a better price, not at another
     # book, not after a restart), and its card isn't edited except to mark it GONE.
     one_alert_per_bet: bool = False
@@ -735,6 +739,7 @@ class Config:
             tier_roles=parse_tier_roles(e("TIER_ROLES", "")),
             top3=e("TOP3", "false").lower() in ("1", "true", "yes"),
             top3_webhook_url=e("DISCORD_TOP3_WEBHOOK_URL", ""),
+            top_picks=num("TOP_PICKS", d.top_picks, int),
             one_alert_per_bet=e("ONE_ALERT_PER_BET", "false").lower() in ("1", "true", "yes"),
             results_daily_only=e("RESULTS_DAILY_ONLY", "false").lower() in ("1", "true", "yes"),
             tune_enabled=e("TUNE_ENABLED", "false").lower() in ("1", "true", "yes"),
@@ -898,6 +903,8 @@ class Config:
             raise ValueError("SAME_GAME_STAKE should be over 0 and at most 1, SAME_GAME_FULL and SAME_GAME_MAX 0 or more")
         if self.parlay_dk_format not in DK_FORMATS:
             raise ValueError(f"PARLAY_DK_FORMAT={self.parlay_dk_format} should be one of {', '.join(DK_FORMATS)}")
+        if not 1 <= self.top_picks <= 10:
+            raise ValueError(f"TOP_PICKS={self.top_picks} should be 1 to 10")
         if self.tune_since:
             try:
                 date.fromisoformat(self.tune_since)
@@ -2413,6 +2420,7 @@ class OpenArb:
     shown: tuple = ()         # (book, price, stake) of the bet as its card shows it (an arb: ())
     # ONE_ALERT_PER_BET: the bet as its card went out, how that card was drawn, and its ✅ / ⚠️ line ("" = none yet)
     sent_item: object = None
+    top3: tuple = ()          # its copy in the Top 3 channel: (message id, its number that day), when it's one
     render: object = None
     status: str = ""
 
@@ -2675,6 +2683,7 @@ class Alerter:
     throttle_edits = False
     book_pings = False   # a new card pings its book's Discord role when BOOK_ROLES is set (bets, not arbs)
     one_alert = False    # ONE_ALERT_PER_BET applies (bets, not arbs)
+    top3_ok = False      # a 🟢 Very confident bet of this kind can be a Top 3 pick (+EV, props, halves: not outliers)
     alerted: "AlertedBets | None" = None   # the bets already alerted, shared by every bet alerter (Trackers)
 
     def __init__(self, cfg: Config, dry_run: bool, noun: str | None = None, props: bool = False):
@@ -3024,6 +3033,8 @@ class Alerter:
             self.alerted.add(self.bet_identity(op.arb), self.bet_expires(op.arb), now)
         if self.once:
             op.sent_item, op.render = op.arb, self.payload
+        if self.top3_ok and op.message_id and not self.dry_run and not op.top3:
+            self.top3_pick(op, now)
         if self.on_posted and op.message_id and not self.dry_run:
             try:
                 self.on_posted({"first_seen": _utc(op.first_seen), **self.row(op)}, op.message_id, op.url)
@@ -3218,6 +3229,46 @@ class Alerter:
         self._save_state()
         return new
 
+    def top3_payload(self, op: OpenArb, **kw) -> dict:
+        """The card as it went out, titled as the day's Top pick (#n), for the Top 3 channel: no ping there."""
+        payload = (op.render or self.payload)(op.sent_item or op.arb, first_seen=op.first_seen, **kw)
+        emb = payload["embeds"][0]
+        emb["title"] = f"🏆 Top pick #{op.top3[1]} of the day · {emb['title']}"[:256]
+        payload.pop("content", None)
+        payload["allowed_mentions"] = {"parse": []}
+        return payload
+
+    def top3_pick(self, op: OpenArb, now: float) -> None:
+        """DISCORD_TOP3_WEBHOOK_URL: a 🟢 Very confident bet is also posted in the top picks' channel, the day's first
+        TOP_PICKS only (New York date, remembered across restarts in state/top3.json)."""
+        cfg, b = self.cfg, op.arb
+        if not (cfg.top3 and cfg.top3_webhook_url and cfg.state_dir) or tier_index(b.fair_prob, b.confidence) != 0:
+            return
+        day = datetime.fromtimestamp(now, ZoneInfo(cfg.timezone)).date().isoformat()
+        path = data_path(cfg.state_dir) / "top3.json"
+        try:
+            picked = json.loads(path.read_text()) if path.exists() else {}
+        except (OSError, ValueError):
+            picked = {}
+        today = picked.get(day, [])
+        if len(today) >= cfg.top_picks or b.key in today:
+            return
+        op.top3 = ("", len(today) + 1)
+        try:
+            msg = _webhook(cfg.top3_webhook_url, self.top3_payload(op))
+        except Exception as e:  # noqa: BLE001 - never holds up the alert itself
+            print(f"  ! Top 3 channel: {e!r:.150}", file=sys.stderr)
+            op.top3 = ()
+            return
+        op.top3 = ((msg or {}).get("id", ""), op.top3[1])
+        picked = {d: v for d, v in picked.items() if d >= (date.fromisoformat(day) - timedelta(days=7)).isoformat()}
+        picked[day] = today + [b.key]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(picked))
+        tmp.replace(path)
+        print(f"  🏆 Top pick #{op.top3[1]} of the day: {self.label(b)}", flush=True)
+
     def still_good(self, op: OpenArb, item, now: float) -> None:
         """ONE_ALERT_PER_BET: a card that went out keeps its bet, stake and odds as sent; only its last line says
         whether the book it named still has a good price (✅: at least OK_EDGE_PCT of edge against today's fair
@@ -3234,6 +3285,8 @@ class Alerter:
         if status != op.status:
             op.status, op.edited = status, now
             self._discord(op.render(sent, first_seen=op.first_seen, status=status), op.message_id, op.url)
+            if op.top3 and op.top3[0]:   # (its Top 3 copy too)
+                self._discord(self.top3_payload(op, status=status), op.top3[0], self.cfg.top3_webhook_url)
 
     def _close(self, key: str, now: float) -> None:
         op = self.open.pop(key)
@@ -3255,6 +3308,8 @@ class Alerter:
         print(f"  ❌ gone after {_fmt_secs(lasted)}: {self.label(op.arb)}", flush=True)
         if op.message_id:
             self._discord(self.payload(op.arb, gone_after=lasted), op.message_id, op.url)
+            if op.top3 and op.top3[0]:
+                self._discord(self.payload(op.arb, gone_after=lasted), op.top3[0], self.cfg.top3_webhook_url)
         self.stats["closed"] += 1
         self.stats["open_seconds"] += lasted
         if not self.log_on_open:
@@ -4661,6 +4716,7 @@ EV_LOG_FIELDS = ["first_seen", "event_id", "sport", "sport_key", "matchup",
 
 class EVAlerter(Alerter):
     noun = "+EV bets"
+    top3_ok = True
     book_pings = True   # (outliers too)
     one_alert = True
     log_fields = EV_LOG_FIELDS
@@ -5829,6 +5885,7 @@ def outlier_payload(b: EVBet, mention: str = "", gone_after: float | None = None
 
 
 class OutlierAlerter(EVAlerter):
+    top3_ok = False   # (big edges the book may void: not a Top 3 pick)
     noun = "outliers"
 
     def text(self, item) -> str:
@@ -11500,12 +11557,13 @@ def top3_text(cfg: Config, t: "Trackers", now: datetime) -> str:
         return ""
     picks.sort(key=lambda x: x[0])
     lines = []
-    for i, (_, b) in enumerate(picks[:3]):
+    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+    for i, (_, b) in enumerate(picks[:cfg.top_picks]):
         ts = int(_parse_time(b.commence_time).timestamp())
-        lines.append(f"{['🥇', '🥈', '🥉'][i]} {tier_line(b.fair_prob, b.confidence)} · "
+        lines.append(f"{medals[i] if i < len(medals) else '•'} {tier_line(b.fair_prob, b.confidence)} · "
                      f"**{_link(f'{b.pick} {odds(b.price)}', b.link)}** · {b.book} · **{b.stake_label}**\n"
                      f"     {sport_icon(b.sport_key)} {b.matchup}, <t:{ts}:t> · {b.fair_prob:.0%} to win")
-    return "🏆 **Top 3 of the day** (the most confident bets still good today)\n" + "\n".join(lines)
+    return f"🏆 **Top {cfg.top_picks} of the day** (the most confident bets still good today)\n" + "\n".join(lines)
 
 
 def _day_marker(cfg: Config, name: str) -> Path | None:
@@ -11527,8 +11585,9 @@ def digest_due(cfg: Config, now: datetime) -> date | None:
 def send_digest(cfg: Config, t: "Trackers", day: date, now: datetime) -> int:
     """Post the morning digest to the +EV channel (no ping), after the Top 3 of the day (TOP3), and remember the day;
     returns how many bets the digest listed."""
-    if cfg.top3 and (top := top3_text(cfg, t, now)):   # (its own channel when it has one: nothing else goes there)
-        _webhook(cfg.top3_webhook_url or cfg.ev_webhook_url or cfg.webhook_url,
+    # (With its own channel the Top 3 are posted there as they go out instead: see Alerter.top3_pick.)
+    if cfg.top3 and not cfg.top3_webhook_url and (top := top3_text(cfg, t, now)):
+        _webhook(cfg.ev_webhook_url or cfg.webhook_url,
                  {"username": BOT_NAME, "content": top[:1990], "allowed_mentions": {"parse": []}})
     text = digest_text(cfg, t, now)
     if text:

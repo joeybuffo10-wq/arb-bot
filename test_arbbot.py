@@ -13072,6 +13072,8 @@ class PropOutlierBadData(MixFiles):
 
 from datetime import date, time as dtime   # noqa: E402 (the daily-card tests below)
 
+real_find_evs = _arbbot.find_evs
+
 
 def round_stake_for(stake, cfg):
     return _arbbot.round_stake(stake, cfg.ev_bankroll * cfg.ev_max_stake_pct / 100, cfg)
@@ -13562,8 +13564,51 @@ class EVBotSpec(MixFiles):
         own = replace(t.cfg, top3_webhook_url="https://top3", ev_webhook_url="https://ev")
         with mock.patch("arbbot._webhook", lambda url, payload, *a, **k: posts.append((url, payload["content"][:20]))):
             _arbbot.send_digest(own, t, date(2026, 10, 3), at(60))
-        self.assertEqual([url for url, _ in posts], ["https://top3", "https://ev"])     # Top 3 alone in its channel
-        self.assertTrue(posts[0][1].startswith("🏆"))
+        self.assertEqual([url for url, _ in posts], ["https://ev"])     # its own channel: picks go there live instead
+        posts.clear()
+        with mock.patch("arbbot._webhook", lambda url, payload, *a, **k: posts.append((url, payload["content"][:20]))):
+            _arbbot.send_digest(replace(own, top3_webhook_url=""), t, date(2026, 10, 3), at(60))
+        self.assertTrue(posts[0][1].startswith("🏆"))                                # no channel: the 10am post
+
+    def test_very_confident_bets_go_to_the_top_3_channel_as_they_go_out(self):
+        from unittest import mock
+        sent = []
+        t = self.live(sent, one_alert_per_bet=True, outliers_enabled=False, top3=True,
+                      top3_webhook_url="https://top3", top_picks=5)
+        top3 = []
+        def hook(url, payload, *a, **k):
+            top3.append((payload["embeds"][0]["title"], payload.get("content", "")))
+            return {"id": f"t{len(top3)}"}
+        def sure(ev_id, price=1.80):          # 62% to win at Pinnacle's -163: very confident once it's high
+            ev = ev_event([("Home", 1.55, None), ("Away", 2.55, None)], {"B": [("Home", price, None)]}, start=self.PRE)
+            ev.update(id=ev_id, sport_key="basketball_nba")
+            return ev
+        [b] = find_evs([stamped(sure("x"), 0)], t.cfg, at(0))
+        self.assertGreaterEqual(b.fair_prob, 0.6)
+        high = lambda *a, **k: [replace(x, confidence="high") for x in real_find_evs(*a, **k)]
+        with mock.patch("arbbot._webhook", hook), mock.patch("arbbot.find_evs", high):
+            self.main(t, [sure(f"e{i}") for i in range(7)], 0)
+        self.assertEqual(len(sent), 7)                                                # all seven go out as usual
+        self.assertEqual([title.split(" · ")[0] for title, _ in top3],
+                         [f"🏆 Top pick #{n} of the day" for n in range(1, 6)])        # the day's first 5 only
+        self.assertEqual({c for _, c in top3}, {""})                                  # no pings there
+        self.assertEqual(len([op for op in t.evs.open.values() if op.top3]), 5)
+        with mock.patch("arbbot._webhook", hook):
+            self.main(t, [], 60)                                                      # all gone
+        self.assertEqual(sum(1 for m, title, *_ in sent if title.startswith("❌ GONE")), 12)  # 7 cards + 5 copies
+
+    def test_a_less_confident_bet_or_an_outlier_is_never_a_top_pick(self):
+        from unittest import mock
+        cfg = self.cfg(Config(top3=True, top3_webhook_url="https://top3", webhook_url="https://main"))
+        a = EVAlerter(cfg, dry_run=False)
+        [b] = find_evs([self.game({"B": 2.20})], Config(min_ev_pct=3), NOW)          # 50%: not very confident
+        op = _arbbot.OpenArb(b, 0.0, 0.0, b.ev_pct, message_id="m1")
+        with mock.patch("arbbot._webhook", side_effect=AssertionError("not a top pick")):
+            a.top3_pick(op, NOW.timestamp())
+            OutlierAlerter(cfg, dry_run=False)._went_out(
+                _arbbot.OpenArb(replace(b, fair_prob=0.7, confidence="high"), 0.0, 0.0, 20.0, message_id="m2"),
+                NOW.timestamp(), None)
+        self.assertEqual(op.top3, ())
 
     def test_props_are_limited_per_player_not_per_game(self):
         sent = []
