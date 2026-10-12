@@ -13526,8 +13526,10 @@ class EVBotSpec(MixFiles):
         self.assertEqual(a.mention_for(b), "<@&111> <@&3>")
         self.assertEqual(a.mention_for(replace(b, confidence="high", fair_prob=0.62)), "<@&111> <@&1>")
         self.assertEqual(_arbbot.allowed_mentions("<@&111> <@&3>"), {"parse": [], "roles": ["111", "3"]})
-        self.assertEqual(EVAlerter(Config(tier_roles={"very": "1"}), True).mention_for(replace(b, fair_prob=0.7,
+        self.assertEqual(EVAlerter(Config(tier_roles={"very": "1"}), True).mention_for(replace(b, fair_prob=0.65,
                                                                                             confidence="high")), "<@&1>")
+        self.assertEqual(EVAlerter(Config(tier_roles={"very": "1"}), True).mention_for(replace(b, fair_prob=0.72,
+                                                                                            confidence="high")), "<@&1>")   # 💎 is top picks only
         self.assertEqual(Alerter(cfg, True).mention_for(b), "")                     # arbs: neither
         with self.assertRaises(ValueError):
             _arbbot.parse_tier_roles("best=5")
@@ -13570,32 +13572,40 @@ class EVBotSpec(MixFiles):
             _arbbot.send_digest(replace(own, top3_webhook_url=""), t, date(2026, 10, 3), at(60))
         self.assertTrue(posts[0][1].startswith("🏆"))                                # no channel: the 10am post
 
-    def test_very_confident_bets_go_to_the_top_3_channel_as_they_go_out(self):
+    def test_elite_bets_go_to_the_top_picks_channel_as_they_go_out(self):
         from unittest import mock
         sent = []
         t = self.live(sent, one_alert_per_bet=True, outliers_enabled=False, top3=True,
                       top3_webhook_url="https://top3", top_picks=5)
-        top3 = []
+        top3, descs = [], []
         def hook(url, payload, *a, **k):
             top3.append((payload["embeds"][0]["title"], payload.get("content", "")))
+            descs.append(payload["embeds"][0]["description"])
             return {"id": f"t{len(top3)}"}
-        def sure(ev_id, price=1.80):          # 62% to win at Pinnacle's -163: very confident once it's high
-            ev = ev_event([("Home", 1.55, None), ("Away", 2.55, None)], {"B": [("Home", price, None)]}, start=self.PRE)
+        def sure(ev_id, price=1.50):          # ~72% to win at Pinnacle: 💎 Elite once it's high confidence
+            ev = ev_event([("Home", 1.35, None), ("Away", 3.60, None)], {"B": [("Home", price, None)]}, start=self.PRE)
             ev.update(id=ev_id, sport_key="basketball_nba")
             return ev
         [b] = find_evs([stamped(sure("x"), 0)], t.cfg, at(0))
-        self.assertGreaterEqual(b.fair_prob, 0.6)
+        self.assertGreaterEqual(b.fair_prob, 0.7)
+        self.assertTrue(_arbbot.is_elite(replace(b, confidence="high")))
+        self.assertFalse(_arbbot.is_elite(replace(b, confidence="high", sharp_prob=None)))    # not Pinnacle's own price
+        self.assertFalse(_arbbot.is_elite(replace(b, confidence="medium")))
+        self.assertFalse(_arbbot.is_elite(replace(b, confidence="high", fair_prob=0.68)))
         high = lambda *a, **k: [replace(x, confidence="high") for x in real_find_evs(*a, **k)]
         with mock.patch("arbbot._webhook", hook), mock.patch("arbbot.find_evs", high):
             self.main(t, [sure(f"e{i}") for i in range(7)], 0)
         self.assertEqual(len(sent), 7)                                                # all seven go out as usual
         self.assertEqual([title.split(" · ")[0] for title, _ in top3],
-                         [f"🏆 Top pick #{n} of the day" for n in range(1, 6)])        # the day's first 5 only
+                         [f"🏆 Top pick #{n} of the day" for n in range(1, 8)])        # every one: no limit
         self.assertEqual({c for _, c in top3}, {""})                                  # no pings there
-        self.assertEqual(len([op for op in t.evs.open.values() if op.top3]), 5)
+        self.assertTrue(all("💎 **Elite**" in d and "Very confident" not in d for d in descs))   # 💎 only there
+        self.assertTrue(all("🟢 **Very confident**" in body and "Elite" not in body for body in self.bodies))
+        self.assertEqual(len([op for op in t.evs.open.values() if op.top3]), 7)
         with mock.patch("arbbot._webhook", hook):
             self.main(t, [], 60)                                                      # all gone
-        self.assertEqual(sum(1 for m, title, *_ in sent if title.startswith("❌ GONE")), 12)  # 7 cards + 5 copies
+        self.assertEqual(sum(1 for m, title, *_ in sent if title.startswith("❌ GONE")), 7)
+        self.assertEqual(sum(1 for m, title, *_ in sent if title.startswith("🏆 Top pick #") and "❌ GONE" in title), 7)
 
     def test_a_less_confident_bet_or_an_outlier_is_never_a_top_pick(self):
         from unittest import mock
@@ -13897,6 +13907,8 @@ class EVBotSpec(MixFiles):
 
     def test_every_card_says_how_likely_it_is_to_hit(self):
         tier = _arbbot.tier_line
+        self.assertEqual((tier(0.72, "high"), tier(0.72, "medium")),
+                         ("🟢 **Very confident**", "🔵 **Confident**"))   # 💎 Elite never shows on a normal card
         self.assertEqual([tier(p) for p in (0.62, 0.55, 0.40, 0.20)],
                          ["🟢 **Very confident**", "🔵 **Confident**", "🟡 **Somewhat confident**", "🟠 **Slight chance**"])
         self.assertEqual((tier(0.62, "medium"), tier(0.20, "medium")), ("🔵 **Confident**", "🟠 **Slight chance**"))
