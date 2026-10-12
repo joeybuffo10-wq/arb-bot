@@ -91,7 +91,18 @@
 (function () {
   var TYPES = ["All", "+EV", "Prop", "Outlier", "Parlay"];
   var RANGES = [["7 days", 7], ["30 days", 30], ["All time", 0]];
-  var state = { type: "All", days: 0, bets: [] };
+  var state = { type: "All", days: 0, from: "", to: "", bets: [] };
+  // ?from=YYYY-MM-DD&to=YYYY-MM-DD (the Discord results cards link one day or one week this way)
+  (function () {
+    var q = new URLSearchParams(location.search), ok = /^\d{4}-\d{2}-\d{2}$/;
+    var f = q.get("from") || "", t = q.get("to") || f;
+    if (ok.test(f) && ok.test(t)) { state.from = f; state.to = t; state.days = -1; }
+  })();
+  function spanLabel() {
+    var o = { month: "short", day: "numeric" }, f = new Date(state.from + "T12:00:00"), t = new Date(state.to + "T12:00:00");
+    return state.from === state.to ? f.toLocaleDateString([], o)
+      : f.toLocaleDateString([], o) + " – " + t.toLocaleDateString([], o);
+  }
 
   function units(x) { return (x > 0 ? "+" : x < 0 ? "−" : "") + Math.abs(x).toFixed(2) + "u"; }
   function pct(x) { return (x > 0 ? "+" : x < 0 ? "−" : "") + Math.abs(x).toFixed(1) + "%"; }
@@ -116,11 +127,12 @@
 
   function chosen() {
     var cutoff = null;
-    if (state.days) {
+    if (state.days > 0) {
       var d = new Date(); d.setDate(d.getDate() - state.days);
       cutoff = d.toISOString().slice(0, 10);
     }
     return state.bets.filter(function (b) {
+      if (state.days === -1 && (b.date < state.from || b.date > state.to)) return false;
       return (state.type === "All" || b.type === state.type) && (!cutoff || b.date >= cutoff);
     });
   }
@@ -273,7 +285,7 @@
 
   function render() {
     buttons("types", TYPES, state.type, function (v) { state.type = v; });
-    buttons("ranges", RANGES, state.days, function (v) { state.days = v; });
+    buttons("ranges", (state.from ? [[spanLabel(), -1]] : []).concat(RANGES), state.days, function (v) { state.days = v; });
     var bets = chosen();
     stats(bets); chart(bets); clvChart(bets); breakdowns(bets); table(bets);
   }

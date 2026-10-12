@@ -7359,7 +7359,7 @@ def results_payload(cfg: Config, title_prefix: str, rows: list[dict], day_rows: 
     arbs = arbs_on(cfg, day)
     clv = day_clv_line(day_rows)
     members = members_lines(cfg, day_rows)
-    link = site_link(cfg)
+    link = site_link(cfg, day=day)
     desc = (body + DIVIDER + f"**{day:%a %b %-d}** (every alert at the stake it showed)\n"
             + day_summary(day_rows, cfg, now) + (f"\n{clv}" if clv else "") + (f"\n{arbs}" if arbs else "")
             + (f"\n\n{members}" if members else "") + (f"\n\n{link}" if link else ""))
@@ -9120,6 +9120,8 @@ def weekly_payload(cfg: Config, end_day: date, held: dict | None = None) -> dict
     week = [r for d in range(1, 8) for r in day_bets(cfg, end_day - timedelta(days=d))]
     if members := members_lines(cfg, week, top=5):   # (✅ tracking: the week's leaderboard)
         text = (text + "\n\n__**🏆 Members this week**__\n" + members)[:4000]
+    if link := site_link(cfg, week=end_day - timedelta(days=1)):
+        text = text[:4000 - len(link) - 2] + "\n\n" + link
     return _card(title, text, 0x2ECC71 if profit > 0 else (0xE74C3C if profit < 0 else 0x5865F2),
                  footer="Suggestions only: the bot never changes a setting by itself."
                         + (" Each arb counts once a day, placed at BANKROLL." if cfg.arbs_enabled else ""))
@@ -11398,10 +11400,21 @@ def go_url(cfg: Config) -> str:
     return f"{url}go.html" if url else ""
 
 
-def site_link(cfg: Config) -> str:
-    """The results cards' line pointing to the public page ("" without one)."""
+def site_link(cfg: Config, day: date | None = None, week: date | None = None) -> str:
+    """The results cards' line pointing to the public page ("" without one): with `day`, that day's bets and the 7
+    days up to it (the daily card); with `week` (its last day), that week's (the weekly card); then the whole record."""
     url = site_url(cfg)
-    return f"🌐 **Full record, every bet:** [EV BOT results]({url})" if url else ""
+    if not url:
+        return ""
+    span = lambda a, b: f"{url}?from={a.isoformat()}&to={b.isoformat()}"
+    links = []
+    if day:
+        links += [f"[{day:%b %-d} results]({span(day, day)})", f"[This week]({span(day - timedelta(days=6), day)})"]
+    if week:
+        links.append(f"[This week's results]({span(week - timedelta(days=6), week)})")
+    if not links:
+        return f"🌐 **Full record, every bet:** [EV BOT results]({url})"
+    return "🌐 **Results site:** " + " · ".join(links + [f"[All time]({url})"])
 
 
 def site_data(cfg: Config, now: datetime | None = None) -> dict:

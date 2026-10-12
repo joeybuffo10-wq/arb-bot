@@ -13749,7 +13749,12 @@ class EVBotSpec(MixFiles):
         self.log(cfg, "g1", "2026-10-03T18:00:00Z")
         res.daily(self.scores({"g1": (4, 2)}), date(2026, 10, 3), datetime(2026, 10, 4, 4, 40, tzinfo=timezone.utc))
         link = "[EV BOT results](https://joeybuffo10-wq.github.io/ev-bot-results/)"
-        self.assertTrue(sent[0]["description"].endswith(link))
+        site = "https://joeybuffo10-wq.github.io/ev-bot-results/"
+        self.assertTrue(sent[0]["description"].endswith(
+            f"🌐 **Results site:** [Oct 3 results]({site}?from=2026-10-03&to=2026-10-03) · "
+            f"[This week]({site}?from=2026-09-27&to=2026-10-03) · [All time]({site})"))   # that day, its week
+        week = _arbbot.weekly_payload(cfg, date(2026, 10, 4))["embeds"][0]["description"]
+        self.assertTrue(week.endswith(f"[This week's results]({site}?from=2026-09-27&to=2026-10-03) · [All time]({site})"))
         self.assertTrue(_arbbot.scoreboard_payload(cfg, NOW)["embeds"][0]["description"].endswith(link))
         self.assertNotIn("EV BOT results", _arbbot.scoreboard_payload(replace(cfg, results_site_repo=""), NOW)
                          ["embeds"][0]["description"])
