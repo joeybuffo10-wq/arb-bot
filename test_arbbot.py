@@ -13557,6 +13557,13 @@ class EVBotSpec(MixFiles):
         self.assertIn("58% to win", text.splitlines()[4])                              # then e4 (58%), then e3 (55%)
         self.assertNotIn("45%", text)                                                 # e1: 4th, left out
         self.assertEqual(_arbbot.top3_text(t.cfg, t, _parse(self.PRE) + timedelta(minutes=1)), "")   # started
+        from unittest import mock
+        posts = []
+        own = replace(t.cfg, top3_webhook_url="https://top3", ev_webhook_url="https://ev")
+        with mock.patch("arbbot._webhook", lambda url, payload, *a, **k: posts.append((url, payload["content"][:20]))):
+            _arbbot.send_digest(own, t, date(2026, 10, 3), at(60))
+        self.assertEqual([url for url, _ in posts], ["https://top3", "https://ev"])     # Top 3 alone in its channel
+        self.assertTrue(posts[0][1].startswith("🏆"))
 
     def test_props_are_limited_per_player_not_per_game(self):
         sent = []

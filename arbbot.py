@@ -184,6 +184,7 @@ WEBHOOK_SETTINGS = {
     "test": ("DISCORD_TEST_WEBHOOK_URL", "sample alerts from --test-discord (nothing else)"),
     "backup": ("DISCORD_BACKUP_WEBHOOK_URL", "a nightly copy of the betting record (keep this channel private)"),
     "free": ("DISCORD_FREE_WEBHOOK_URL", "the free preview: each winning player prop, once it's graded"),
+    "top3": ("DISCORD_TOP3_WEBHOOK_URL", "the Top 3 of the day (nothing else goes there)"),
 }
 
 
@@ -418,6 +419,7 @@ class Config:
     tier_roles: dict = field(default_factory=dict)
     # With DIGEST_HOUR: a "Top 3 of the day" post first, today's three most confident bets still good (TOP3=true).
     top3: bool = False
+    top3_webhook_url: str = ""   # the Top 3's own channel (only the Top 3 goes there); empty = the +EV channel
     # One alert per bet: a bet that went out is never alerted again (not at a better price, not at another
     # book, not after a restart), and its card isn't edited except to mark it GONE.
     one_alert_per_bet: bool = False
@@ -732,6 +734,7 @@ class Config:
             book_roles=parse_book_roles(e("BOOK_ROLES", "")),
             tier_roles=parse_tier_roles(e("TIER_ROLES", "")),
             top3=e("TOP3", "false").lower() in ("1", "true", "yes"),
+            top3_webhook_url=e("DISCORD_TOP3_WEBHOOK_URL", ""),
             one_alert_per_bet=e("ONE_ALERT_PER_BET", "false").lower() in ("1", "true", "yes"),
             results_daily_only=e("RESULTS_DAILY_ONLY", "false").lower() in ("1", "true", "yes"),
             tune_enabled=e("TUNE_ENABLED", "false").lower() in ("1", "true", "yes"),
@@ -1076,7 +1079,8 @@ class Config:
                           ("results_webhook_url", "DISCORD_RESULTS_WEBHOOK_URL"),
                           ("test_webhook_url", "DISCORD_TEST_WEBHOOK_URL"),
                           ("backup_webhook_url", "DISCORD_BACKUP_WEBHOOK_URL"),
-                          ("free_webhook_url", "DISCORD_FREE_WEBHOOK_URL")):
+                          ("free_webhook_url", "DISCORD_FREE_WEBHOOK_URL"),
+                          ("top3_webhook_url", "DISCORD_TOP3_WEBHOOK_URL")):
             value = getattr(self, attr)
             if value and not value.startswith(("https://", "http://")):
                 bad.append(env)
@@ -11523,9 +11527,9 @@ def digest_due(cfg: Config, now: datetime) -> date | None:
 def send_digest(cfg: Config, t: "Trackers", day: date, now: datetime) -> int:
     """Post the morning digest to the +EV channel (no ping), after the Top 3 of the day (TOP3), and remember the day;
     returns how many bets the digest listed."""
-    if cfg.top3 and (top := top3_text(cfg, t, now)):
-        _webhook(cfg.ev_webhook_url or cfg.webhook_url, {"username": BOT_NAME, "content": top[:1990],
-                                                         "allowed_mentions": {"parse": []}})
+    if cfg.top3 and (top := top3_text(cfg, t, now)):   # (its own channel when it has one: nothing else goes there)
+        _webhook(cfg.top3_webhook_url or cfg.ev_webhook_url or cfg.webhook_url,
+                 {"username": BOT_NAME, "content": top[:1990], "allowed_mentions": {"parse": []}})
     text = digest_text(cfg, t, now)
     if text:
         _webhook(cfg.ev_webhook_url or cfg.webhook_url, {"username": BOT_NAME, "content": text,
