@@ -161,7 +161,7 @@ class FindArbs(unittest.TestCase):
     def test_guide(self):
         from arbbot import guide_payload
         g = guide_payload()["embeds"][0]
-        for word in ("+EV", "Outlier", "Parlay", "GONE", "Stake", "Confidence"):
+        for word in ("+EV", "Outlier", "Parlay", "GONE", "Stake", "Very confident", "Slight chance"):
             self.assertIn(word, g["description"])
 
     def test_live_arb_needs_fresh_prices_on_both_sides(self):
@@ -555,7 +555,7 @@ class PlusEV(unittest.TestCase):
                                [(1.95, 1.95), (1.96, 1.94), (1.94, 1.96)])
         [b] = find_evs([ev], Config(min_ev_pct=3, round_stakes=0), NOW)
         self.assertEqual(b.confidence, "high")
-        self.assertIn("🟢 Confidence: High", ev_payload(b)["embeds"][0]["description"])
+        self.assertIn(_arbbot.tier_line(b.fair_prob, "high"), ev_payload(b)["embeds"][0]["description"])
         lowcfg = Config(min_ev_pct=3, round_stakes=0, min_confidence="high")
         wide = self.market_event([("Home", 1.88, None), ("Away", 1.88, None)], [])     # ~6.4% margin
         self.assertEqual(find_evs([wide], lowcfg, NOW), [])
@@ -627,7 +627,7 @@ class PlusEV(unittest.TestCase):
         desc = ev_payload(b)["embeds"][0]["description"]
         # Oct 11, short: the game and when, the bet, its stake in dollars and units (1u = 1% of $1,000) and confidence.
         self.assertEqual(desc, "🏟️ **Test** · Away @ Home\n⏰ Starts <t:1791050400:t> (<t:1791050400:R>)\n\n"
-                               "**Home ML +110**\n## $11 (1.1u)\n🟡 Confidence: Medium\n"
+                               "**Home ML +110**\n## $11 (1.1u)\n🟡 **Somewhat confident**\n"
                                "📊 Fair value **+100** · 50.0% to win")
         for gone in ("DO THIS", "won't win every time", "+EV = better price", "Can't use that book",
                      "skip if the price", "other books mostly agree"):
@@ -6102,7 +6102,7 @@ class PropsInLocks(MixFiles):
                                               "6 sportsbooks price it (2 you can't bet at)",
                                               "no Pinnacle price: stake 30% smaller"])
         card = ev_payload(b)["embeds"][0]
-        self.assertIn("🟢 Confidence: High", card["description"])                  # (just the rating on the card)
+        self.assertIn(_arbbot.tier_line(b.fair_prob, "high"), card["description"])   # (just the tier on the card)
         self.assertEqual(_arbbot.sources_line(b), "Sources: median of 5 books (no Pinnacle price)")
         self.assertEqual(b.stake, kelly_stake(0.5, 2.20, self.locks(), 0.7))   # 30% smaller, high = full
         self.assertIn("Lower confidence already means a smaller stake.", _arbbot.GUIDE)
@@ -6286,7 +6286,7 @@ class PropsInLocks(MixFiles):
             self.assertFalse([t for m, t, _ in sent if m == "POST" or t.startswith("❌")], (i, sent))
             self.assertEqual(b.kept, b.confidence == "medium")
         self.assertEqual((b.confidence, b.kept), ("medium", True))                 # 🟡, no "better price" ping
-        self.assertIn("🟡 Confidence: Medium", ev_payload(b)["embeds"][0]["description"])
+        self.assertIn(_arbbot.tier_line(b.fair_prob, "medium"), ev_payload(b)["embeds"][0]["description"])
         self.assertEqual(len(_read(cfg.ev_log_file)), 1)                           # one bet, logged once
         # Under medium it does go: 5 sportsbooks that disagree.
         del sent[:]
@@ -8676,7 +8676,7 @@ class ConfirmedPreGame(MixFiles):
         self.assertEqual(b.stake, 9.0)                                       # smaller (a 5.5% bet: $12)
         card = ev_payload(b)["embeds"][0]
         self.assertEqual(card["title"], "📈 Home ML +108 · B")
-        self.assertIn("🟢 Confidence: High", card["description"])
+        self.assertIn(_arbbot.tier_line(b.fair_prob, "high"), card["description"])
         self.assertEqual("\n".join(_arbbot.confirm_lines(b)),
                          "✅✅ Two sharp books agree: Pinnacle and Kalshi\n"
                          "A smaller edge than the usual 5% is OK here: both give it almost the same chance to win "
@@ -13516,6 +13516,34 @@ class EVBotSpec(MixFiles):
         with self.assertRaises(ValueError):
             Config(same_game_stake=0).check()
 
+    def test_props_are_limited_per_player_not_per_game(self):
+        sent = []
+        t = self.live(sent, one_alert_per_bet=True, same_game_full=2, same_game_max=4, same_player_full=1,
+                      same_player_max=2)
+        [base] = find_evs([self.game({"B": 2.20})], t.cfg, NOW)
+        def prop(player, market="player_receptions", point=3.5, stake=20.0):
+            return replace(base, market=market, line=(player, point), point=point, outcome="Over", stake=stake)
+        five = [prop(p) for p in ("Allen", "Cook", "Shakir", "Kincaid", "Wilson")]   # five players, one game
+        kept = _arbbot.same_game(five, t.cfg, t, (t.prop_evs, t.prop_outs))
+        self.assertEqual(([b.stake for b in kept], [b.tune_note for b in kept]), ([20.0] * 5, [""] * 5))
+        for b in kept:
+            t.alerted.add(b.key, 2e9, now=0)                                       # (they went out)
+        second = prop("Shakir", "player_reception_yds", 40.5)
+        [b2] = _arbbot.same_game([second], t.cfg, t, (t.prop_evs, t.prop_outs))
+        self.assertEqual(b2.stake, 10.0)                                           # Shakir's 2nd prop: half
+        self.assertIn("alert #2 on Shakir", b2.tune_note)
+        t.alerted.add(b2.key, 2e9, now=0)
+        self.assertEqual(_arbbot.same_game([prop("Shakir", "player_receptions", 5.5)], t.cfg, t,
+                                           (t.prop_evs, t.prop_outs)), [])          # his 3rd: not sent
+        game = [replace(base, stake=20.0), replace(base, market="totals", line=220.5, point=220.5, outcome="Over",
+                                                    stake=20.0), replace(base, market="spreads", line=-3.5, point=-3.5,
+                                                                        stake=20.0)]
+        lines = _arbbot.same_game(game, t.cfg, t, (t.evs, t.outs))                 # game lines: their own count
+        self.assertEqual(sorted(b.stake for b in lines), [10.0, 20.0, 20.0])
+        self.assertEqual(_arbbot.same_group(t.cfg, "e1", "team_totals", ("Bills", 24.5)), ("game", "e1"))
+        old = replace(t.cfg, same_player_full=0, same_player_max=0)                # not set: props count per game
+        self.assertEqual(_arbbot.same_group(old, "e1", "player_receptions", ("Shakir", 3.5)), ("game", "e1"))
+
     def test_the_uptime_monitor_hears_from_the_bot_every_5_minutes(self):
         from unittest import mock
         cfg = Config(healthcheck_url="https://hc-ping.com/abc")
@@ -13772,6 +13800,17 @@ class EVBotSpec(MixFiles):
         self.assertEqual(_arbbot.parlay_slip_link(replace(cfg, results_site_repo=""), "DraftKings", legs), "")
         page = (Path(_arbbot.__file__).parent / "site" / "go.html").read_text()
         self.assertIn("^dksb:\\/\\/sb\\/addbet\\/", page)                          # only DraftKings app links
+
+    def test_every_card_says_how_likely_it_is_to_hit(self):
+        tier = _arbbot.tier_line
+        self.assertEqual([tier(p) for p in (0.62, 0.55, 0.40, 0.20)],
+                         ["🟢 **Very confident**", "🔵 **Confident**", "🟡 **Somewhat confident**", "🟠 **Slight chance**"])
+        self.assertEqual((tier(0.62, "medium"), tier(0.20, "medium")), ("🔵 **Confident**", "🟠 **Slight chance**"))
+        self.assertEqual((tier(0.60), tier(0.50), tier(0.35)), ("🟢 **Very confident**", "🔵 **Confident**",
+                                                                "🟡 **Somewhat confident**"))   # (the cut-offs)
+        legs = [ev_leg(g, {"FanDuel": 2.20}) for g in ("g1", "g2")]
+        [p] = find_parlays(legs, Config(parlay_min_ev_pct=1, parlay_leg_min_ev_pct=1, parlay_max_legs=2))
+        self.assertIn("🟠 **Slight chance**", parlay_payload(p)["embeds"][0]["description"])   # 25% to win
 
     def test_every_bet_card_shows_its_fair_value(self):
         odds = _arbbot.odds

@@ -23,6 +23,7 @@ Standard library only. Run `python arbbot.py --help`.
 from __future__ import annotations
 
 import argparse
+import ast
 import base64
 import calendar
 import csv
@@ -472,6 +473,10 @@ class Config:
     same_game_full: int = 0
     same_game_stake: float = 0.5
     same_game_max: int = 0
+    # Player props are counted per player instead (SAME_PLAYER_FULL at full stake, the next at x SAME_GAME_STAKE, at most
+    # SAME_PLAYER_MAX): two players' props hardly move together, one player's do. 0 and 0: props count in the game too.
+    same_player_full: int = 0
+    same_player_max: int = 0
     tune_since: str = ""   # YYYY-MM-DD: tuning counts only bets alerted from this day on (older data was off); "" = all
     # A new alert (or a much better price's re-alert) isn't posted on odds fetched longer ago than this by the
     # time it's ready (a slow pass, Discord making the bot wait): the next check looks again and sends it on its
@@ -747,6 +752,8 @@ class Config:
             same_game_full=num("SAME_GAME_FULL", d.same_game_full, int),
             same_game_stake=num("SAME_GAME_STAKE", d.same_game_stake, float),
             same_game_max=num("SAME_GAME_MAX", d.same_game_max, int),
+            same_player_full=num("SAME_PLAYER_FULL", d.same_player_full, int),
+            same_player_max=num("SAME_PLAYER_MAX", d.same_player_max, int),
             min_live_profit_pct=num("MIN_LIVE_PROFIT_PCT", d.min_live_profit_pct, float),
             live_arb_max_skew=num("LIVE_ARB_MAX_SKEW", d.live_arb_max_skew, int),
             live_confirm_checks=num("LIVE_CONFIRM_CHECKS", d.live_confirm_checks, int),
@@ -4554,6 +4561,21 @@ def status_line(status: str, book: str) -> str:
     return STATUS_LINES[base].format(book=book) + ("\n⏰ **Starts soon**" if base == "ok" and "soon" in more else "")
 
 
+# How likely a bet is to hit, for its card: (fair win chance from, icon, name), most likely first.
+TIERS = ((0.60, "🟢", "Very confident"), (0.50, "🔵", "Confident"), (0.35, "🟡", "Somewhat confident"),
+         (0.0, "🟠", "Slight chance"))
+
+
+def tier_line(fair_prob: float, confidence: str = "") -> str:
+    """"🟢 **Very confident**": the bet's tier by its fair win chance (TIERS), one lower when the bot is only medium
+    (or low) confident in that price. Outliers and parlays have no confidence rating: their win chance decides."""
+    i = next(i for i, (cut, _, _) in enumerate(TIERS) if fair_prob >= cut)
+    if confidence in ("medium", "low"):
+        i = min(i + 1, len(TIERS) - 1)
+    _, icon, name = TIERS[i]
+    return f"{icon} **{name}**"
+
+
 def fair_value_line(fair_prob: float) -> str:
     """"📊 Fair value **+100** · 50.0% to win": what the bet's odds should be, from the sharp price (or the other books')."""
     return f"📊 Fair value **{odds(1 / fair_prob)}** · {fair_prob:.1%} to win" if fair_prob > 0 else ""
@@ -4565,8 +4587,7 @@ def bet_lines(b: EVBet, status: str = "", note: str = "") -> str:
     game = f"{sport_icon(b.sport_key)} **{b.sport}** · {b.matchup}\n{_when(b.is_live, b.commence_time)}"
     # (The stake as a heading: big, so it's the first thing anyone sees.)
     bet = (f"**{b.pick} {odds(b.price)}**{ALT_NOTE if b.alt else ''}\n## {b.stake_label}"
-           + (f"\n{confidence_line(b.confidence)}" if b.confidence else "")
-           + f"\n{fair_value_line(b.fair_prob)}")
+           + f"\n{tier_line(b.fair_prob, b.confidence)}\n{fair_value_line(b.fair_prob)}")
     return "\n\n".join(x for x in (game, bet, status_line(status, b.book), note) if x)
 
 
@@ -5932,7 +5953,7 @@ def parlay_payload(p: Parlay, mention: str = "", gone_after: float | None = None
         + ("🔴 LIVE" if b.is_live else f"<t:{int(_parse_time(b.commence_time).timestamp())}:t>")
         for i, (b, pr, ln) in enumerate(p.legs))
     one = f"🔗 **[Add all {len(p.legs)} legs to the {p.book} bet slip]({slip})**\n\n" if slip else ""
-    return _card(f"📦 {len(p.legs)}-leg parlay · {p.book} · {odds(p.price)}", f"{one}{legs}\n## {p.stake_label}\n{fair_value_line(p.fair_prob)}",
+    return _card(f"📦 {len(p.legs)}-leg parlay · {p.book} · {odds(p.price)}", f"{one}{legs}\n## {p.stake_label}\n{tier_line(p.fair_prob)}\n{fair_value_line(p.fair_prob)}",
                  0x9B59B6, url=slip, mention=mention)
 
 
@@ -8982,6 +9003,10 @@ def weekly_text(cfg: Config, end_day: date, held: dict | None = None) -> tuple[s
     marks = read(cfg.markout_file, lambda: [r for r in markout_rows(cfg)
                                             if _in_week(cfg, r.get("first_seen") or "", start, end_day)], [])
     tally = read(HELD_FILE, lambda: read_held(held_path(cfg)) if held is None else held, {})
+    # Only what can be alerted now: with arbs and live alerts off, the card leaves them out (--results keeps them).
+    off = groups_off(cfg) | ({"Pre-game arbs", "Live arbs"} if not cfg.arbs_enabled else set())
+    graded, clv = bettable(cfg, graded), bettable(cfg, clv)
+    marks = [m for m in marks if _weekly_group(m) not in off]
     whys: dict[str, dict[str, int]] = {}
     for day, kinds in tally.items():
         try:
@@ -8993,9 +9018,11 @@ def weekly_text(cfg: Config, end_day: date, held: dict | None = None) -> tuple[s
             bucket = whys.setdefault(kind, {})
             for why, n in counts.items():
                 bucket[why] = bucket.get(why, 0) + n
-    parts = [f"**{start:%a %b %-d} – {last:%a %b %-d}** · every alert at the stake it showed (bets by game "
-             f"day, arbs by when they went out). ✋ Held back = stopped by the hourly caps or the live rules."]
-    for kind in WEEKLY_TYPES:
+    parts = [f"**{start:%a %b %-d} – {last:%a %b %-d}** · every alert at the stake it showed (bets by game day"
+             + (", arbs by when they went out" if cfg.arbs_enabled else "")
+             + (", pre-game bets only" if live_off(cfg) else "")
+             + "). ✋ Held back = stopped by the hourly caps or the live rules."]
+    for kind in [k for k in WEEKLY_TYPES if k not in off]:
         parts.append("\n".join(read(f"the {kind} numbers", lambda kind=kind: _weekly_section(
             cfg, kind, start, end_day, graded, clv, marks, whys.get(kind, {})), [f"**{kind}**: couldn't read it"])))
     tips = read("the suggestions", lambda: weekly_suggestions(cfg, clv, marks), [])
@@ -9013,8 +9040,8 @@ def weekly_payload(cfg: Config, end_day: date, held: dict | None = None) -> dict
     if members := members_lines(cfg, week, top=5):   # (✅ tracking: the week's leaderboard)
         text = (text + "\n\n__**🏆 Members this week**__\n" + members)[:4000]
     return _card(title, text, 0x2ECC71 if profit > 0 else (0xE74C3C if profit < 0 else 0x5865F2),
-                 footer="Suggestions only: the bot never changes a setting by itself. Each arb counts once a "
-                        "day, placed at BANKROLL.")
+                 footer="Suggestions only: the bot never changes a setting by itself."
+                        + (" Each arb counts once a day, placed at BANKROLL." if cfg.arbs_enabled else ""))
 
 
 def weekly_command(cfg: Config, args) -> None:
@@ -9898,7 +9925,7 @@ GUIDE = """**Each alert is one bet. Tap the title to open it at the book, bet th
 "1H" / "1Q" means first half / first quarter. Team totals are a team's own points.
 
 **Stake:** bet the amount shown, e.g. $11 (1.1u): the same stake in dollars and units. Lower confidence already means a smaller stake.
-**Confidence:** 🟢 High, 🟡 Medium. Each card says which.
+**How likely it hits:** 🟢 Very confident (60%+ to win), 🔵 Confident (50–60%), 🟡 Somewhat confident (35–50%), 🟠 Slight chance (under 35%, pays more). One tier lower when the price itself is less certain.
 **✅ Still good / ⚠️ Price moved:** the line under a card after it goes out. ⚠️ means don't bet it now.
 **✅ reaction:** tap it after you place a bet, so the results show what members took.
 **❌ GONE:** the chance is over. Ignore it.
@@ -10366,33 +10393,59 @@ class Tuning:
 TUNE_REFRESH_SECONDS = 3600
 
 
+def same_group(cfg: Config, event_id: str, market: str, line) -> tuple:
+    """Which group a bet counts in for the same-game limit: ("player", game, name) for a player prop when
+    SAME_PLAYER_* are set, else ("game", game) (game lines, halves, team totals; every prop when they're not)."""
+    per_player = cfg.same_player_full or cfg.same_player_max
+    if per_player and is_prop(line) and market != "team_totals":
+        return ("player", event_id, line[0])
+    return ("game", event_id)
+
+
+def _key_group(cfg: Config, key: str) -> tuple | None:
+    """same_group() of an alert key ("ev|game|market|line|outcome"), or None when it can't be read."""
+    parts = key.split("|", 4)
+    if len(parts) < 5 or parts[0] != "ev":
+        return None
+    try:
+        line = ast.literal_eval(parts[3])
+    except (ValueError, SyntaxError):
+        line = parts[3]
+    return same_group(cfg, parts[1], parts[2], line)
+
+
 def same_game(bets: list, cfg: Config, t: "Trackers", alerters: tuple) -> list:
-    """SAME_GAME_FULL / SAME_GAME_STAKE / SAME_GAME_MAX: a game's first new alerts at full stake, the next ones smaller
-    (they win and lose together), none past the cap. Counts every alert already out on the game (main lines and
-    props; remembered across restarts) and the ones before it in this check, best edge first. Cards already up
-    go through unchanged; what's held back is counted as "same game"."""
-    if not (cfg.same_game_full or cfg.same_game_max):
+    """The same-game limit: bets that win and lose together are sized down and capped. A game's lines (and, with
+    SAME_PLAYER_* set, each player's props on their own) count together: the first SAME_GAME_FULL (SAME_PLAYER_FULL)
+    new alerts at full stake, the next at x SAME_GAME_STAKE, none past SAME_GAME_MAX (SAME_PLAYER_MAX). Counts every
+    alert already out in the group (remembered across restarts) and the ones before it in this check, best edge
+    first. Cards already up go through unchanged; what's held back is counted as "same game"."""
+    if not (cfg.same_game_full or cfg.same_game_max or cfg.same_player_full or cfg.same_player_max):
         return bets
     up = {k for a in alerters for k in (*a.open, *a.restored)}
     every = (t.evs, t.outs, t.prop_evs, t.prop_outs, t.period_evs, t.period_outs)
-    out_on: dict[str, set[str]] = {}
+    out_on: dict[tuple, set[str]] = {}
     for key in {*t.alerted.until, *(k for a in every for k in (*a.open, *a.restored))}:
-        if key.startswith("ev|"):
-            out_on.setdefault(key.split("|")[1], set()).add(key)
+        if (group := _key_group(cfg, key)) is not None:
+            out_on.setdefault(group, set()).add(key)
     keep = []
     for b in sorted(bets, key=lambda b: -b.ev_pct):
         if b.key in up:
             keep.append(b)
             continue
-        on = out_on.setdefault(b.event_id, set())
-        n = len(on - {b.key}) + 1   # this one's place on the game
-        if cfg.same_game_max and n > cfg.same_game_max:
+        group = same_group(cfg, b.event_id, b.market, b.line)
+        full, cap_n = ((cfg.same_player_full, cfg.same_player_max) if group[0] == "player"
+                       else (cfg.same_game_full, cfg.same_game_max))
+        on = out_on.setdefault(group, set())
+        n = len(on - {b.key}) + 1   # this one's place in its group
+        if cap_n and n > cap_n:
             alerters[0].held_counts["same game"] = alerters[0].held_counts.get("same game", 0) + 1
             continue
-        if cfg.same_game_full and n > cfg.same_game_full and b.stake:
+        if full and n > full and b.stake:
             cap = cfg.ev_bankroll * cfg.ev_max_stake_pct / 100
             b.stake = round_stake(b.stake * cfg.same_game_stake, min(cap, b.stake), cfg)
-            note = f"Stake ×{cfg.same_game_stake:g}: alert #{n} on this game (bets on one game win and lose together)"
+            what = f"on {group[2]}" if group[0] == "player" else "on this game"
+            note = f"Stake ×{cfg.same_game_stake:g}: alert #{n} {what} (they win and lose together)"
             b.tune_note = f"{b.tune_note}\n📊 {note}" if b.tune_note else note
         on.add(b.key)
         keep.append(b)
