@@ -184,7 +184,7 @@ WEBHOOK_SETTINGS = {
     "test": ("DISCORD_TEST_WEBHOOK_URL", "sample alerts from --test-discord (nothing else)"),
     "backup": ("DISCORD_BACKUP_WEBHOOK_URL", "a nightly copy of the betting record (keep this channel private)"),
     "free": ("DISCORD_FREE_WEBHOOK_URL", "the free preview: each winning player prop, once it's graded"),
-    "top3": ("DISCORD_TOP3_WEBHOOK_URL", "the Top 3 of the day (nothing else goes there)"),
+    "top3": ("DISCORD_TOP3_WEBHOOK_URL", "💎 Elite bets (they go there instead of the +EV channel)"),
 }
 
 
@@ -419,9 +419,8 @@ class Config:
     tier_roles: dict = field(default_factory=dict)
     # With DIGEST_HOUR: a "Top 3 of the day" post first, today's three most confident bets still good (TOP3=true).
     top3: bool = False
-    # The top picks' own channel: each 💎 Elite bet (not outliers or parlays) is also posted there the moment it
-    # goes out, "🏆 Top pick #1 of the day", every one (no daily limit), with the same ✅ / GONE updates. Nothing
-    # else goes there. Without it, TOP3 is a 10am post of the day's top TOP_PICKS in the +EV channel instead.
+    # The top picks' own channel: every 💎 Elite bet (+EV, props, halves: not outliers or parlays) goes there INSTEAD
+    # of its usual channel, its one card (pings, ✅ / GONE updates as usual). Nothing else goes there. Without it, TOP3 is a 10am post of the day's top TOP_PICKS in the +EV channel instead.
     top3_webhook_url: str = ""
     top_picks: int = 3
     # One alert per bet: a bet that went out is never alerted again (not at a better price, not at another
@@ -2420,7 +2419,6 @@ class OpenArb:
     shown: tuple = ()         # (book, price, stake) of the bet as its card shows it (an arb: ())
     # ONE_ALERT_PER_BET: the bet as its card went out, how that card was drawn, and its ✅ / ⚠️ line ("" = none yet)
     sent_item: object = None
-    top3: tuple = ()          # its copy in the Top 3 channel: (message id, its number that day), when it's one
     render: object = None
     status: str = ""
 
@@ -2683,7 +2681,6 @@ class Alerter:
     throttle_edits = False
     book_pings = False   # a new card pings its book's Discord role when BOOK_ROLES is set (bets, not arbs)
     one_alert = False    # ONE_ALERT_PER_BET applies (bets, not arbs)
-    top3_ok = False      # a 💎 Elite bet of this kind can be a top pick (+EV, props, halves: not outliers)
     alerted: "AlertedBets | None" = None   # the bets already alerted, shared by every bet alerter (Trackers)
 
     def __init__(self, cfg: Config, dry_run: bool, noun: str | None = None, props: bool = False):
@@ -3033,8 +3030,6 @@ class Alerter:
             self.alerted.add(self.bet_identity(op.arb), self.bet_expires(op.arb), now)
         if self.once:
             op.sent_item, op.render = op.arb, self.payload
-        if self.top3_ok and op.message_id and not self.dry_run and not op.top3:
-            self.top3_pick(op, now)
         if self.on_posted and op.message_id and not self.dry_run:
             try:
                 self.on_posted({"first_seen": _utc(op.first_seen), **self.row(op)}, op.message_id, op.url)
@@ -3229,50 +3224,6 @@ class Alerter:
         self._save_state()
         return new
 
-    def top3_payload(self, op: OpenArb, payload: dict | None = None, **kw) -> dict:
-        """The card as it went out, titled as the day's Top pick (#n), for the Top 3 channel: no ping there. Its tier
-        line says 💎 Elite (only there: the main channel's card keeps 🟢 Very confident)."""
-        b = op.sent_item or op.arb
-        payload = payload or (op.render or self.payload)(b, first_seen=op.first_seen, **kw)
-        emb = payload["embeds"][0]
-        emb["title"] = f"🏆 Top pick #{op.top3[1]} of the day · {emb['title']}"[:256]
-        if is_elite(b):
-            emb["description"] = emb.get("description", "").replace(tier_line(b.fair_prob, b.confidence), ELITE_LINE, 1)
-        payload.pop("content", None)
-        payload["allowed_mentions"] = {"parse": []}
-        return payload
-
-    def top3_pick(self, op: OpenArb, now: float) -> None:
-        """DISCORD_TOP3_WEBHOOK_URL: every 💎 Elite bet is also posted in the top picks' channel, numbered by the New York
-        day (remembered across restarts in state/top3.json, so a bet is never posted there twice)."""
-        cfg, b = self.cfg, op.arb
-        if not (cfg.top3 and cfg.top3_webhook_url and cfg.state_dir) or not is_elite(b):
-            return
-        day = datetime.fromtimestamp(now, ZoneInfo(cfg.timezone)).date().isoformat()
-        path = data_path(cfg.state_dir) / "top3.json"
-        try:
-            picked = json.loads(path.read_text()) if path.exists() else {}
-        except (OSError, ValueError):
-            picked = {}
-        today = picked.get(day, [])
-        if b.key in today:
-            return
-        op.top3 = ("", len(today) + 1)
-        try:
-            msg = _webhook(cfg.top3_webhook_url, self.top3_payload(op))
-        except Exception as e:  # noqa: BLE001 - never holds up the alert itself
-            print(f"  ! Top 3 channel: {e!r:.150}", file=sys.stderr)
-            op.top3 = ()
-            return
-        op.top3 = ((msg or {}).get("id", ""), op.top3[1])
-        picked = {d: v for d, v in picked.items() if d >= (date.fromisoformat(day) - timedelta(days=7)).isoformat()}
-        picked[day] = today + [b.key]
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(picked))
-        tmp.replace(path)
-        print(f"  🏆 Top pick #{op.top3[1]} of the day: {self.label(b)}", flush=True)
-
     def still_good(self, op: OpenArb, item, now: float) -> None:
         """ONE_ALERT_PER_BET: a card that went out keeps its bet, stake and odds as sent; only its last line says
         whether the book it named still has a good price (✅: at least OK_EDGE_PCT of edge against today's fair
@@ -3289,8 +3240,6 @@ class Alerter:
         if status != op.status:
             op.status, op.edited = status, now
             self._discord(op.render(sent, first_seen=op.first_seen, status=status), op.message_id, op.url)
-            if op.top3 and op.top3[0]:   # (its Top 3 copy too)
-                self._discord(self.top3_payload(op, status=status), op.top3[0], self.cfg.top3_webhook_url)
 
     def _close(self, key: str, now: float) -> None:
         op = self.open.pop(key)
@@ -3312,9 +3261,6 @@ class Alerter:
         print(f"  ❌ gone after {_fmt_secs(lasted)}: {self.label(op.arb)}", flush=True)
         if op.message_id:
             self._discord(self.payload(op.arb, gone_after=lasted), op.message_id, op.url)
-            if op.top3 and op.top3[0]:
-                self._discord(self.top3_payload(op, self.payload(op.arb, gone_after=lasted)), op.top3[0],
-                              self.cfg.top3_webhook_url)
         self.stats["closed"] += 1
         self.stats["open_seconds"] += lasted
         if not self.log_on_open:
@@ -4652,34 +4598,34 @@ def status_line(status: str, book: str) -> str:
 
 
 # How likely a bet is to hit, for its card: (fair win chance from, icon, name), most likely first.
-TIERS = ((0.60, "🟢", "Very confident", "very"), (0.50, "🔵", "Confident", "confident"),
+TIERS = ((0.70, "💎", "Elite", "elite"), (0.60, "🟢", "Very confident", "very"), (0.50, "🔵", "Confident", "confident"),
          (0.35, "🟡", "Somewhat confident", "somewhat"), (0.0, "🟠", "Slight chance", "slight"))
-# 💎 Elite: above 🟢, shown only in the top picks' channel (the bet's card everywhere else keeps its usual tier).
-ELITE_PROB, ELITE_LINE = 0.70, "💎 **Elite**"
 
 
-def tier_index(fair_prob: float, confidence: str = "") -> int:
+def tier_index(fair_prob: float, confidence: str = "", sharp: bool = False) -> int:
     """The bet's place in TIERS (0 = most likely to hit) by its fair win chance, one lower when the bot is only medium
-    (or low) confident in that price. Outliers and parlays have no confidence rating: their win chance decides."""
-    i = next(i for i, (cut, *_) in enumerate(TIERS) if fair_prob >= cut)
+    (or low) confident in that price. 💎 Elite (0) takes all of: 70%+, high confidence, and Pinnacle's own price
+    (sharp), not one worked out from the other books; anything else starts at 🟢 Very confident. Outliers and parlays
+    have no confidence rating: their win chance decides, and they're never Elite."""
+    if fair_prob >= TIERS[0][0] and confidence == "high" and sharp:
+        return 0
+    i = next(i for i, (cut, *_) in enumerate(TIERS[1:], 1) if fair_prob >= cut)
     return min(i + 1, len(TIERS) - 1) if confidence in ("medium", "low") else i
 
 
 def bet_tier(b) -> int:
     """tier_index() of a bet (an EVBet or a parlay)."""
-    return tier_index(getattr(b, "fair_prob", 0.0), getattr(b, "confidence", ""))
+    return tier_index(getattr(b, "fair_prob", 0.0), getattr(b, "confidence", ""), getattr(b, "sharp_prob", None) is not None)
 
 
 def is_elite(b) -> bool:
-    """💎 Elite, for the top picks' channel: all of 70%+ to win, high confidence, and Pinnacle's own price (not one
-    worked out from the other books). Outliers and parlays never are."""
-    return (getattr(b, "fair_prob", 0.0) >= ELITE_PROB and getattr(b, "confidence", "") == "high"
-            and getattr(b, "sharp_prob", None) is not None)
+    """💎 Elite: its card goes to the top picks' channel (DISCORD_TOP3_WEBHOOK_URL) instead of the usual one."""
+    return bet_tier(b) == 0
 
 
-def tier_line(fair_prob: float, confidence: str = "") -> str:
+def tier_line(fair_prob: float, confidence: str = "", sharp: bool = False) -> str:
     """"🟢 **Very confident**": the card's tier line."""
-    _, icon, name, _ = TIERS[tier_index(fair_prob, confidence)]
+    _, icon, name, _ = TIERS[tier_index(fair_prob, confidence, sharp)]
     return f"{icon} **{name}**"
 
 
@@ -4689,7 +4635,7 @@ def row_tier(r: dict) -> str:
         p = 1 / float(r.get("fair_odds") or 0)
     except (ValueError, ZeroDivisionError):
         return ""
-    _, icon, name, _ = TIERS[tier_index(p, r.get("confidence", ""))]
+    _, icon, name, _ = TIERS[tier_index(p, r.get("confidence", ""), r.get("pinnacle_prob") not in ("", None))]
     return f"{icon} {name}"
 
 
@@ -4704,7 +4650,7 @@ def bet_lines(b: EVBet, status: str = "", note: str = "") -> str:
     game = f"{sport_icon(b.sport_key)} **{b.sport}** · {b.matchup}\n{_when(b.is_live, b.commence_time)}"
     # (The stake as a heading: big, so it's the first thing anyone sees.)
     bet = (f"**{b.pick} {odds(b.price)}**{ALT_NOTE if b.alt else ''}\n## {b.stake_label}"
-           + f"\n{tier_line(b.fair_prob, b.confidence)}\n{fair_value_line(b.fair_prob)}")
+           + f"\n{tier_line(b.fair_prob, b.confidence, b.sharp_prob is not None)}\n{fair_value_line(b.fair_prob)}")
     return "\n\n".join(x for x in (game, bet, status_line(status, b.book), note) if x)
 
 
@@ -4735,7 +4681,6 @@ EV_LOG_FIELDS = ["first_seen", "event_id", "sport", "sport_key", "matchup",
 
 class EVAlerter(Alerter):
     noun = "+EV bets"
-    top3_ok = True
     book_pings = True   # (outliers too)
     one_alert = True
     log_fields = EV_LOG_FIELDS
@@ -4777,6 +4722,8 @@ class EVAlerter(Alerter):
         return self.cfg.ev_log_file
 
     def webhook_for(self, item) -> str:
+        if self.cfg.top3 and self.cfg.top3_webhook_url and is_elite(item):   # 💎 Elite: the top picks' channel only
+            return self.cfg.top3_webhook_url
         return (self.props and self.cfg.props_webhook_url) or self.cfg.ev_webhook_url or self.cfg.webhook_url
 
     def row(self, op: OpenArb) -> dict:
@@ -5904,7 +5851,6 @@ def outlier_payload(b: EVBet, mention: str = "", gone_after: float | None = None
 
 
 class OutlierAlerter(EVAlerter):
-    top3_ok = False   # (big edges the book may void: not a Top 3 pick)
     noun = "outliers"
 
     def text(self, item) -> str:
@@ -10060,8 +10006,7 @@ GUIDE = """**Each alert is one bet. Tap the title to open it at the book, bet th
 "1H" / "1Q" means first half / first quarter. Team totals are a team's own points.
 
 **Stake:** bet the amount shown, e.g. $11 (1.1u): the same stake in dollars and units. Lower confidence already means a smaller stake.
-**How likely it hits:** 🟢 Very confident (60%+ to win), 🔵 Confident (50–60%), 🟡 Somewhat confident (35–50%), 🟠 Slight chance (under 35%, pays more). One tier lower when the price itself is less certain.
-🏆 **Top picks channel:** only 💎 Elite bets (70%+ to win, the sharpest price, highest confidence), every one as it goes out. Even 💎 loses sometimes: no bet is a sure thing.
+**How likely it hits:** 💎 Elite (70%+ to win, the sharpest price, highest confidence: these go in the top picks channel), 🟢 Very confident (60%+), 🔵 Confident (50–60%), 🟡 Somewhat confident (35–50%), 🟠 Slight chance (under 35%, pays more). One tier lower when the price itself is less certain. Even 💎 loses sometimes: no bet is a sure thing.
 **✅ Still good / ⚠️ Price moved:** the line under a card after it goes out. ⚠️ means don't bet it now.
 **✅ reaction:** tap it after you place a bet, so the results show what members took.
 **❌ GONE:** the chance is over. Ignore it.
@@ -11572,7 +11517,7 @@ def top3_text(cfg: Config, t: "Trackers", now: datetime) -> str:
             start = _parse_time(b.commence_time)
             if b.is_live or start <= now or start.astimezone(ZoneInfo(cfg.timezone)).date() != today:
                 continue
-            picks.append(((not is_elite(b), bet_tier(b), rank.get(b.confidence, 1), -b.fair_prob, -b.ev_pct), b))
+            picks.append(((bet_tier(b), rank.get(b.confidence, 1), -b.fair_prob, -b.ev_pct), b))
     if not picks:
         return ""
     picks.sort(key=lambda x: x[0])
@@ -11580,7 +11525,7 @@ def top3_text(cfg: Config, t: "Trackers", now: datetime) -> str:
     medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
     for i, (_, b) in enumerate(picks[:cfg.top_picks]):
         ts = int(_parse_time(b.commence_time).timestamp())
-        lines.append(f"{medals[i] if i < len(medals) else '•'} {ELITE_LINE if is_elite(b) else tier_line(b.fair_prob, b.confidence)} · "
+        lines.append(f"{medals[i] if i < len(medals) else '•'} {tier_line(b.fair_prob, b.confidence, b.sharp_prob is not None)} · "
                      f"**{_link(f'{b.pick} {odds(b.price)}', b.link)}** · {b.book} · **{b.stake_label}**\n"
                      f"     {sport_icon(b.sport_key)} {b.matchup}, <t:{ts}:t> · {b.fair_prob:.0%} to win")
     return f"🏆 **Top {cfg.top_picks} of the day** (the most confident bets still good today)\n" + "\n".join(lines)
@@ -11605,7 +11550,7 @@ def digest_due(cfg: Config, now: datetime) -> date | None:
 def send_digest(cfg: Config, t: "Trackers", day: date, now: datetime) -> int:
     """Post the morning digest to the +EV channel (no ping), after the Top 3 of the day (TOP3), and remember the day;
     returns how many bets the digest listed."""
-    # (With its own channel the Top 3 are posted there as they go out instead: see Alerter.top3_pick.)
+    # (With its own channel, 💎 Elite bets are posted there instead of the +EV channel: see EVAlerter.webhook_for.)
     if cfg.top3 and not cfg.top3_webhook_url and (top := top3_text(cfg, t, now)):
         _webhook(cfg.ev_webhook_url or cfg.webhook_url,
                  {"username": BOT_NAME, "content": top[:1990], "allowed_mentions": {"parse": []}})
