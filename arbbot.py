@@ -444,6 +444,15 @@ class Config:
     # 💵 unit DMs (with DISCORD_BOT_TOKEN): members type "!unit 25" in this channel (its id) to set their own unit
     # size; tapping 💵 under a bet card then DMs them its stake in dollars at their unit. Empty = off.
     unit_channel_id: str = ""
+    # Paid members (with DISCORD_BOT_TOKEN and UNIT_CHANNEL_ID): STRIPE_KEY (a restricted key, set with --set, never
+    # in remote.env) lets the bot read the sign-ups on STRIPE_PAYMENT_LINK (its plink_ id). Each buyer's Discord name
+    # (asked at checkout) gets PAID_ROLE_ID while their subscription is on, and loses it once it's canceled. "!refer"
+    # gives a member their own sign-up link (STRIPE_SIGNUP_URL?client_reference_id=their id); when a friend who used it
+    # makes their first real payment, the referrer gets a month's price as Stripe credit (their next month free).
+    stripe_key: str = ""
+    stripe_payment_link: str = ""
+    stripe_signup_url: str = ""
+    paid_role_id: str = ""
     # An uptime monitor's ping URL (healthchecks.io: https://hc-ping.com/...; set it with --set). The bot calls it
     # every HEARTBEAT_SECONDS while it's running; when the calls stop, the monitor tells you. Empty = off.
     healthcheck_url: str = ""
@@ -760,6 +769,10 @@ class Config:
             results_site_token=e("RESULTS_SITE_TOKEN", "").strip(),
             reaction_minutes=num("REACTION_MINUTES", d.reaction_minutes, int),
             unit_channel_id="".join(c for c in e("UNIT_CHANNEL_ID", "") if c.isdigit()),
+            stripe_key=e("STRIPE_KEY", "").strip(),
+            stripe_payment_link=e("STRIPE_PAYMENT_LINK", "").strip(),
+            stripe_signup_url=e("STRIPE_SIGNUP_URL", "").strip(),
+            paid_role_id="".join(c for c in e("PAID_ROLE_ID", "") if c.isdigit()),
             tune_slow_still_pct=num("TUNE_SLOW_STILL_PCT", d.tune_slow_still_pct, float),
             tune_slow_bets=num("TUNE_SLOW_BETS", d.tune_slow_bets, int),
             tune_slow_extra_pct=num("TUNE_SLOW_EXTRA_PCT", d.tune_slow_extra_pct, float),
@@ -7789,6 +7802,7 @@ class BetReactions:
         self.units_path = data_path(cfg.state_dir) / "units.json" if self.units_on else None
         self.dm_last = 0.0
         self.dm_channels: dict[str, str] = {}   # user id -> their DM channel with the bot
+        self.command = None   # optional callback(user id, message text) -> a reply, for other "!" commands (!refer)
         self.warned: set[str] = set()         # problems said once (console)
         if self.msg_path and self.msg_path.exists():
             try:
@@ -7898,6 +7912,15 @@ class BetReactions:
                                     "(Discord Developer Portal → your app → Bot)")
                 continue
             hit = UNIT_CMD.match(text)
+            other = self.command(who["id"], text) if self.command and not hit else None
+            if other:
+                try:
+                    _bot_api(self.token, "POST", f"/channels/{cid}/messages",
+                             {"content": other, "message_reference": {"message_id": m["id"]},
+                              "allowed_mentions": {"parse": []}})
+                except urllib.error.HTTPError as e:
+                    self._say(f"reply{e.code}", f"couldn't answer in the unit channel (Discord said {e.code})")
+                continue
             if not hit:
                 continue
             uid, amount = who["id"], hit.group(1).replace(",", "")
@@ -8026,6 +8049,217 @@ class BetReactions:
             self._say("taken", f"couldn't save who took what ({e})")
         self._save()
         return sum(1 for e in taken.values() if e["users"])
+
+
+STRIPE_API = "https://api.stripe.com/v1"
+MEMBERS_SECONDS = 120   # how often new sign-ups, subscriptions and referrals are checked
+PAID_STATUSES = ("trialing", "active", "past_due")   # the Paid role stays on (past_due: Stripe is still retrying)
+REFER_CMD = re.compile(r"^\s*(?:<@!?\d+>\s*)?!refer\b", re.I)
+
+
+def _stripe(key: str, method: str, path: str, params: dict | None = None) -> dict:
+    """One Stripe API call (form-encoded; GET params go in the query)."""
+    query = urllib.parse.urlencode(params or {}, doseq=True)
+    url = STRIPE_API + path + (f"?{query}" if query and method == "GET" else "")
+    req = urllib.request.Request(url, method=method, data=query.encode() if method != "GET" else None,
+                                 headers={"Authorization": f"Bearer {key}", "User-Agent": "arbbot/3.0",
+                                          "Content-Type": "application/x-www-form-urlencoded"})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        return json.loads(resp.read())
+
+
+def _stripe_all(key: str, path: str, params: dict) -> list[dict]:
+    """Every item of a Stripe list (pages of 100)."""
+    out, after = [], None
+    while True:
+        page = _stripe(key, "GET", path, {**params, "limit": 100, **({"starting_after": after} if after else {})})
+        out += page.get("data", [])
+        if not page.get("has_more") or not page.get("data"):
+            return out
+        after = page["data"][-1]["id"]
+
+
+def _clean_name(name: str) -> str:
+    """A Discord name as typed at checkout, for matching: no @, no old #1234 tag, no spaces, lower case."""
+    return re.sub(r"#\d{4}$", "", name.strip().lstrip("@")).replace(" ", "").lower()
+
+
+class Members:
+    """Paid members, from Stripe (see Config.stripe_key). Every MEMBERS_SECONDS: new completed checkouts on the
+    payment link (with the buyer's Discord name and who referred them), every subscription's status, the Paid role
+    on or off to match, and referral credits for friends' first real payments. Kept in state/members.json. Never
+    touches anyone who didn't buy through Stripe (comped members keep a role given by hand)."""
+
+    def __init__(self, cfg: Config, reactions: BetReactions, off: bool = False):
+        self.cfg, self.r = cfg, reactions
+        self.on = bool(reactions.on and cfg.unit_channel_id and cfg.stripe_key and cfg.stripe_payment_link
+                       and cfg.paid_role_id and not off)
+        self.path = data_path(cfg.state_dir) / "members.json" if self.on else None
+        self.last = 0.0
+        self.guild = ""
+        if self.on:
+            reactions.command = self.command
+
+    def read(self) -> dict:
+        try:
+            data = json.loads(self.path.read_text()) if self.path and self.path.exists() else {}
+        except (OSError, ValueError):
+            data = {}
+        return {"since": data.get("since", 0), "customers": data.get("customers", {}),
+                "price": data.get("price", 0), "warned": data.get("warned", [])}
+
+    def save(self, data: dict) -> None:
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data))
+            tmp.replace(self.path)
+        except OSError as e:
+            self.r._say("members", f"couldn't save the members ({e})")
+
+    def signup_url(self) -> str:
+        return self.cfg.stripe_signup_url or ""
+
+    def command(self, uid: str, text: str) -> str | None:
+        """"!refer": the member's own sign-up link, and what it has earned them so far."""
+        if not REFER_CMD.match(text):
+            return None
+        url = self.signup_url()
+        if not url:
+            return None
+        sep = "&" if "?" in url else "?"
+        data = self.read()
+        earned = sum(1 for c in data["customers"].values() if c.get("ref") == uid and c.get("rewarded") == "yes")
+        waiting = sum(1 for c in data["customers"].values() if c.get("ref") == uid and not c.get("rewarded"))
+        return (f"🎁 Your invite link: <{url}{sep}client_reference_id={uid}>\n"
+                f"When a friend joins with it and pays for their first month (after their free week), your next "
+                f"month is free." + (f"\nSo far: {earned} free month{'s' if earned != 1 else ''}" if earned or waiting
+                                     else "") + (f", {waiting} friend{'s' if waiting != 1 else ''} still in their "
+                                                 f"free week." if waiting else ("." if earned else "")))
+
+    def due(self) -> bool:
+        return self.on and time.time() - self.last >= MEMBERS_SECONDS
+
+    def find_user(self, name: str) -> str:
+        """The Discord user id for a name typed at checkout ("" if nobody in the server matches it exactly)."""
+        want = _clean_name(name)
+        if not want:
+            return ""
+        page = _bot_api(self.r.token, "GET", f"/guilds/{self.guild}/members/search?"
+                                             + urllib.parse.urlencode({"query": want[:32], "limit": 10})) or []
+        for m in page:
+            u = m.get("user", {})
+            if want in {_clean_name(x or "") for x in (u.get("username"), u.get("global_name"), m.get("nick"))}:
+                return u.get("id", "")
+        return ""
+
+    def set_role(self, uid: str, on: bool) -> bool:
+        try:
+            _bot_api(self.r.token, "PUT" if on else "DELETE",
+                     f"/guilds/{self.guild}/members/{uid}/roles/{self.cfg.paid_role_id}")
+            return True
+        except urllib.error.HTTPError as e:
+            if e.code == 404 and not on:   # they left the server: nothing to take
+                return True
+            self.r._say(f"role{e.code}", f"couldn't {'give' if on else 'take'} the Paid role (Discord said "
+                                         f"{e.code}): give the bot Manage Roles, with its role above Paid")
+            return False
+
+    def tell(self, text: str) -> None:
+        """A note for the owners in the test channel (never names an email)."""
+        url = self.cfg.test_webhook_url or self.cfg.status_webhook_url
+        if url:
+            try:
+                _webhook(url, {"username": BOT_NAME, "content": text[:1990], "allowed_mentions": {"parse": []}})
+            except Exception as e:  # noqa: BLE001
+                print(f"  ! Members note: {e!r:.150}", file=sys.stderr)
+
+    def tick(self, now: float | None = None) -> None:
+        now = now or time.time()
+        self.last = time.time()
+        key = self.cfg.stripe_key
+        data = self.read()
+        if not self.guild:
+            self.guild = (_bot_api(self.r.token, "GET", f"/channels/{self.cfg.unit_channel_id}") or {}).get("guild_id", "")
+            if not self.guild:
+                return
+        # 1. New sign-ups: who bought, their Discord name, who referred them.
+        since = data["since"]
+        for s in _stripe_all(key, "/checkout/sessions", {"payment_link": self.cfg.stripe_payment_link,
+                                                          "status": "complete", "created[gt]": since}):
+            data["since"] = max(data["since"], s.get("created", 0))
+            cus = s.get("customer")
+            if not cus or cus in data["customers"]:
+                continue
+            name = next((f.get("text", {}).get("value") or "" for f in s.get("custom_fields", [])
+                         if f.get("key") == "discord"), "")
+            data["customers"][cus] = {"name": name, "user": "", "sub": s.get("subscription") or "",
+                                      "ref": s.get("client_reference_id") or "", "rewarded": "", "role": False,
+                                      "status": "", "joined": s.get("created", 0)}
+        if not data["customers"]:
+            self.save(data)
+            return
+        # 2. Every subscription's status (one list call), and the price, for the referral credit.
+        subs = {x["id"]: x for x in _stripe_all(key, "/subscriptions", {"status": "all"})}
+        for cus, c in data["customers"].items():
+            sub = subs.get(c["sub"])
+            if sub:
+                c["status"] = sub.get("status", "")
+                items = sub.get("items", {}).get("data", [])
+                if items and not data["price"]:
+                    data["price"] = items[0].get("price", {}).get("unit_amount") or 0
+        # 3. Each buyer's Discord account, then the Paid role to match their subscription.
+        for cus, c in data["customers"].items():
+            if not c["user"] and c["status"] in PAID_STATUSES:
+                try:
+                    c["user"] = self.find_user(c["name"])
+                except urllib.error.HTTPError as e:
+                    self.r._say(f"search{e.code}", f"couldn't look up members (Discord said {e.code}): turn on "
+                                                   "SERVER MEMBERS INTENT for the bot (Developer Portal → Bot)")
+                if not c["user"] and cus not in data["warned"] and now - c.get("joined", now) > 3600:
+                    data["warned"].append(cus)
+                    self.tell(f"💳 A new member paid an hour ago but nobody in the server is called "
+                              f"**{c['name'] or '(no name given)'}** (Stripe customer {cus}). Give them the Paid role "
+                              f"by hand once you find them.")
+        # (One person, several subscriptions over time: the role is on while any of them is.)
+        paying = {c["user"] for c in data["customers"].values() if c["user"] and c["status"] in PAID_STATUSES}
+        for cus, c in data["customers"].items():
+            if not c["user"]:
+                continue
+            want = c["user"] in paying
+            if want != c["role"] and self.set_role(c["user"], want):
+                c["role"] = want
+                if want and c["status"] in PAID_STATUSES:
+                    self.r.dm(c["user"], "✅ You're in: the alert channels are unlocked. Type `!refer` in the "
+                                         f"<#{self.cfg.unit_channel_id}> channel for your invite link: every friend "
+                                         "who joins with it gets you a free month.")
+        # 4. Referrals: a friend's first real payment gives the referrer a month's price as credit.
+        # (Each friend counts once, however many times they sign up; the referrer's paying subscription gets it.)
+        by_user = {c["user"]: cus for cus, c in sorted(data["customers"].items(),
+                                                       key=lambda x: x[1]["status"] in PAID_STATUSES) if c["user"]}
+        counted = {c["user"] for c in data["customers"].values() if c["user"] and c["rewarded"] == "yes"}
+        for cus, c in data["customers"].items():
+            if not c["ref"] or c["rewarded"] or c["status"] != "active":
+                continue
+            if c["ref"] == c["user"] or (c["user"] and c["user"] in counted):
+                c["rewarded"] = "self" if c["ref"] == c["user"] else "again"
+                continue
+            paid = _stripe(key, "GET", "/invoices", {"subscription": c["sub"], "status": "paid", "limit": 5})
+            if not any(i.get("amount_paid", 0) > 0 for i in paid.get("data", [])):
+                continue
+            ref_cus = by_user.get(c["ref"])
+            if not ref_cus or data["customers"][ref_cus]["status"] not in PAID_STATUSES or not data["price"]:
+                continue   # the referrer isn't a paying member (yet): kept until they are
+            _stripe(key, "POST", f"/customers/{ref_cus}/balance_transactions",
+                    {"amount": -int(data["price"]), "currency": "usd",
+                     "description": f"Referral: a free month for inviting {c['name'] or 'a friend'}"})
+            c["rewarded"] = "yes"
+            counted.add(c["user"])
+            self.r.dm(c["ref"], f"🎉 **{c['name'] or 'Your friend'}** joined with your link, so your next month is "
+                                f"free ({money(data['price'] / 100)} credit on your account). Thanks for spreading "
+                                "the word!")
+            self.tell(f"🎁 Referral: {c['name'] or 'a member'} paid their first month; their inviter got a free month.")
+        self.save(data)
 
 
 def members_lines(cfg: Config, rows: list[dict], top: int = 3) -> str:
@@ -10779,6 +11013,7 @@ class Trackers:
             a.alerted = self.alerted
         # ✅ bet tracking (DISCORD_BOT_TOKEN; not --once, --demo or --dry-run).
         self.reactions = BetReactions(cfg, off)
+        self.members = Members(cfg, self.reactions, off)
         if self.reactions.on:
             for a in (self.evs, self.outs, self.prop_evs, self.prop_outs, self.parlays, self.period_evs,
                       self.period_outs):
@@ -11440,6 +11675,11 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
                 t.reactions.dm_tick()
             except Exception as e:  # noqa: BLE001 - 💵 DMs must never stop the bot
                 print(f"  ! 💵 unit DMs failed: {e!r:.200}", file=sys.stderr)
+        if not args.once and t.members.due():
+            try:
+                t.members.tick()
+            except Exception as e:  # noqa: BLE001 - members must never stop the bot
+                print(f"  ! Members (Stripe): {e!r:.200}", file=sys.stderr)
 
         if args.once:
             if line := links_line(main_events + prop_events, cfg):

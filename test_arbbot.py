@@ -13421,6 +13421,87 @@ class EVBotSpec(MixFiles):
             self.assertEqual(t.reactions.dm_tick(), 0)                                     # once per card
             self.assertEqual(posts, [])
 
+    def test_paid_role_follows_stripe_and_a_friends_first_payment_earns_a_free_month(self):
+        from unittest import mock
+        import urllib.parse as up
+        sent, discord, stripe_posts, tells = [], [], [], []
+        sessions = [
+            {"id": "cs_1", "created": 100, "customer": "cus_A", "subscription": "sub_A", "client_reference_id": None,
+             "custom_fields": [{"key": "discord", "text": {"value": "@Annie"}}]},
+            {"id": "cs_2", "created": 200, "customer": "cus_B", "subscription": "sub_B", "client_reference_id": "111",
+             "custom_fields": [{"key": "discord", "text": {"value": "bobby"}}]},
+            {"id": "cs_3", "created": 300, "customer": "cus_C", "subscription": "sub_C", "client_reference_id": None,
+             "custom_fields": [{"key": "discord", "text": {"value": "nobody here"}}]}]
+        status = {"sub_A": "active", "sub_B": "trialing", "sub_C": "active"}
+        paid = {"sub_B": []}
+        people = {"annie": {"user": {"id": "111", "username": "annie"}},
+                  "bobby": {"user": {"id": "222", "username": "Bobby_B", "global_name": "bobby"}}}
+
+        def stripe(key, method, path, params=None):
+            params = params or {}
+            if method == "POST":
+                stripe_posts.append((path, params))
+                return {}
+            if path == "/checkout/sessions":
+                self.assertEqual(params["payment_link"], "plink_1")
+                return {"data": [x for x in sessions if x["created"] > params["created[gt]"]], "has_more": False}
+            if path == "/subscriptions":
+                return {"data": [{"id": k, "status": v, "items": {"data": [{"price": {"unit_amount": 2000}}]}}
+                                 for k, v in status.items()], "has_more": False}
+            if path == "/invoices":
+                return {"data": paid.get(params["subscription"], [])}
+            raise AssertionError(path)
+
+        def api(token, method, path, body=None):
+            discord.append((method, path))
+            if path == "/users/@me":
+                return {"id": "bot1"}
+            if path == "/channels/99":
+                return {"guild_id": "g1"}
+            if "/members/search?" in path:
+                q = up.parse_qs(path.split("?")[1])["query"][0]
+                return [m for k, m in people.items() if k.startswith(q[:4])]
+            if path == "/users/@me/channels":
+                return {"id": "dm-" + body["recipient_id"]}
+            if path.startswith("/channels/dm-"):
+                discord.append(("DM", body["content"]))
+            return {}
+        with mock.patch("arbbot._stripe", stripe), mock.patch("arbbot._bot_api", api), \
+                mock.patch("arbbot._webhook", lambda url, payload, *a, **k: tells.append(payload["content"])):
+            t = self.tracked(sent, unit_channel_id="99", stripe_key="rk", stripe_payment_link="plink_1",
+                             stripe_signup_url="https://buy.stripe.com/x", paid_role_id="555",
+                             test_webhook_url="https://test")
+            m = t.members
+            self.assertTrue(m.on)
+            m.tick(now=400)
+            roles = [(meth, path) for meth, path in discord if "/roles/" in path]
+            self.assertEqual(roles, [("PUT", "/guilds/g1/members/111/roles/555"),
+                                     ("PUT", "/guilds/g1/members/222/roles/555")])     # trialing counts
+            self.assertEqual(stripe_posts, [])                                          # friend still in their free week
+            self.assertEqual(tells, [])                                                 # cus_C: not an hour yet
+            self.assertIn("client_reference_id=111", m.command("111", "!refer"))
+            self.assertIn("1 friend still in their free week", m.command("111", "!refer"))
+            self.assertIsNone(m.command("111", "!unit 25"))
+
+            status["sub_B"], paid["sub_B"] = "active", [{"amount_paid": 2000}]           # the friend's first payment
+            discord.clear()
+            m.tick(now=400 + 3700)
+            self.assertEqual(stripe_posts, [("/customers/cus_A/balance_transactions",
+                                             {"amount": -2000, "currency": "usd",
+                                              "description": "Referral: a free month for inviting bobby"})])
+            self.assertTrue(any(k == "DM" and "your next month is free ($20 credit" in v for k, v in discord))
+            self.assertEqual(len(tells), 2)
+            self.assertIn("nobody in the server is called **nobody here**", tells[0])   # then: give it by hand
+            self.assertIn("1 free month", m.command("111", "!refer"))
+            m.tick(now=9000)
+            self.assertEqual(len(stripe_posts), 1)                                     # once per friend
+            self.assertEqual(len(tells), 2)                                            # and the warning once
+
+            status["sub_B"] = "canceled"
+            discord.clear()
+            m.tick(now=9500)
+            self.assertEqual([(a, b) for a, b in discord if "/roles/" in b], [("DELETE", "/guilds/g1/members/222/roles/555")])
+
     def test_tracking_is_off_without_a_token_or_in_a_test_run(self):
         sent = []
         t = self.live(sent)
