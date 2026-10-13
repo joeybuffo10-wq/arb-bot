@@ -13434,6 +13434,7 @@ class EVBotSpec(MixFiles):
              "custom_fields": [{"key": "discord", "text": {"value": "nobody here"}}]}]
         status = {"sub_A": "active", "sub_B": "trialing", "sub_C": "active"}
         paid = {"sub_B": []}
+        prices = {"sub_B": 4500}   # the friend pays the new $45; the referrer's own month ($20) is the credit
         cards = {"sub_D": "fp_/payment_methods/pm_sub_B"}   # Dave pays with Bobby's card
         people = {"annie": {"user": {"id": "111", "username": "annie"}},
                   "dave": {"user": {"id": "444", "username": "dave"}},
@@ -13450,7 +13451,7 @@ class EVBotSpec(MixFiles):
                 self.assertEqual(params["payment_link"], "plink_1")
                 return {"data": [x for x in sessions if x["created"] > params["created[gt]"]], "has_more": False}
             if path == "/subscriptions":
-                return {"data": [{"id": k, "status": v, "items": {"data": [{"price": {"unit_amount": 2000}}]},
+                return {"data": [{"id": k, "status": v, "items": {"data": [{"price": {"unit_amount": prices.get(k, 2000)}}]},
                                   "default_payment_method": "pm_" + k} for k, v in status.items()], "has_more": False}
             if path.startswith("/payment_methods/"):
                 return {"card": {"fingerprint": cards.get(path.split("_", 2)[-1], "fp_" + path)}}

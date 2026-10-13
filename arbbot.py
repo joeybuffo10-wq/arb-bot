@@ -8115,7 +8115,7 @@ class Members:
         except (OSError, ValueError):
             data = {}
         return {"since": data.get("since", 0), "customers": data.get("customers", {}),
-                "price": data.get("price", 0), "warned": data.get("warned", [])}
+                "warned": data.get("warned", [])}
 
     def save(self, data: dict) -> None:
         try:
@@ -8223,8 +8223,8 @@ class Members:
                         self.r._say(f"card{e.code}", f"couldn't read a sign-up's card (Stripe said {e.code}): give "
                                                      "the bot's Stripe key Payment Methods: Read")
                 items = sub.get("items", {}).get("data", [])
-                if items and not data["price"]:
-                    data["price"] = items[0].get("price", {}).get("unit_amount") or 0
+                if items:   # (each member's own monthly price: a referral credit is a month of the referrer's)
+                    c["price"] = items[0].get("price", {}).get("unit_amount") or 0
         # 3. Each buyer's Discord account, then the Paid role to match their subscription.
         for cus, c in data["customers"].items():
             if not c["user"] and c["status"] in PAID_STATUSES:
@@ -8290,15 +8290,16 @@ class Members:
             if not any(i.get("amount_paid", 0) > 0 for i in paid.get("data", [])):
                 continue
             ref_cus = by_user.get(c["ref"])
-            if not ref_cus or data["customers"][ref_cus]["status"] not in PAID_STATUSES or not data["price"]:
+            price = data["customers"][ref_cus].get("price", 0) if ref_cus else 0
+            if not ref_cus or data["customers"][ref_cus]["status"] not in PAID_STATUSES or not price:
                 continue   # the referrer isn't a paying member (yet): kept until they are
             _stripe(key, "POST", f"/customers/{ref_cus}/balance_transactions",
-                    {"amount": -int(data["price"]), "currency": "usd",
+                    {"amount": -int(price), "currency": "usd",
                      "description": f"Referral: a free month for inviting {c['name'] or 'a friend'}"})
             c["rewarded"] = "yes"
             counted.add(c["user"])
             self.r.dm(c["ref"], f"🎉 **{c['name'] or 'Your friend'}** joined with your link, so your next month is "
-                                f"free ({money(data['price'] / 100)} credit on your account). Thanks for spreading "
+                                f"free ({money(price / 100)} credit on your account). Thanks for spreading "
                                 "the word!")
             self.tell(f"🎁 Referral: {c['name'] or 'a member'} paid their first month; their inviter got a free month.")
         self.save(data)
