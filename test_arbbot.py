@@ -623,7 +623,7 @@ class PlusEV(unittest.TestCase):
     def test_payload(self):
         ev = ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"B": [("Home", 2.10, None)]})
         [b] = find_evs([ev], EVCFG, NOW)
-        self.assertEqual("📈 Home ML +110 · B", ev_payload(b)["embeds"][0]["title"])
+        self.assertEqual("📈 +5.0% EV · Home ML +110 · B", ev_payload(b)["embeds"][0]["title"])   # EV % up top
         desc = ev_payload(b)["embeds"][0]["description"]
         # Oct 11, short: the game and when, the bet, its stake in dollars and units (1u = 1% of $1,000) and confidence.
         self.assertEqual(desc, "🏟️ **Test** · Away @ Home\n⏰ Starts <t:1791050400:t> (<t:1791050400:R>)\n\n"
@@ -1025,7 +1025,7 @@ class Parlays(unittest.TestCase):
         legs = [ev_leg("g1", {"DK": 2.40}), ev_leg("g2", {"DK": 2.40})]
         [p] = find_parlays(legs, Config(parlay_min_ev_pct=5))
         d = parlay_payload(p)["embeds"][0]
-        self.assertTrue(d["title"].startswith("📦 2-leg parlay · DK"), d["title"])
+        self.assertTrue(d["title"].startswith(f"📦 +{p.ev_pct:.1f}% EV · 2-leg parlay · DK"), d["title"])
         self.assertNotIn("DO THIS", d["description"])
         a = ParlayAlerter(Config(webhook_url="main", ev_webhook_url="ev"), dry_run=True)
         self.assertEqual(a.webhook_for(p), "ev")
@@ -1618,7 +1618,7 @@ class AlertLifecycle(unittest.TestCase):
         back = replace(b, price=2.24)
         hand_over([back], [], ev_alr, out_alr)
         ev_alr.handle([back], ["Test"], now=1200)
-        self.assertTrue(self.pings[-1][0].startswith("📈 Home ML +124"))
+        self.assertTrue(self.pings[-1][0].startswith("📈 +12.0% EV · Home ML +124"), self.pings[-1][0])
         self.assertEqual(self.pings[-1][1], "")
         self.assertAlmostEqual(ev_alr.open[b.key].alerted_pct, 15.0)
         ev_alr.handle([replace(b, price=2.32)], ["Test"], now=1300)            # 16%: an edit, no new alert
@@ -8676,7 +8676,7 @@ class ConfirmedPreGame(MixFiles):
         self.assertEqual(b.stake, kelly_stake(0.5, 2.08, self.locks()))     # normal Kelly: the smaller edge makes it
         self.assertEqual(b.stake, 9.0)                                       # smaller (a 5.5% bet: $12)
         card = ev_payload(b)["embeds"][0]
-        self.assertEqual(card["title"], "📈 Home ML +108 · B")
+        self.assertEqual(card["title"], "📈 +4.0% EV · Home ML +108 · B")
         self.assertIn(_arbbot.tier_line(b.fair_prob, "high"), card["description"])
         self.assertEqual("\n".join(_arbbot.confirm_lines(b)),
                          "✅✅ Two sharp books agree: Pinnacle and Kalshi\n"
@@ -9046,7 +9046,7 @@ class ConfirmedPreGame(MixFiles):
         games = [confirm_event(), confirm_event(gid="e2")]           # e2: Kalshi never has it
         self.scan(t, games, -30, AGREE)                                  # (the first look waits)
         res = self.scan(t, games, -15, AGREE)
-        self.assertEqual((res.confirmed_sent, sent), (1, [("POST", "📈 Home ML +108 · B", "@here")]))
+        self.assertEqual((res.confirmed_sent, sent), (1, [("POST", "📈 +4.0% EV · Home ML +108 · B", "@here")]))
         del sent[:]
         blip = self.scan(t, games, 0, {})                              # Kalshi too slow, or too thin, this once
         self.assertEqual((blip.ev_sent, blip.confirmed_sent, blip.confirm_misses), (0, 0, {"no Kalshi price": 1}))
@@ -11707,7 +11707,7 @@ class SendTimeChecks(MixFiles):
         a.handle([live(2.26)], ["basketball_nba"], now=1060, fetched={"e1": time.time() - 2})     # sent at 13%
         self.assertAlmostEqual(a.open[live(2.26).key].alerted_pct, 13.0)
         a.handle([live(2.26)], ["basketball_nba"], now=1120, fetched={"e1": time.time() - 2})     # the same price
-        self.assertEqual([(t.split(" · ")[0], m) for t, m in self.pings], [("📈 Home ML +126", "@ev")])
+        self.assertEqual([(t.split(" · ")[1], m) for t, m in self.pings], [("Home ML +126", "@ev")])
         self.sent, self.pings = [], []
         a, cfg = self.ev_alerter(live_confirm_checks=2, ev_live=True)           # it keeps rising after it's sent:
         a.handle([live(2.20)], ["basketball_nba"], now=1000, fetched={"e1": time.time() - 100})
@@ -11715,7 +11715,7 @@ class SendTimeChecks(MixFiles):
         a.handle([live(2.32)], ["basketball_nba"], now=1120, fetched={"e1": time.time() - 2})     # 16%: one sighting
         self.assertEqual(len(self.pings), 1)
         a.handle([live(2.32)], ["basketball_nba"], now=1180, fetched={"e1": time.time() - 2})     # two: re-alerted
-        self.assertEqual([t.split(" · ")[0] for t, _ in self.pings], ["📈 Home ML +126", "📈 Home ML +132"])
+        self.assertEqual([t.split(" · ")[1] for t, _ in self.pings], ["Home ML +126", "Home ML +132"])
         self.sent, self.pings = [], []
         a, cfg = self.ev_alerter()                                              # before the game, the same
         a.handle([self.bet(2.20)], ["basketball_nba"], now=1000, fetched={"e1": time.time() - 700})
@@ -13802,7 +13802,7 @@ class EVBotSpec(MixFiles):
         self.assertEqual(p.n_period, 1)
         [op] = t.period_evs.open.values()
         self.assertEqual((op.arb.pick, op.url), ("1H Home -3.5", "https://ev"))          # +EV channel, not props
-        self.assertEqual(sent[-1][1], "📈 1H Home -3.5 +115 · B")
+        self.assertEqual(sent[-1][1], "📈 +7.5% EV · 1H Home -3.5 +115 · B")
         self.assertEqual(len(t.evs.open), 1)                                             # the full-game card: untouched
         self.assertEqual((t.prop_evs.open, t.prop_outs.open), ({}, {}))
         self.assertEqual(_arbbot.market_label("spreads_h1", -3.5), "1st Half Spread -3.5")

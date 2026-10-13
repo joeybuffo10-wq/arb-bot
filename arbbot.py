@@ -4662,7 +4662,7 @@ def ev_payload(b: EVBet, mention: str = "", gone_after: float | None = None,
     if gone_after is not None:
         return _gone_card(f"❌ GONE after {_fmt_secs(gone_after)} · ~~{b.pick} {odds(b.price)}~~",
                           f"Ignore this one. {b.book} moved and the value is gone. ({icon} {b.matchup})")
-    return _card(f"📈 {b.pick} {odds(b.price)} · {b.book}", bet_lines(b, status), 0x3498DB, url=b.link, mention=mention)
+    return _card(f"📈 +{b.ev_pct:.1f}% EV · {b.pick} {odds(b.price)} · {b.book}", bet_lines(b, status), 0x3498DB, url=b.link, mention=mention)
 
 
 EV_LOG_FIELDS = ["first_seen", "event_id", "sport", "sport_key", "matchup",
@@ -5846,7 +5846,7 @@ def outlier_payload(b: EVBet, mention: str = "", gone_after: float | None = None
         return _gone_card(f"❌ GONE after {_fmt_secs(gone_after)} · ~~🚨 {b.pick} {odds(b.price)}~~",
                           f"Ignore this one. {b.book} fixed its price. ({icon} {b.matchup})")
     void = "⚠️ May be a pricing error the book can void." if b.ev_pct >= VOID_WARN_PCT else ""
-    return _card(f"🚨 {b.pick} {odds(b.price)} · {b.book}", bet_lines(b, status, void), 0xE67E22, url=b.link,
+    return _card(f"🚨 +{b.ev_pct:.1f}% EV · {b.pick} {odds(b.price)} · {b.book}", bet_lines(b, status, void), 0xE67E22, url=b.link,
                  mention=mention)
 
 
@@ -6018,7 +6018,7 @@ def parlay_payload(p: Parlay, mention: str = "", gone_after: float | None = None
         + ("🔴 LIVE" if b.is_live else f"<t:{int(_parse_time(b.commence_time).timestamp())}:t>")
         for i, (b, pr, ln) in enumerate(p.legs))
     one = f"🔗 **[Add all {len(p.legs)} legs to the {p.book} bet slip]({slip})**\n\n" if slip else ""
-    return _card(f"📦 {len(p.legs)}-leg parlay · {p.book} · {odds(p.price)}", f"{one}{legs}\n## {p.stake_label}\n{tier_line(p.fair_prob)}\n{fair_value_line(p.fair_prob)}",
+    return _card(f"📦 +{p.ev_pct:.1f}% EV · {len(p.legs)}-leg parlay · {p.book} · {odds(p.price)}", f"{one}{legs}\n## {p.stake_label}\n{tier_line(p.fair_prob)}\n{fair_value_line(p.fair_prob)}",
                  0x9B59B6, url=slip, mention=mention)
 
 
