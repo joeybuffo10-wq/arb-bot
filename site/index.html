@@ -58,6 +58,7 @@
 
   <div class="bar" id="types" role="group" aria-label="Bet type"></div>
   <div class="bar" id="ranges" role="group" aria-label="Time range"></div>
+  <div class="bar" id="tiers" role="group" aria-label="Tier"></div>
 
   <div class="card">
     <h2>Profit over time (units)</h2>
@@ -91,7 +92,10 @@
 (function () {
   var TYPES = ["All", "+EV", "Prop", "Outlier", "Parlay"];
   var RANGES = [["7 days", 7], ["30 days", 30], ["All time", 0]];
-  var state = { type: "All", days: 0, from: "", to: "", bets: [] };
+  // Tiers, most likely to hit first; a button keeps that tier and every one above it.
+  var TIER_ORDER = ["💎 Elite", "🟢 Very confident", "🔵 Confident", "🟡 Somewhat confident", "🟠 Slight chance"];
+  var TIERS = [["All tiers", 0], ["💎 Elite only", 1], ["🟢 Very confident & up", 2], ["🔵 Confident & up", 3]];
+  var state = { type: "All", days: 0, tier: 0, from: "", to: "", bets: [] };
   // ?from=YYYY-MM-DD&to=YYYY-MM-DD (the Discord results cards link one day or one week this way)
   (function () {
     var q = new URLSearchParams(location.search), ok = /^\d{4}-\d{2}-\d{2}$/;
@@ -133,6 +137,7 @@
     }
     return state.bets.filter(function (b) {
       if (state.days === -1 && (b.date < state.from || b.date > state.to)) return false;
+      if (state.tier) { var i = TIER_ORDER.indexOf(b.tier); if (i < 0 || i >= state.tier) return false; }
       return (state.type === "All" || b.type === state.type) && (!cutoff || b.date >= cutoff);
     });
   }
@@ -285,6 +290,7 @@
 
   function render() {
     buttons("types", TYPES, state.type, function (v) { state.type = v; });
+    buttons("tiers", TIERS, state.tier, function (v) { state.tier = v; });
     buttons("ranges", (state.from ? [[spanLabel(), -1]] : []).concat(RANGES), state.days, function (v) { state.days = v; });
     var bets = chosen();
     stats(bets); chart(bets); clvChart(bets); breakdowns(bets); table(bets);

@@ -2790,7 +2790,10 @@ class Alerter:
 
     def card_hash(self, item, first_seen: float | None) -> str:
         """Everything the card shows, so any visible change (a book's price on the list, the
-        confidence, related alerts...) edits it."""
+        confidence, related alerts...) edits it. Not the other books' prices or the sharp move (➕ / 🔥): those
+        lines are as they were when the card went out, and their changing alone doesn't edit it."""
+        if hasattr(item, "also"):
+            item = replace(item, also=[], sharp_move=None)
         emb = {k: v for k, v in self.payload(item, first_seen=first_seen)["embeds"][0].items() if k != "timestamp"}
         return hashlib.sha1(json.dumps(emb, sort_keys=True).encode()).hexdigest()[:16]
 
@@ -3518,6 +3521,7 @@ class EVBet:
     alt_books: set[str] = field(default_factory=set)   # books on the board whose price is their alternate line's
     hedge_alt: set[str] = field(default_factory=set)   # hedge outcomes priced on an alternate line
     tune_note: str = ""              # TUNE_ENABLED: why its stake was raised or cut by the bot's own record ("" = not)
+    sharp_move: float | None = None  # the sharp price's move toward this side over the last hour, in win-% points
 
     def worst_ok_price(self, min_edge_pct: float = OK_EDGE_PCT) -> float:
         """Lowest price that still leaves min_edge_pct of edge against the fair price."""
@@ -4333,6 +4337,7 @@ def find_evs(events: list[dict], cfg: Config, now: datetime | None = None,
                     if not doubt:   # never a lock until the sharp prices the line again
                         doubt = why = f"{sharp_title} took this line down"
             move = history.record((ev["id"], k[0], k[1], name), now, p_own) if history and from_sharp else None
+            bet.sharp_move = move
             bet.confidence, bet.confidence_notes = rate_confidence(hold, gap, hours, bet.ev_pct, is_prop(k[1]), move,
                                                                    kgap, cfg.confident_hours, agree, missed)
             if kalshi_alone:   # one exchange's price is the whole fair price: at most medium, never a lock
@@ -4644,6 +4649,24 @@ def fair_value_line(fair_prob: float) -> str:
     return f"📊 Fair value **{odds(1 / fair_prob)}** · {fair_prob:.1%} to win" if fair_prob > 0 else ""
 
 
+SHARP_MOVE_POINTS = 2.0   # 🔥 Sharp money: the sharp price moved this many win-% points toward the bet in the last hour
+
+
+def extra_lines(b: EVBet) -> str:
+    """The card's lines under the fair value: how far the price can drop and still be worth it, the other books
+    where it's good too (best 2), and 🔥 when the sharp price has been moving toward it."""
+    lines = []
+    worst = b.worst_ok_price()
+    if _printed(worst) < _printed(b.price):
+        lines.append(f"⬇️ Good down to **{odds(worst)}**")
+    if also := sorted(b.also, key=lambda x: -x[1])[:2]:
+        lines.append("➕ Also good: " + " · ".join(f"{bk} {odds(pr)}" for bk, pr in also))
+    if b.sharp_move is not None and b.sharp_move >= SHARP_MOVE_POINTS:
+        lines.append(f"🔥 **Sharp money:** {b.sharp_name or 'Pinnacle'} moved toward it "
+                     f"(+{b.sharp_move:.1f}% win chance this hour)")
+    return "\n".join(lines)
+
+
 def bet_lines(b: EVBet, status: str = "", note: str = "") -> str:
     """A bet card's whole text: the game and when it starts, the bet and its odds, the stake ("$11 (1.1u)") and
     confidence, then the ✅ / ⚠️ line once it has one, and a warning when there is one."""
@@ -4651,6 +4674,8 @@ def bet_lines(b: EVBet, status: str = "", note: str = "") -> str:
     # (The stake as a heading: big, so it's the first thing anyone sees.)
     bet = (f"**{b.pick} {odds(b.price)}**{ALT_NOTE if b.alt else ''}\n## {b.stake_label}"
            + f"\n{tier_line(b.fair_prob, b.confidence, b.sharp_prob is not None)}\n{fair_value_line(b.fair_prob)}")
+    if more := extra_lines(b):
+        bet += f"\n{more}"
     return "\n\n".join(x for x in (game, bet, status_line(status, b.book), note) if x)
 
 

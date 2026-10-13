@@ -628,7 +628,14 @@ class PlusEV(unittest.TestCase):
         # Oct 11, short: the game and when, the bet, its stake in dollars and units (1u = 1% of $1,000) and confidence.
         self.assertEqual(desc, "🏟️ **Test** · Away @ Home\n⏰ Starts <t:1791050400:t> (<t:1791050400:R>)\n\n"
                                "**Home ML +110**\n## $11 (1.1u)\n🟡 **Somewhat confident**\n"
-                               "📊 Fair value **+100** · 50.0% to win")
+                               "📊 Fair value **+100** · 50.0% to win\n⬇️ Good down to **+103**")
+        # The other books where it's good too (the best 2), and 🔥 when the sharp price moved toward it this hour.
+        more = ev_payload(replace(b, also=[("C", 2.04), ("D", 2.08), ("E", 2.02)], sharp_move=2.5,
+                                  sharp_name="Pinnacle"))["embeds"][0]["description"]
+        self.assertTrue(more.endswith("⬇️ Good down to **+103**\n➕ Also good: D +108 · C +104\n"
+                                      "🔥 **Sharp money:** Pinnacle moved toward it (+2.5% win chance this hour)"), more)
+        self.assertNotIn("🔥", ev_payload(replace(b, sharp_move=1.5))["embeds"][0]["description"])   # under 2 points
+        self.assertNotIn("⬇️", ev_payload(replace(b, price=1.52))["embeds"][0]["description"])   # no room to drop
         for gone in ("DO THIS", "won't win every time", "+EV = better price", "Can't use that book",
                      "skip if the price", "other books mostly agree"):
             self.assertNotIn(gone, desc)
@@ -10662,6 +10669,16 @@ class CardEditThrottle(unittest.TestCase):
 
     def methods(self):
         return [m for m, _ in self.sent]
+
+    def test_a_sharp_move_toward_a_bet_is_on_it(self):
+        from arbbot import SharpHistory
+        h = SharpHistory()
+        then = ev_event([("Home", 2.00, None), ("Away", 1.82, None)], {"B": [("Home", 2.20, None)]})
+        now_ = ev_event([("Home", 1.88, None), ("Away", 1.94, None)], {"B": [("Home", 2.20, None)]})
+        self.assertFalse(find_evs([then], EVCFG, NOW, history=h)[0].sharp_move)          # first sighting: no move
+        [b] = find_evs([now_], EVCFG, NOW + timedelta(minutes=20), history=h)
+        self.assertGreater(b.sharp_move, 2.0)
+        self.assertIn("🔥 **Sharp money:**", ev_payload(b)["embeds"][0]["description"])
 
     def test_other_books_prices_never_edit_the_card(self):
         # Oct 11: the card is short (the game, the bet, units, confidence), so other books' prices aren't on it.
