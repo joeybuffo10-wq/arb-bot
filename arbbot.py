@@ -441,6 +441,9 @@ class Config:
     # the bot puts a ✅ under each new bet card, reads who tapped it every REACTION_MINUTES until the game starts,
     # and the results card reports the bets members actually took.
     discord_bot_token: str = ""
+    # 💵 unit DMs (with DISCORD_BOT_TOKEN): members type "!unit 25" in this channel (its id) to set their own unit
+    # size; tapping 💵 under a bet card then DMs them its stake in dollars at their unit. Empty = off.
+    unit_channel_id: str = ""
     # An uptime monitor's ping URL (healthchecks.io: https://hc-ping.com/...; set it with --set). The bot calls it
     # every HEARTBEAT_SECONDS while it's running; when the calls stop, the monitor tells you. Empty = off.
     healthcheck_url: str = ""
@@ -756,6 +759,7 @@ class Config:
             parlay_dk_format=(e("PARLAY_DK_FORMAT") or "plus").strip().lower(),
             results_site_token=e("RESULTS_SITE_TOKEN", "").strip(),
             reaction_minutes=num("REACTION_MINUTES", d.reaction_minutes, int),
+            unit_channel_id="".join(c for c in e("UNIT_CHANNEL_ID", "") if c.isdigit()),
             tune_slow_still_pct=num("TUNE_SLOW_STILL_PCT", d.tune_slow_still_pct, float),
             tune_slow_bets=num("TUNE_SLOW_BETS", d.tune_slow_bets, int),
             tune_slow_extra_pct=num("TUNE_SLOW_EXTRA_PCT", d.tune_slow_extra_pct, float),
@@ -7717,11 +7721,15 @@ class Results:
 DISCORD_API = "https://discord.com/api/v10"
 TAKEN = "✅"
 TAKEN_GRACE = 1800   # seconds after kickoff a ✅ still counts (a bet placed right at the start), then it's final
+UNIT_DM = "💵"         # tap it under a card: the bot DMs you its stake in dollars at your own unit (UNIT_CHANNEL_ID)
+UNIT_DM_SECONDS = 60  # how often the 💵 taps and the "!unit" messages are read
+UNIT_CMD = re.compile(r"^\s*(?:<@!?\d+>\s*)?!?unit\b\s*\$?\s*([\d,]*\.?\d*)\s*$", re.I)
 
 
-def _bot_api(token: str, method: str, path: str) -> dict | list | None:
+def _bot_api(token: str, method: str, path: str, body: dict | None = None) -> dict | list | None:
     """One Discord API call as the bot. A "slow down" (429) is waited out, twice at most, up to 10s each."""
-    req = urllib.request.Request(DISCORD_API + path, method=method, data=b"" if method == "PUT" else None,
+    data = json.dumps(body).encode() if body is not None else (b"" if method == "PUT" else None)
+    req = urllib.request.Request(DISCORD_API + path, method=method, data=data,
                                  headers={"Authorization": f"Bot {token}", "Content-Type": "application/json",
                                           "User-Agent": "DiscordBot (https://github.com/joeybuffo10-wq/arb-bot, 3.0)"})
     for _ in range(3):
@@ -7775,7 +7783,12 @@ class BetReactions:
         self.messages: dict[str, dict] = {}   # message id -> {"bet", "channel", "start"}: cards still being read
         self.channels: dict[str, str] = {}    # webhook URL -> its channel id
         self.me = ""                          # the bot's own user id (its ✅ isn't a member's)
+        self.guilds: dict[str, str] = {}      # webhook URL -> its server id (for links to a card)
         self.last = 0.0
+        self.units_on = self.on and bool(cfg.unit_channel_id)
+        self.units_path = data_path(cfg.state_dir) / "units.json" if self.units_on else None
+        self.dm_last = 0.0
+        self.dm_channels: dict[str, str] = {}   # user id -> their DM channel with the bot
         self.warned: set[str] = set()         # problems said once (console)
         if self.msg_path and self.msg_path.exists():
             try:
@@ -7804,7 +7817,8 @@ class BetReactions:
         if webhook not in self.channels:
             req = urllib.request.Request(webhook, headers={"User-Agent": "arbbot/3.0"})
             with urllib.request.urlopen(req, timeout=10) as resp:
-                self.channels[webhook] = json.loads(resp.read())["channel_id"]
+                info = json.loads(resp.read())
+            self.channels[webhook], self.guilds[webhook] = info["channel_id"], info.get("guild_id", "")
         return self.channels[webhook]
 
     def add(self, row: dict, message_id: str, webhook: str) -> None:
@@ -7814,20 +7828,25 @@ class BetReactions:
         channel = self.channel(webhook)
         self.messages[message_id] = {"bet": row_bet_id(row), "channel": channel,
                                      "start": row.get("commence_time") or _parlay_row(row)["commence_time"]}
+        if self.units_on:   # (for 💵: the stake in units, the server for the card's link, who's been DMed)
+            unit = self.cfg.unit() or 1.0
+            n = row.get("units") or (float(row.get("stake") or 0) / unit)
+            self.messages[message_id].update(units=float(n), guild=self.guilds.get(webhook, ""), dm=[])
         self._save()
-        try:
-            _bot_api(self.token, "PUT", f"/channels/{channel}/messages/{message_id}/reactions/"
-                                        f"{urllib.parse.quote(TAKEN)}/@me")
-        except urllib.error.HTTPError as e:
-            self._say(f"add{e.code}", f"couldn't add the ✅ (Discord said {e.code}): give the bot Add Reactions "
-                                      "and Read Message History in the bet channels")
+        for emoji in (TAKEN, UNIT_DM) if self.units_on else (TAKEN,):
+            try:
+                _bot_api(self.token, "PUT", f"/channels/{channel}/messages/{message_id}/reactions/"
+                                            f"{urllib.parse.quote(emoji)}/@me")
+            except urllib.error.HTTPError as e:
+                self._say(f"add{e.code}", f"couldn't add the {emoji} (Discord said {e.code}): give the bot Add "
+                                          "Reactions and Read Message History in the bet channels")
 
-    def users(self, channel: str, message_id: str) -> dict[str, str]:
+    def users(self, channel: str, message_id: str, emoji: str = TAKEN) -> dict[str, str]:
         """{user id: name} of the members who ✅'d a card (not the bot itself, nor other bots)."""
         out, after = {}, ""
         while True:
             page = _bot_api(self.token, "GET", f"/channels/{channel}/messages/{message_id}/reactions/"
-                                               f"{urllib.parse.quote(TAKEN)}?limit=100" + (f"&after={after}" if after else ""))
+                                               f"{urllib.parse.quote(emoji)}?limit=100" + (f"&after={after}" if after else ""))
             if not page:
                 return out
             for u in page:
@@ -7839,6 +7858,130 @@ class BetReactions:
 
     def due(self) -> bool:
         return self.on and bool(self.messages) and time.time() - self.last >= self.cfg.reaction_minutes * 60
+
+    # ----- 💵 unit DMs (UNIT_CHANNEL_ID)
+
+    def read_units(self) -> dict:
+        """{"last": the last "!unit" message read, "units": {user id: dollars per unit}}."""
+        try:
+            data = json.loads(self.units_path.read_text()) if self.units_path and self.units_path.exists() else {}
+        except (OSError, ValueError):
+            data = {}
+        return {"last": data.get("last", ""), "units": data.get("units", {})}
+
+    def _save_units(self, data: dict) -> None:
+        try:
+            self.units_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.units_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data))
+            tmp.replace(self.units_path)
+        except OSError as e:
+            self._say("units", f"couldn't save the members' units ({e})")
+
+    def dm_due(self) -> bool:
+        return self.units_on and time.time() - self.dm_last >= UNIT_DM_SECONDS
+
+    def unit_commands(self, data: dict) -> None:
+        """Read the new messages in the unit channel: "!unit 25" sets that member's unit ($25), "!unit" says it.
+        Each gets a short reply. (Needs the bot's Message Content intent, or the bot @mentioned.)"""
+        cid = self.cfg.unit_channel_id
+        page = _bot_api(self.token, "GET", f"/channels/{cid}/messages?limit=50"
+                                           + (f"&after={data['last']}" if data["last"] else "")) or []
+        for m in sorted(page, key=lambda m: int(m["id"])):
+            data["last"] = m["id"]
+            who = m.get("author", {})
+            if who.get("bot") or who.get("id") == self.me:
+                continue
+            text = m.get("content", "")
+            if not text and not m.get("attachments"):
+                self._say("intent", "can't read the !unit messages: turn on MESSAGE CONTENT INTENT for the bot "
+                                    "(Discord Developer Portal → your app → Bot)")
+                continue
+            hit = UNIT_CMD.match(text)
+            if not hit:
+                continue
+            uid, amount = who["id"], hit.group(1).replace(",", "")
+            if amount:
+                try:
+                    value = float(amount)
+                except ValueError:
+                    value = 0.0
+                if not 1 <= value <= 100_000:
+                    reply = "Type it like `!unit 25` (dollars per unit, 1 to 100,000)."
+                else:
+                    data["units"][uid] = value
+                    reply = (f"✅ Your unit is now **{money(value)}**. Tap {UNIT_DM} under any bet and I'll DM you "
+                             f"what to bet.")
+            else:
+                mine = data["units"].get(uid)
+                reply = (f"Your unit is **{money(mine)}**." if mine else
+                         f"You haven't set one: the cards use {money(self.cfg.unit() or 10)}.") + " Change it: `!unit 25`."
+            try:
+                _bot_api(self.token, "POST", f"/channels/{cid}/messages",
+                         {"content": reply, "message_reference": {"message_id": m["id"]},
+                          "allowed_mentions": {"parse": []}})
+            except urllib.error.HTTPError as e:
+                self._say(f"reply{e.code}", f"couldn't answer in the unit channel (Discord said {e.code}): give "
+                                            "the bot View Channel, Send Messages and Read Message History there")
+
+    def dm(self, uid: str, text: str) -> bool:
+        """DM one member (False: they don't take DMs from server members, or Discord said no)."""
+        try:
+            if uid not in self.dm_channels:
+                self.dm_channels[uid] = (_bot_api(self.token, "POST", "/users/@me/channels",
+                                                  {"recipient_id": uid}) or {})["id"]
+            _bot_api(self.token, "POST", f"/channels/{self.dm_channels[uid]}/messages",
+                     {"content": text, "allowed_mentions": {"parse": []}})
+            return True
+        except (urllib.error.HTTPError, KeyError):
+            return False
+
+    def dm_text(self, m: dict, mid: str, unit: float | None) -> str:
+        link = f"https://discord.com/channels/{m.get('guild') or '@me'}/{m['channel']}/{mid}"
+        n = m.get("units", 0.0)
+        if unit:
+            return f"{UNIT_DM} **{money(n * unit)}** on this bet ({n:g}u at your {money(unit)} unit)\n{link}"
+        base = self.cfg.unit() or 10.0
+        return (f"{UNIT_DM} **{money(n * base)}** on this bet ({n:g}u at {money(base)} a unit). Set your own unit: "
+                f"type `!unit 25` in <#{self.cfg.unit_channel_id}>.\n{link}")
+
+    def dm_tick(self) -> int:
+        """Read the "!unit" messages, then DM each member who tapped 💵 under an open card (once per card).
+        Returns how many DMs went out."""
+        self.dm_last = time.time()
+        if not self.me:
+            try:
+                self.me = (_bot_api(self.token, "GET", "/users/@me") or {}).get("id", "")
+            except urllib.error.HTTPError as e:
+                self._say(f"me{e.code}", f"Discord turned the bot token down ({e.code}): check DISCORD_BOT_TOKEN")
+                return 0
+        data = self.read_units()
+        try:
+            self.unit_commands(data)
+        except urllib.error.HTTPError as e:
+            self._say(f"unitch{e.code}", f"couldn't read the unit channel (Discord said {e.code}): check "
+                                         "UNIT_CHANNEL_ID and give the bot View Channel and Read Message History there")
+        except OSError as e:
+            self._say("net", f"couldn't reach Discord ({e!r:.100}); trying again later")
+            return 0
+        self._save_units(data)
+        sent = 0
+        for mid, m in list(self.messages.items()):
+            if "units" not in m:
+                continue
+            try:
+                tapped = self.users(m["channel"], mid, UNIT_DM)
+            except urllib.error.HTTPError:
+                continue
+            except OSError:
+                break
+            for uid in tapped:
+                if uid in m["dm"]:
+                    continue
+                m["dm"].append(uid)   # (once, even if their DMs are closed: never spam a retry)
+                sent += self.dm(uid, self.dm_text(m, mid, data["units"].get(uid)))
+        self._save()
+        return sent
 
     def tick(self, now: datetime | None = None) -> int:
         """Read every card still open to ✅s; returns how many bets have at least one taker now."""
@@ -10033,9 +10176,10 @@ GUIDE = """**Each alert is one bet. Tap the title to open it at the book, bet th
 "1H" / "1Q" means first half / first quarter. Team totals are a team's own points.
 
 **Stake:** bet the amount shown, e.g. $11 (1.1u): the same stake in dollars and units. Lower confidence already means a smaller stake.
-**How likely it hits:** 💎 Elite (70%+ to win, the sharpest price, highest confidence: these go in the top picks channel), 🟢 Very confident (60%+), 🔵 Confident (50–60%), 🟡 Somewhat confident (35–50%), 🟠 Slight chance (under 35%, pays more). One tier lower when the price itself is less certain. Even 💎 loses sometimes: no bet is a sure thing.
+**How likely it hits:** 💎 Elite (70%+, sharpest price, top confidence: top picks channel only), 🟢 Very confident (60%+), 🔵 Confident (50–60%), 🟡 Somewhat confident (35–50%), 🟠 Slight chance (under 35%, pays more). One tier lower when the price itself is less certain. Even 💎 loses sometimes: no bet is a sure thing.
 **✅ Still good / ⚠️ Price moved:** the line under a card after it goes out. ⚠️ means don't bet it now.
-**✅ reaction:** tap it after you place a bet, so the results show what members took.
+**✅ reaction:** tap it when you place a bet; the results show what members took.
+**💵 reaction:** DMs you the bet in dollars at your unit (set it: `!unit 25` in the units channel).
 **❌ GONE:** the chance is over. Ignore it.
 
 📋 **Results** come once a night (after midnight) in the results channel, and the pinned 📊 Scoreboard keeps the running record."""
@@ -11291,6 +11435,11 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
                 t.reactions.tick(now)
             except Exception as e:  # noqa: BLE001 - ✅ tracking must never stop the bot
                 print(f"  ! ✅ tracking failed: {e!r:.200}", file=sys.stderr)
+        if not args.once and t.reactions.dm_due():
+            try:
+                t.reactions.dm_tick()
+            except Exception as e:  # noqa: BLE001 - 💵 DMs must never stop the bot
+                print(f"  ! 💵 unit DMs failed: {e!r:.200}", file=sys.stderr)
 
         if args.once:
             if line := links_line(main_events + prop_events, cfg):

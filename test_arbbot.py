@@ -13377,6 +13377,50 @@ class EVBotSpec(MixFiles):
             self.assertEqual(again.reactions.messages, {})
             self.assertEqual(_arbbot.read_taken(t.cfg)[bid]["users"], {"u1": "Joey"})
 
+    def test_members_set_a_unit_and_a_money_tap_dms_them_the_stake(self):
+        from unittest import mock
+        sent, posts = [], []
+        chat = [{"id": "5", "author": {"id": "u1"}, "content": "!unit $25"},
+                {"id": "6", "author": {"id": "u2"}, "content": "hello"},
+                {"id": "7", "author": {"id": "u3"}, "content": "!unit 0"},
+                {"id": "8", "author": {"id": "bot1", "bot": True}, "content": "!unit 5"}]
+        taps = {"m1": [{"id": "bot1", "bot": True}, {"id": "u1"}, {"id": "u2"}]}
+
+        def api(token, method, path, body=None):
+            if path == "/users/@me":
+                return {"id": "bot1"}
+            if method == "PUT":
+                return None
+            if path.startswith("/channels/99/messages?"):
+                return [] if "after=8" in path else chat
+            if path == "/users/@me/channels":
+                return {"id": "dm-" + body["recipient_id"]}
+            if method == "POST":
+                posts.append((path, body["content"]))
+                return {}
+            if "%F0%9F%92%B5" in path:     # 💵
+                return taps.get(path.split("/messages/")[1].split("/")[0], [])
+            return []
+        with mock.patch("arbbot._bot_api", api):
+            t = self.tracked(sent, one_alert_per_bet=True, outliers_enabled=False, unit_channel_id="99")
+            t.reactions.guilds = {"https://main": "g1"}
+            self.main(t, [self.game({"B": 2.20})], 0)
+            m = t.reactions.messages["m1"]
+            self.assertEqual(t.reactions.dm_tick(), 2)
+            self.assertEqual(t.reactions.read_units()["units"], {"u1": 25.0})              # $25; "0" refused
+            replies = [text for path, text in posts if path == "/channels/99/messages"]
+            self.assertEqual(len(replies), 2)
+            self.assertIn("Your unit is now **$25**", replies[0])
+            dms = dict((path, text) for path, text in posts if path.startswith("/channels/dm-"))
+            n = m["units"]
+            self.assertTrue(dms["/channels/dm-u1/messages"].startswith(
+                f"💵 **{_arbbot.money(n * 25)}** on this bet ({n:g}u at your $25 unit)\n"
+                "https://discord.com/channels/g1/chan1/m1"))
+            self.assertIn("type `!unit 25` in <#99>", dms["/channels/dm-u2/messages"])      # no unit yet: $10
+            posts.clear()
+            self.assertEqual(t.reactions.dm_tick(), 0)                                     # once per card
+            self.assertEqual(posts, [])
+
     def test_tracking_is_off_without_a_token_or_in_a_test_run(self):
         sent = []
         t = self.live(sent)
