@@ -13434,7 +13434,11 @@ class EVBotSpec(MixFiles):
              "custom_fields": [{"key": "discord", "text": {"value": "nobody here"}}]}]
         status = {"sub_A": "active", "sub_B": "trialing", "sub_C": "active"}
         paid = {"sub_B": []}
+        cards = {"sub_D": "fp_/payment_methods/pm_sub_B"}   # Dave pays with Bobby's card
         people = {"annie": {"user": {"id": "111", "username": "annie"}},
+                  "dave": {"user": {"id": "444", "username": "dave"}},
+                  "newbie": {"user": {"id": str(int((9990 - 5 * 86400 - 1420070400) * 1000) << 22),
+                                      "username": "newbie"}},   # made 5 days before signing up
                   "bobby": {"user": {"id": "222", "username": "Bobby_B", "global_name": "bobby"}}}
 
         def stripe(key, method, path, params=None):
@@ -13446,8 +13450,10 @@ class EVBotSpec(MixFiles):
                 self.assertEqual(params["payment_link"], "plink_1")
                 return {"data": [x for x in sessions if x["created"] > params["created[gt]"]], "has_more": False}
             if path == "/subscriptions":
-                return {"data": [{"id": k, "status": v, "items": {"data": [{"price": {"unit_amount": 2000}}]}}
-                                 for k, v in status.items()], "has_more": False}
+                return {"data": [{"id": k, "status": v, "items": {"data": [{"price": {"unit_amount": 2000}}]},
+                                  "default_payment_method": "pm_" + k} for k, v in status.items()], "has_more": False}
+            if path.startswith("/payment_methods/"):
+                return {"card": {"fingerprint": cards.get(path.split("_", 2)[-1], "fp_" + path)}}
             if path == "/invoices":
                 return {"data": paid.get(params["subscription"], [])}
             raise AssertionError(path)
@@ -13517,6 +13523,27 @@ class EVBotSpec(MixFiles):
             m.tick(now=9900)
             self.assertIn(("PUT", "/guilds/g1/members/222/roles/555"), discord)
             self.assertEqual(len(stripe_posts), 1)                                       # and no second referral credit
+
+            # A new Discord account on a card that already had a trial: no free trial either.
+            sessions.append({"id": "cs_5", "created": 9950, "customer": "cus_D", "subscription": "sub_D",
+                             "client_reference_id": None, "custom_fields": [{"key": "discord", "text": {"value": "dave"}}]})
+            status["sub_D"] = "trialing"
+            discord.clear()
+            m.tick(now=10000)
+            self.assertEqual([x for x in discord if "/members/444/roles/" in x[1]], [])
+            self.assertTrue(any(k == "DM" and "already had your free trial" in v for k, v in discord))
+            status["sub_D"] = "active"
+            m.tick(now=10100)
+            self.assertIn(("PUT", "/guilds/g1/members/444/roles/555"), discord)
+
+            # A Discord account made days before signing up: no free trial.
+            sessions.append({"id": "cs_6", "created": 9990, "customer": "cus_N", "subscription": "sub_N",
+                             "client_reference_id": None, "custom_fields": [{"key": "discord", "text": {"value": "newbie"}}]})
+            status["sub_N"] = "trialing"
+            discord.clear()
+            m.tick(now=10200)
+            self.assertFalse(any("/roles/" in p for _, p in discord))
+            self.assertTrue(any(k == "DM" and "at least 30 days old" in v for k, v in discord))
 
     def test_tracking_is_off_without_a_token_or_in_a_test_run(self):
         sent = []

@@ -8054,6 +8054,7 @@ class BetReactions:
 STRIPE_API = "https://api.stripe.com/v1"
 MEMBERS_SECONDS = 120   # how often new sign-ups, subscriptions and referrals are checked
 PAID_STATUSES = ("trialing", "active", "past_due")   # the Paid role stays on (past_due: Stripe is still retrying)
+NEW_ACCOUNT_DAYS = 30   # a Discord account younger than this at sign-up gets no free trial (alt accounts)
 REFER_CMD = re.compile(r"^\s*(?:<@!?\d+>\s*)?!refer\b", re.I)
 
 
@@ -8077,6 +8078,14 @@ def _stripe_all(key: str, path: str, params: dict) -> list[dict]:
         if not page.get("has_more") or not page.get("data"):
             return out
         after = page["data"][-1]["id"]
+
+
+def discord_created(uid: str) -> float:
+    """When a Discord account was made (Unix time), from its id (a snowflake); 0 if it isn't one."""
+    try:
+        return ((int(uid) >> 22) + 1420070400000) / 1000
+    except ValueError:
+        return 0.0
 
 
 def _clean_name(name: str) -> str:
@@ -8205,6 +8214,14 @@ class Members:
             sub = subs.get(c["sub"])
             if sub:
                 c["status"] = sub.get("status", "")
+                # The card's fingerprint (the same for one card on every account), for one free trial per card.
+                pm = sub.get("default_payment_method")
+                if "card" not in c and pm and c["status"] in PAID_STATUSES:
+                    try:
+                        c["card"] = (_stripe(key, "GET", f"/payment_methods/{pm}").get("card") or {}).get("fingerprint", "")
+                    except urllib.error.HTTPError as e:
+                        self.r._say(f"card{e.code}", f"couldn't read a sign-up's card (Stripe said {e.code}): give "
+                                                     "the bot's Stripe key Payment Methods: Read")
                 items = sub.get("items", {}).get("data", [])
                 if items and not data["price"]:
                     data["price"] = items[0].get("price", {}).get("unit_amount") or 0
@@ -8222,19 +8239,32 @@ class Members:
                               f"**{c['name'] or '(no name given)'}** (Stripe customer {cus}). Give them the Paid role "
                               f"by hand once you find them.")
         # (One person, several subscriptions over time: the role is on while any of them is. One free trial per
-        # Discord account: a later sign-up's trial doesn't count, only its first real payment does.)
-        first = {}
+        # Discord account and per card: a later sign-up's trial doesn't count, only its first real payment does.)
+        first, first_card = {}, {}
         for c in data["customers"].values():
+            j = c.get("joined", 0)
             if c["user"]:
-                first[c["user"]] = min(first.get(c["user"], c.get("joined", 0)), c.get("joined", 0))
-        repeat = lambda c: c["status"] == "trialing" and c.get("joined", 0) > first.get(c["user"], 0)
+                first[c["user"]] = min(first.get(c["user"], j), j)
+            if c.get("card"):
+                first_card[c["card"]] = min(first_card.get(c["card"], j), j)
+        def no_trial(c) -> str:
+            """Why this sign-up's free trial doesn't open the channels ("" = it does)."""
+            if c["status"] != "trialing":
+                return ""
+            j = c.get("joined", 0)
+            if j > first.get(c["user"], 0) or (c.get("card") and j > first_card.get(c["card"], 0)):
+                return "You've already had your free trial"
+            if 0 < j - discord_created(c["user"]) < NEW_ACCOUNT_DAYS * 86400:
+                return "Free trials are for Discord accounts at least 30 days old"
+            return ""
+        repeat = lambda c: bool(no_trial(c))
         paying = {c["user"] for c in data["customers"].values()
                   if c["user"] and c["status"] in PAID_STATUSES and not repeat(c)}
         for c in data["customers"].values():
             if c["user"] and repeat(c) and not c.get("told_repeat") and c["user"] not in paying:
                 c["told_repeat"] = True
-                self.r.dm(c["user"], "You've already had your free trial, so the alert channels open when your first "
-                                     "payment goes through (when this trial ends). Questions? Ask in the server.")
+                self.r.dm(c["user"], f"{no_trial(c)}, so the alert channels open when your first payment goes "
+                                     "through (when this trial ends). Questions? Ask in the server.")
         for cus, c in data["customers"].items():
             if not c["user"]:
                 continue
