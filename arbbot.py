@@ -8221,8 +8221,20 @@ class Members:
                     self.tell(f"💳 A new member paid an hour ago but nobody in the server is called "
                               f"**{c['name'] or '(no name given)'}** (Stripe customer {cus}). Give them the Paid role "
                               f"by hand once you find them.")
-        # (One person, several subscriptions over time: the role is on while any of them is.)
-        paying = {c["user"] for c in data["customers"].values() if c["user"] and c["status"] in PAID_STATUSES}
+        # (One person, several subscriptions over time: the role is on while any of them is. One free trial per
+        # Discord account: a later sign-up's trial doesn't count, only its first real payment does.)
+        first = {}
+        for c in data["customers"].values():
+            if c["user"]:
+                first[c["user"]] = min(first.get(c["user"], c.get("joined", 0)), c.get("joined", 0))
+        repeat = lambda c: c["status"] == "trialing" and c.get("joined", 0) > first.get(c["user"], 0)
+        paying = {c["user"] for c in data["customers"].values()
+                  if c["user"] and c["status"] in PAID_STATUSES and not repeat(c)}
+        for c in data["customers"].values():
+            if c["user"] and repeat(c) and not c.get("told_repeat") and c["user"] not in paying:
+                c["told_repeat"] = True
+                self.r.dm(c["user"], "You've already had your free trial, so the alert channels open when your first "
+                                     "payment goes through (when this trial ends). Questions? Ask in the server.")
         for cus, c in data["customers"].items():
             if not c["user"]:
                 continue

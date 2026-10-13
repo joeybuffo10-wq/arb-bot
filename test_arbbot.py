@@ -13502,6 +13502,22 @@ class EVBotSpec(MixFiles):
             m.tick(now=9500)
             self.assertEqual([(a, b) for a, b in discord if "/roles/" in b], [("DELETE", "/guilds/g1/members/222/roles/555")])
 
+            # Bobby signs up again with another card: no second free trial.
+            sessions.append({"id": "cs_4", "created": 9600, "customer": "cus_B2", "subscription": "sub_B2",
+                             "client_reference_id": "111", "custom_fields": [{"key": "discord", "text": {"value": "bobby"}}]})
+            status["sub_B2"] = "trialing"
+            discord.clear()
+            m.tick(now=9700)
+            self.assertEqual([x for x in discord if "/roles/" in x[1]], [])                 # no role during the trial
+            self.assertTrue(any(k == "DM" and "already had your free trial" in v for k, v in discord))
+            discord.clear()
+            m.tick(now=9800)
+            self.assertFalse(any(k == "DM" for k, _ in discord))                          # said once
+            status["sub_B2"], paid["sub_B2"] = "active", [{"amount_paid": 2000}]             # pays: in
+            m.tick(now=9900)
+            self.assertIn(("PUT", "/guilds/g1/members/222/roles/555"), discord)
+            self.assertEqual(len(stripe_posts), 1)                                       # and no second referral credit
+
     def test_tracking_is_off_without_a_token_or_in_a_test_run(self):
         sent = []
         t = self.live(sent)
