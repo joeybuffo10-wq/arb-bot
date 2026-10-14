@@ -13903,7 +13903,7 @@ class EVBotSpec(MixFiles):
         self.assertEqual(len(data["bets"]), 1)
         self.assertEqual(data["bets"][0], {"date": "2026-10-03", "sport": "NHL", "game": "Away @ Home", "bet": "Home ML",
                                            "book": "BetMGM", "odds": "+120", "units": 2.0, "result": "win",
-                                           "profit": 2.4, "clv": 3.5, "type": "+EV", "tier": ""})
+                                           "profit": 2.4, "clv": 3.5, "type": "+EV", "tier": "", "market": "Moneyline"})
         self.assertFalse(data["live"])
 
     def test_the_public_page_is_uploaded_once_a_night(self):
@@ -13928,6 +13928,12 @@ class EVBotSpec(MixFiles):
         self.assertEqual(_arbbot.site_due(cfg, datetime(2026, 10, 11, 5, 30, tzinfo=timezone.utc)), date(2026, 10, 11))
         self.assertIsNone(_arbbot.site_due(replace(cfg, results_site_token=""), now))
         self.assertTrue((Path(_arbbot.__file__).parent / "site" / "index.html").exists())
+
+    def test_the_results_page_knows_each_bets_kind_for_the_clv_finder(self):
+        n = _arbbot.bet_type_name
+        self.assertEqual([n("player_assists"), n("player_assists_alternate"), n("spreads_h1"), n("h2h"), n("parlay")],
+                         ["Assists", "Assists", "1st Half Spread", "Moneyline", "Parlay"])
+        self.assertEqual(n("player_something_new"), "Player Something New")
 
     def test_the_results_cards_link_to_the_public_page(self):
         cfg, res, sent = self.results(results_site_repo="joeybuffo10-wq/ev-bot-results")

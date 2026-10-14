@@ -2074,6 +2074,13 @@ MARKET_NAMES = {
 }
 
 
+def bet_type_name(market: str) -> str:
+    """The kind of bet, for grouping results: 'Assists', '1st Half Spread', 'Moneyline' (an alternate line is the same
+    kind as its main one), 'Parlay'."""
+    m = (market or "").removesuffix("_alternate")
+    return "Parlay" if m == "parlay" else MARKET_NAMES.get(m, m.replace("_", " ").title() or "Other")
+
+
 def is_prop(line) -> bool:
     return isinstance(line, tuple)
 
@@ -11889,7 +11896,7 @@ def site_data(cfg: Config, now: datetime | None = None) -> dict:
                      "result": r["result"], "profit": round(float(r["profit"]) / unit, 2),
                      "clv": round(float(clv), 2) if clv not in ("", None) else None,
                      "type": {"ev": "+EV", "outlier": "Outlier", "prop": "Prop", "parlay": "Parlay"}.get(_kind(r), "+EV"),
-                     "tier": row_tier(r)})
+                     "tier": row_tier(r), "market": bet_type_name(r.get("market", ""))})
     return {"name": BOT_NAME, "updated": now.isoformat(timespec="minutes"), "unit": unit, "bets": bets,
             "live": not live_off(cfg)}
 
