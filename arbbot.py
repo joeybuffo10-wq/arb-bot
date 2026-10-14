@@ -578,6 +578,9 @@ class Config:
     min_confidence: str = "low"           # low / medium / high: alert only at or above this
     confident_hours: float = 24           # main lines this close to kickoff can be high confidence
     sport_min_ev: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_SPORT_MIN_EV))
+    # BOOK_EXTRA_EDGE=kalshi=3: points of edge a new +EV/prop/half bet at that book needs on top of the usual bar
+    # (a book whose alerts keep losing to the closing line). Book names as in book_slug ("kalshi", "betmgm").
+    book_extra_edge: dict[str, float] = field(default_factory=dict)
     move_window_minutes: int = 60         # how far back to look for sharp line movement
     confidence_stakes: str = "1,0.75,0.5"  # stake multiplier for high, medium, low
     unit_size: float = 0            # dollars per unit (1u) on bet cards; 0 = EV_BANKROLL / 100 (100u = the bankroll)
@@ -844,6 +847,7 @@ class Config:
             min_confidence=e("MIN_CONFIDENCE", d.min_confidence).strip().lower(),
             confident_hours=num("CONFIDENT_HOURS", d.confident_hours, float),
             sport_min_ev={**d.sport_min_ev, **pairs("SPORT_MIN_EV", float)},
+            book_extra_edge={book_slug(k): v for k, v in pairs("BOOK_EXTRA_EDGE", float).items()},
             move_window_minutes=num("MOVE_WINDOW_MINUTES", d.move_window_minutes, int),
             confidence_stakes=(e("CONFIDENCE_STAKES") or d.confidence_stakes).replace(";", ","),
             unit_size=num("UNIT_SIZE", d.unit_size, float),
@@ -10992,7 +10996,7 @@ def tune_bets(bets: list, cfg: Config, tuning: Tuning, alerters: tuple) -> list:
     """TUNE_ENABLED: new bets (no card up in these alerters) from a book whose price is usually gone by the next
     check need TUNE_SLOW_EXTRA_PCT more edge (the others are held back, counted as "tuned out"), and each new bet's
     stake follows its book's and sport's CLV. Bets with a card up go through unchanged."""
-    if not cfg.tune_enabled:
+    if not cfg.tune_enabled and not cfg.book_extra_edge:
         return bets
     up = {k for a in alerters for k in (*a.open, *a.restored)}
     out = []
@@ -11000,13 +11004,15 @@ def tune_bets(bets: list, cfg: Config, tuning: Tuning, alerters: tuple) -> list:
         if b.key in up:
             out.append(b)
             continue
-        extra, why = tuning.extra_edge(cfg, b)
+        extra, why = tuning.extra_edge(cfg, b) if cfg.tune_enabled else (0.0, "")
+        if own := cfg.book_extra_edge.get(book_slug(b.book), 0.0):   # (BOOK_EXTRA_EDGE)
+            extra, why = extra + own, (f"{why}; " if why else "") + f"+{own:g} for {b.book} (BOOK_EXTRA_EDGE)"
         bar = cfg.prop_min_ev_pct if is_prop(b.line) else max(cfg.min_ev_pct, cfg.sport_min_ev.get(b.sport_key, 0))
         if extra and b.ev_pct < bar + extra:
             alerters[0].held_counts["tuned out"] = alerters[0].held_counts.get("tuned out", 0) + 1
             print(f"  ✂️ {b.pick} at {b.book} +{b.ev_pct:.1f}%: needs +{bar + extra:g}% ({b.book} {why})", flush=True)
             continue
-        mult, note = tuning.stake_mult(cfg, b)
+        mult, note = tuning.stake_mult(cfg, b) if cfg.tune_enabled else (1.0, "")
         if mult != 1.0 and b.stake:
             cap = cfg.ev_bankroll * cfg.ev_max_stake_pct / 100
             if b.kalshi_room:   # (cut to what Kalshi's order book holds: never more than that)

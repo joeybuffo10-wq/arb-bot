@@ -13929,6 +13929,20 @@ class EVBotSpec(MixFiles):
         self.assertIsNone(_arbbot.site_due(replace(cfg, results_site_token=""), now))
         self.assertTrue((Path(_arbbot.__file__).parent / "site" / "index.html").exists())
 
+    def test_a_book_can_need_more_edge(self):
+        cfg = Config(min_ev_pct=4, tune_enabled=False, book_extra_edge={"kalshi": 3.0})
+        from unittest import mock
+        import os
+        with mock.patch.dict(os.environ, {"BOOK_EXTRA_EDGE": "Kalshi=3,BetMGM=1.5"}):
+            self.assertEqual(Config.from_env().book_extra_edge, {"kalshi": 3.0, "betmgm": 1.5})
+        [b] = find_evs([self.game({"B": 2.20})], Config(min_ev_pct=3), NOW)          # +10% at book B
+        at = lambda book, price: replace(b, book=book, price=price)
+        t = _arbbot.Tuning()
+        a = EVAlerter(cfg, True)
+        kept = _arbbot.tune_bets([at("Kalshi", 2.10), at("Kalshi", 2.16), at("FanDuel", 2.10)], cfg, t, (a,))
+        self.assertEqual([(x.book, round(x.ev_pct, 1)) for x in kept], [("Kalshi", 8.0), ("FanDuel", 5.0)])  # 5% < 4+3
+        self.assertEqual(len(_arbbot.tune_bets([at("Kalshi", 2.10)], replace(cfg, book_extra_edge={}), t, (a,))), 1)
+
     def test_the_results_page_knows_each_bets_kind_for_the_clv_finder(self):
         n = _arbbot.bet_type_name
         self.assertEqual([n("player_assists"), n("player_assists_alternate"), n("spreads_h1"), n("h2h"), n("parlay")],
