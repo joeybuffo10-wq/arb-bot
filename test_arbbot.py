@@ -13929,6 +13929,18 @@ class EVBotSpec(MixFiles):
         self.assertIsNone(_arbbot.site_due(replace(cfg, results_site_token=""), now))
         self.assertTrue((Path(_arbbot.__file__).parent / "site" / "index.html").exists())
 
+    def test_the_join_message_has_a_free_trial_button(self):
+        cfg = Config(stripe_signup_url="https://buy.stripe.com/x", results_site_repo="joey/r",
+                     join_site_url="https://buffbets.github.io")
+        p = _arbbot.join_payload(cfg)
+        row = p["components"][0]["components"]
+        self.assertEqual([(b["label"], b["url"], b["style"]) for b in row],
+                         [("Start 14-day free trial", "https://buy.stripe.com/x", 5),
+                          ("See every result", "https://joey.github.io/r/", 5),
+                          ("How it works", "https://buffbets.github.io", 5)])
+        self.assertIn("$45/month", p["embeds"][0]["description"])
+        self.assertEqual(len(_arbbot.join_payload(replace(cfg, join_site_url=""))["components"][0]["components"]), 2)
+
     def test_a_book_can_need_more_edge(self):
         cfg = Config(min_ev_pct=4, tune_enabled=False, book_extra_edge={"kalshi": 3.0})
         from unittest import mock

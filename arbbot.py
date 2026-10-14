@@ -453,6 +453,7 @@ class Config:
     stripe_payment_link: str = ""
     stripe_signup_url: str = ""
     paid_role_id: str = ""
+    join_site_url: str = ""   # the sign-up website, for --post-join's "How it works" button
     # An uptime monitor's ping URL (healthchecks.io: https://hc-ping.com/...; set it with --set). The bot calls it
     # every HEARTBEAT_SECONDS while it's running; when the calls stop, the monitor tells you. Empty = off.
     healthcheck_url: str = ""
@@ -776,6 +777,7 @@ class Config:
             stripe_payment_link=e("STRIPE_PAYMENT_LINK", "").strip(),
             stripe_signup_url=e("STRIPE_SIGNUP_URL", "").strip(),
             paid_role_id="".join(c for c in e("PAID_ROLE_ID", "") if c.isdigit()),
+            join_site_url=e("JOIN_SITE_URL", "").strip(),
             tune_slow_still_pct=num("TUNE_SLOW_STILL_PCT", d.tune_slow_still_pct, float),
             tune_slow_bets=num("TUNE_SLOW_BETS", d.tune_slow_bets, int),
             tune_slow_extra_pct=num("TUNE_SLOW_EXTRA_PCT", d.tune_slow_extra_pct, float),
@@ -8316,6 +8318,53 @@ class Members:
         self.save(data)
 
 
+def join_payload(cfg: Config) -> dict:
+    """The "unlock every alert" message for a channel everyone sees: what members get, the price, and buttons to the
+    checkout (STRIPE_SIGNUP_URL), the public results and the sign-up website."""
+    desc = ("You're on the free side of the server. Members also get:\n"
+            "📈 Every +EV, prop, outlier and parlay alert, the moment it's found\n"
+            "💎 Elite picks in the 🏆 top picks channel\n"
+            "💵 Your stake in dollars at your own unit size\n"
+            "📊 Nightly results and the full record\n\n"
+            "**14 days free, then $45/month. Cancel anytime.**\n"
+            "At checkout, enter your Discord username exactly as it shows here: the alert channels unlock within a "
+            "couple of minutes. One free trial per person. 21+ only.")
+    buttons = [("Start 14-day free trial", cfg.stripe_signup_url, "🎟️"), ("See every result", site_url(cfg), "📊"),
+               ("How it works", cfg.join_site_url, "📖")]
+    return {"embeds": [{"title": "🔓 Unlock every Buff Bets alert", "description": desc, "color": 0xF5B21B}],
+            "components": [{"type": 1, "components": [
+                {"type": 2, "style": 5, "label": label, "url": url, "emoji": {"name": emoji}}
+                for label, url, emoji in buttons if url]}],
+            "allowed_mentions": {"parse": []}}
+
+
+def post_join(cfg: Config, channel: str = "") -> str:
+    """--post-join: post join_payload() as the bot (link buttons need the bot, not a webhook) in that channel, or in
+    the server's first channel with "welcome" in its name, and pin it. Returns what happened."""
+    if not (cfg.discord_bot_token and cfg.stripe_signup_url):
+        sys.exit("Needs DISCORD_BOT_TOKEN and STRIPE_SIGNUP_URL.")
+    tok = cfg.discord_bot_token
+    if not channel:
+        if not cfg.unit_channel_id:
+            sys.exit("Give the channel's id: --post-join 123456789")
+        guild = (_bot_api(tok, "GET", f"/channels/{cfg.unit_channel_id}") or {}).get("guild_id", "")
+        chans = _bot_api(tok, "GET", f"/guilds/{guild}/channels") or []
+        found = next((c for c in sorted(chans, key=lambda c: c.get("position", 0))
+                      if c.get("type") == 0 and "welcome" in c.get("name", "").lower()), None)
+        if not found:
+            sys.exit("No channel with \"welcome\" in its name: give the channel's id: --post-join 123456789")
+        channel = found["id"]
+    try:
+        msg = _bot_api(tok, "POST", f"/channels/{channel}/messages", join_payload(cfg)) or {}
+    except urllib.error.HTTPError as e:
+        sys.exit(f"Discord said {e.code}: give the bot View Channel, Send Messages and Embed Links in that channel.")
+    try:
+        _bot_api(tok, "PUT", f"/channels/{channel}/pins/{msg.get('id', '')}")
+        return f"Posted and pinned it in <#{channel}>."
+    except urllib.error.HTTPError:
+        return "Posted it. Pin it by hand (hover → ⋯ → Pin Message): the bot can't pin there."
+
+
 def members_lines(cfg: Config, rows: list[dict], top: int = 3) -> str:
     """The results card's ✅ part for these bets: how many members took, their record at the card's stake in
     units, and the top three ("" when nobody ✅'d any of them)."""
@@ -12263,6 +12312,8 @@ def main() -> None:
                    help="change a setting in .env, e.g. --set MY_BOOKS=fanduel,draftkings (repeatable)")
     p.add_argument("--set-webhook", choices=sorted(WEBHOOK_SETTINGS), metavar="CHANNEL",
                    help="paste a Discord webhook URL for a channel: " + ", ".join(sorted(WEBHOOK_SETTINGS)))
+    p.add_argument("--post-join", nargs="?", const="", default=None, metavar="CHANNEL_ID",
+                   help="post the pinned 'unlock every alert' message with a free-trial button (in #welcome by default)")
     p.add_argument("--post-guide", action="store_true",
                    help="post a how-to-use guide to your Discord channel (then pin it)")
     p.add_argument("--check-kalshi", action="store_true",
@@ -12330,7 +12381,7 @@ def main() -> None:
                     if u.startswith("https://")), "")   # a placeholder status URL falls back, like Status
         interactive = (args.dry_run, args.demo, args.once, args.plan, args.results, args.test_discord,
                        args.post_guide, args.post_results, args.check_kalshi, args.check_props, args.check_upcoming,
-                       args.weekly, args.post_weekly, args.test_dk_links)
+                       args.weekly, args.post_weekly, args.test_dk_links, args.post_join is not None)
         if url.startswith("https://") and not any(interactive):   # the service: say why it stopped
             try:
                 _webhook(url, {"username": BOT_NAME, "content": f"🔴 Bot stopped: bad setting in .env: {ex}. "
@@ -12348,6 +12399,10 @@ def main() -> None:
 
     if args.weekly or args.post_weekly:
         weekly_command(cfg, args)
+        return
+
+    if args.post_join is not None:
+        print(post_join(cfg, args.post_join))
         return
 
     if args.post_guide:
