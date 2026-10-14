@@ -8340,7 +8340,7 @@ def join_payload(cfg: Config) -> dict:
 
 def post_join(cfg: Config, channel: str = "") -> str:
     """--post-join: post join_payload() as the bot (link buttons need the bot, not a webhook) in that channel, or in
-    the server's first channel with "welcome" in its name, and pin it. Returns what happened."""
+    the server's #subscription channel (else one named *join* or *welcome*), and pin it. Returns what happened."""
     if not (cfg.discord_bot_token and cfg.stripe_signup_url):
         sys.exit("Needs DISCORD_BOT_TOKEN and STRIPE_SIGNUP_URL.")
     tok = cfg.discord_bot_token
@@ -8349,10 +8349,11 @@ def post_join(cfg: Config, channel: str = "") -> str:
             sys.exit("Give the channel's id: --post-join 123456789")
         guild = (_bot_api(tok, "GET", f"/channels/{cfg.unit_channel_id}") or {}).get("guild_id", "")
         chans = _bot_api(tok, "GET", f"/guilds/{guild}/channels") or []
-        found = next((c for c in sorted(chans, key=lambda c: c.get("position", 0))
-                      if c.get("type") == 0 and "welcome" in c.get("name", "").lower()), None)
+        text = [c for c in sorted(chans, key=lambda c: c.get("position", 0)) if c.get("type") == 0]
+        found = next((c for word in ("subscri", "join", "welcome") for c in text if word in c.get("name", "").lower()),
+                     None)
         if not found:
-            sys.exit("No channel with \"welcome\" in its name: give the channel's id: --post-join 123456789")
+            sys.exit("No #subscription (or #welcome) channel: give the channel's id: --post-join 123456789")
         channel = found["id"]
     try:
         msg = _bot_api(tok, "POST", f"/channels/{channel}/messages", join_payload(cfg)) or {}
@@ -12313,7 +12314,7 @@ def main() -> None:
     p.add_argument("--set-webhook", choices=sorted(WEBHOOK_SETTINGS), metavar="CHANNEL",
                    help="paste a Discord webhook URL for a channel: " + ", ".join(sorted(WEBHOOK_SETTINGS)))
     p.add_argument("--post-join", nargs="?", const="", default=None, metavar="CHANNEL_ID",
-                   help="post the pinned 'unlock every alert' message with a free-trial button (in #welcome by default)")
+                   help="post the pinned 'unlock every alert' message with a free-trial button (in #subscription by default)")
     p.add_argument("--post-guide", action="store_true",
                    help="post a how-to-use guide to your Discord channel (then pin it)")
     p.add_argument("--check-kalshi", action="store_true",
