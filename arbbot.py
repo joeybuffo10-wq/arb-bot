@@ -582,6 +582,9 @@ class Config:
     # BOOK_EXTRA_EDGE=kalshi=3: points of edge a new +EV/prop/half bet at that book needs on top of the usual bar
     # (a book whose alerts keep losing to the closing line). Book names as in book_slug ("kalshi", "betmgm").
     book_extra_edge: dict[str, float] = field(default_factory=dict)
+    # PROP_SPORT_MIN_EV=americanfootball_nfl=10: a higher edge bar for one sport's player props only (its game lines
+    # keep SPORT_MIN_EV / MIN_EV_PCT). Empty = every sport's props use PROP_MIN_EV_PCT.
+    prop_sport_min_ev: dict[str, float] = field(default_factory=dict)
     move_window_minutes: int = 60         # how far back to look for sharp line movement
     confidence_stakes: str = "1,0.75,0.5"  # stake multiplier for high, medium, low
     unit_size: float = 0            # dollars per unit (1u) on bet cards; 0 = EV_BANKROLL / 100 (100u = the bankroll)
@@ -850,6 +853,7 @@ class Config:
             confident_hours=num("CONFIDENT_HOURS", d.confident_hours, float),
             sport_min_ev={**d.sport_min_ev, **pairs("SPORT_MIN_EV", float)},
             book_extra_edge={book_slug(k): v for k, v in pairs("BOOK_EXTRA_EDGE", float).items()},
+            prop_sport_min_ev=pairs("PROP_SPORT_MIN_EV", float),
             move_window_minutes=num("MOVE_WINDOW_MINUTES", d.move_window_minutes, int),
             confidence_stakes=(e("CONFIDENCE_STAKES") or d.confidence_stakes).replace(";", ","),
             unit_size=num("UNIT_SIZE", d.unit_size, float),
@@ -1189,7 +1193,8 @@ class Config:
     def for_props(self) -> "Config":
         """The same settings with the prop thresholds swapped in (prop markets carry more margin)."""
         return replace(self, min_ev_pct=self.prop_min_ev_pct, consensus_min_books=self.prop_min_books,
-                       max_sharp_hold_pct=self.max_sharp_hold_pct + 4)
+                       max_sharp_hold_pct=self.max_sharp_hold_pct + 4,
+                       sport_min_ev={**self.sport_min_ev, **self.prop_sport_min_ev})
 
     def minutes_for(self, sport: str) -> int:
         if sport in self.game_minutes:
@@ -11057,7 +11062,7 @@ def tune_bets(bets: list, cfg: Config, tuning: Tuning, alerters: tuple) -> list:
         extra, why = tuning.extra_edge(cfg, b) if cfg.tune_enabled else (0.0, "")
         if own := cfg.book_extra_edge.get(book_slug(b.book), 0.0):   # (BOOK_EXTRA_EDGE)
             extra, why = extra + own, (f"{why}; " if why else "") + f"+{own:g} for {b.book} (BOOK_EXTRA_EDGE)"
-        bar = cfg.prop_min_ev_pct if is_prop(b.line) else max(cfg.min_ev_pct, cfg.sport_min_ev.get(b.sport_key, 0))
+        bar = max(cfg.min_ev_pct if not is_prop(b.line) else cfg.prop_min_ev_pct, cfg.sport_min_ev.get(b.sport_key, 0))
         if extra and b.ev_pct < bar + extra:
             alerters[0].held_counts["tuned out"] = alerters[0].held_counts.get("tuned out", 0) + 1
             print(f"  ✂️ {b.pick} at {b.book} +{b.ev_pct:.1f}%: needs +{bar + extra:g}% ({b.book} {why})", flush=True)

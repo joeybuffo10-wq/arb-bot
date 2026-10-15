@@ -13941,6 +13941,20 @@ class EVBotSpec(MixFiles):
         self.assertIn("$45/month", p["embeds"][0]["description"])
         self.assertEqual(len(_arbbot.join_payload(replace(cfg, join_site_url=""))["components"][0]["components"]), 2)
 
+    def test_one_sports_props_can_need_more_edge(self):
+        cfg = Config(min_ev_pct=4, prop_min_ev_pct=7, prop_sport_min_ev={"americanfootball_nfl": 10.0})
+        props = cfg.for_props()
+        self.assertEqual(max(props.min_ev_pct, props.sport_min_ev.get("americanfootball_nfl", 0)), 10)   # NFL props
+        self.assertEqual(max(props.min_ev_pct, props.sport_min_ev.get("icehockey_nhl", 0)), 7)          # other props
+        self.assertEqual(max(cfg.min_ev_pct, cfg.sport_min_ev.get("americanfootball_nfl", 0)), 4)        # NFL lines
+        self.assertEqual(props.sport_min_ev["americanfootball_ncaaf"], 6.0)                             # defaults kept
+        def found(sport):   # a +9% prop at DraftKings against Pinnacle's even line
+            ev = prop_event({"Pinnacle": (2.0, 2.0), "DraftKings": (2.18, 1.7)})
+            ev["sport_key"] = sport
+            return [x for x in find_evs([ev], props, NOW) if x.book == "DraftKings"]
+        self.assertTrue(found("basketball_nba"))        # 9% clears the usual 7%
+        self.assertFalse(found("americanfootball_nfl"))  # but not NFL's 10%
+
     def test_a_book_can_need_more_edge(self):
         cfg = Config(min_ev_pct=4, tune_enabled=False, book_extra_edge={"kalshi": 3.0})
         from unittest import mock
