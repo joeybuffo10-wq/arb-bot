@@ -8664,6 +8664,49 @@ def _market_group(row: dict) -> str:
 TIMING_BUCKETS = ((1, "under 1 hour"), (3, "1-3 hours"), (8, "3-8 hours"), (24, "8-24 hours"), (1e9, "over a day"))
 
 
+def speed_report(cfg: Config, days: int = 10) -> str:
+    """--speed: how fast alerts went out and how long their prices lasted, per day and sport, props and game lines
+    apart: "still" = the book still had the alerted price (or better) at the next check, "delay" = seconds from
+    fetching the odds to posting the alert (median), "next" = seconds until that next check (median)."""
+    cut = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    marks = [r for r in markout_rows(cfg) if r.get("kind") != "arb" and r.get("still_ok") in ("0", "1")
+             and (r.get("first_seen") or "") >= cut]
+    if not marks:
+        return "No finished alerts to measure yet."
+    delays = {}
+    for name in (cfg.ev_log_file, cfg.outlier_log_file):
+        for r in _read_csv(name) if name else []:
+            if r.get("post_delay") not in ("", None):
+                delays.setdefault(_bet_id(r), float(r["post_delay"]))
+
+    def med(xs):
+        xs = [x for x in xs if x is not None]
+        return f"{statistics.median(xs):>6.0f}" if xs else "     -"
+
+    def table(title, rows, key):
+        groups: dict[str, list] = {}
+        for r in rows:
+            groups.setdefault(key(r), []).append(r)
+        lines = [f"== {title}", f"  {'':<14}{'alerts':>7}{'still':>7}{'delay':>7}{'next':>7}"]
+        for name in sorted(groups):
+            g = groups[name]
+            still = sum(r["still_ok"] == "1" for r in g) / len(g) * 100
+            lines.append(f"  {name[:14]:<14}{len(g):>7}{still:>6.0f}%{med([delays.get(r.get('bet_id')) for r in g])}"
+                         f"{med([_cell(r.get('still_secs')) for r in g])}")
+        return lines
+    day = lambda r: local_day(cfg, r["first_seen"]).strftime("%a %b %-d")
+    props = [r for r in marks if r.get("player")]
+    lines_ = [r for r in marks if not r.get("player")]
+    out = [f"Last {days} days. still = price still there at the next check; delay = seconds from the odds to the "
+           f"alert; next = seconds to that check (medians)."]
+    out += table("Props by day", sorted(props, key=lambda r: r["first_seen"]), day)
+    out += table("Props by sport", props, lambda r: r.get("sport", ""))
+    out += table("Props by book", props, lambda r: r.get("book", ""))
+    if lines_:
+        out += table("Game lines by sport", lines_, lambda r: r.get("sport", ""))
+    return "\n".join(out)
+
+
 def timing_report(cfg: Config) -> str:
     """--timing: whether bets alerted earlier or later before the game beat the closing line more often (and made
     more), overall, for props and game lines, by sport, and by where the fair price came from."""
@@ -12394,6 +12437,8 @@ def main() -> None:
     p.add_argument("--results", nargs="?", const="today", metavar="DAY",
                    help="grade finished alerts and list a day's bets with what hit (today, yesterday or "
                         "YYYY-MM-DD), plus the records (2 credits per sport with finished games)")
+    p.add_argument("--speed", action="store_true",
+                   help="how fast alerts go out and how long their prices last, by day, sport and book")
     p.add_argument("--timing", action="store_true",
                    help="how beating the closing line depends on how long before the game a bet was alerted")
     p.add_argument("--weekly", action="store_true",
@@ -12449,7 +12494,7 @@ def main() -> None:
                     if u.startswith("https://")), "")   # a placeholder status URL falls back, like Status
         interactive = (args.dry_run, args.demo, args.once, args.plan, args.results, args.test_discord,
                        args.post_guide, args.post_results, args.check_kalshi, args.check_props, args.check_upcoming,
-                       args.weekly, args.post_weekly, args.test_dk_links, args.post_join is not None, args.timing)
+                       args.weekly, args.post_weekly, args.test_dk_links, args.post_join is not None, args.timing, args.speed)
         if url.startswith("https://") and not any(interactive):   # the service: say why it stopped
             try:
                 _webhook(url, {"username": BOT_NAME, "content": f"🔴 Bot stopped: bad setting in .env: {ex}. "
@@ -12469,8 +12514,8 @@ def main() -> None:
         weekly_command(cfg, args)
         return
 
-    if args.timing:
-        print(timing_report(cfg))
+    if args.timing or args.speed:
+        print("\n\n".join(r(cfg) for r, on in ((speed_report, args.speed), (timing_report, args.timing)) if on))
         return
 
     if args.post_join is not None:

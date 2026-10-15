@@ -13971,6 +13971,21 @@ class EVBotSpec(MixFiles):
         with mock.patch("arbbot.clv_rows", return_value=[]):
             self.assertEqual(_arbbot.timing_report(Config()), "No bets with a closing line yet.")
 
+    def test_the_speed_report_shows_how_long_prices_last(self):
+        from unittest import mock
+        now = datetime.now(timezone.utc)
+        def mk(still, player="X", sport="NHL", book="DraftKings", bid="b"):
+            return {"first_seen": (now - timedelta(hours=2)).isoformat(), "kind": "ev", "player": player, "sport": sport,
+                    "book": book, "still_ok": "1" if still else "0", "still_secs": "180", "bet_id": bid}
+        rows = [mk(True, bid="a"), mk(False, bid="b"), mk(False, bid="c"), mk(True, player="", sport="NFL", bid="d")]
+        with mock.patch("arbbot.markout_rows", return_value=rows), mock.patch("arbbot._read_csv", return_value=[
+                {"event_id": "a", "post_delay": "40"}]), mock.patch("arbbot._bet_id", side_effect=lambda r: r["event_id"]):
+            text = _arbbot.speed_report(Config(ev_log_file="x.csv"))
+        self.assertRegex(text, r"Props by sport\n.*\n  NHL\s+3\s+33%\s+40\s+180")
+        self.assertIn("== Game lines by sport", text)
+        with mock.patch("arbbot.markout_rows", return_value=[]):
+            self.assertEqual(_arbbot.speed_report(Config()), "No finished alerts to measure yet.")
+
     def test_one_sports_props_can_need_more_edge(self):
         cfg = Config(min_ev_pct=4, prop_min_ev_pct=7, prop_sport_min_ev={"americanfootball_nfl": 10.0})
         props = cfg.for_props()
