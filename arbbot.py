@@ -185,6 +185,7 @@ WEBHOOK_SETTINGS = {
     "backup": ("DISCORD_BACKUP_WEBHOOK_URL", "a nightly copy of the betting record (keep this channel private)"),
     "free": ("DISCORD_FREE_WEBHOOK_URL", "the free preview: each winning player prop, once it's graded"),
     "top3": ("DISCORD_TOP3_WEBHOOK_URL", "💎 Elite bets (they go there instead of the +EV channel)"),
+    "boosts": ("DISCORD_BOOSTS_WEBHOOK_URL", "the daily best bets for profit boosts at FanDuel and DraftKings"),
 }
 
 
@@ -422,6 +423,10 @@ class Config:
     # The top picks' own channel: every 💎 Elite bet (+EV, props, halves: not outliers or parlays) goes there INSTEAD
     # of its usual channel, its one card (pings, ✅ / GONE updates as usual). Nothing else goes there. Without it, TOP3 is a 10am post of the day's top TOP_PICKS in the +EV channel instead.
     top3_webhook_url: str = ""
+    # Profit boosts: "!boost 50 fanduel" in the unit channel DMs the best bets for that boost; BOOSTS_HOUR (New York,
+    # -1 = off) posts the best ones for 25/50/100% boosts at FanDuel and DraftKings to DISCORD_BOOSTS_WEBHOOK_URL daily.
+    boosts_webhook_url: str = ""
+    boosts_hour: int = -1
     top_picks: int = 3
     # One alert per bet: a bet that went out is never alerted again (not at a better price, not at another
     # book, not after a restart), and its card isn't edited except to mark it GONE.
@@ -765,6 +770,8 @@ class Config:
             tier_roles=parse_tier_roles(e("TIER_ROLES", "")),
             top3=e("TOP3", "false").lower() in ("1", "true", "yes"),
             top3_webhook_url=e("DISCORD_TOP3_WEBHOOK_URL", ""),
+            boosts_webhook_url=e("DISCORD_BOOSTS_WEBHOOK_URL", ""),
+            boosts_hour=num("BOOSTS_HOUR", d.boosts_hour, int),
             top_picks=num("TOP_PICKS", d.top_picks, int),
             one_alert_per_bet=e("ONE_ALERT_PER_BET", "false").lower() in ("1", "true", "yes"),
             results_daily_only=e("RESULTS_DAILY_ONLY", "false").lower() in ("1", "true", "yes"),
@@ -1124,7 +1131,8 @@ class Config:
                           ("test_webhook_url", "DISCORD_TEST_WEBHOOK_URL"),
                           ("backup_webhook_url", "DISCORD_BACKUP_WEBHOOK_URL"),
                           ("free_webhook_url", "DISCORD_FREE_WEBHOOK_URL"),
-                          ("top3_webhook_url", "DISCORD_TOP3_WEBHOOK_URL")):
+                          ("top3_webhook_url", "DISCORD_TOP3_WEBHOOK_URL"),
+                          ("boosts_webhook_url", "DISCORD_BOOSTS_WEBHOOK_URL")):
             value = getattr(self, attr)
             if value and not value.startswith(("https://", "http://")):
                 bad.append(env)
@@ -4051,7 +4059,8 @@ def find_evs(events: list[dict], cfg: Config, now: datetime | None = None,
              history: SharpHistory | None = None, kalshi: dict | None = None,
              prices: PriceHistory | None = None, keep: set[str] | frozenset = frozenset(),
              confirm_misses: dict[str, int] | None = None, alt_seen: set | None = None,
-             sharp_down: set[str] | frozenset = frozenset(), rejects: list | None = None) -> list[EVBet]:
+             sharp_down: set[str] | frozenset = frozenset(), rejects: list | None = None,
+             pool: "BoostPool | None" = None) -> list[EVBet]:
     """+EV prices vs the sharp book's fair odds. With CONSENSUS_MIN_BOOKS (props), a line no sharp
     prices is judged against the median of the OTHER books instead (the book being judged, and its
     sister books, never count toward its own fair price), and rated on how much they agree.
@@ -4207,6 +4216,15 @@ def find_evs(events: list[dict], cfg: Config, now: datetime | None = None,
                     alt_seen.add((ev["id"], k, oc["name"], key))
                 ev_pct = (p * price - 1) * 100
                 link = book_link(ev, bm, mkt, oc, cfg)
+                if (pool is not None and key in BOOST_BOOKS and not is_live and k in fair and not alt
+                        and price <= BOOST_MAX_LEG and -BOOST_LEG_FLOOR <= ev_pct <= cfg.max_ev_pct):
+                    # (Near-fair prices at FanDuel/DraftKings, against the sharp line: a profit boost makes them +EV.)
+                    pool.add(EVBet(event_id=ev["id"], sport=ev.get("sport_title", ev.get("sport_key", "")),
+                                   sport_key=ev.get("sport_key", ""), matchup=f"{ev['away_team']} @ {ev['home_team']}",
+                                   home_team=ev["home_team"], away_team=ev["away_team"],
+                                   commence_time=ev["commence_time"], is_live=False, market=k[0], line=k[1],
+                                   outcome=oc["name"], point=oc.get("point"), book=bm.get("title", key), price=price,
+                                   fair_prob=p, sharp_book=sharp_name.get(k, ""), n_outcomes=len(fair[k]), link=link), now)
                 # (Kalshi's price can't be both the fair odds and the bet.)
                 ok = price <= cfg.ev_max_odds and ev_pct <= cfg.max_ev_pct and not (k in alone and key == "kalshi")
                 waiting = False
@@ -8334,6 +8352,145 @@ class Members:
         self.save(data)
 
 
+BOOST_BOOKS = ("fanduel", "draftkings")
+BOOST_MAX_LEG = 6.0      # a leg's odds at most +500
+BOOST_LEG_FLOOR = 6.0    # a leg may be up to 6% worse than fair (a boost more than makes up for it)
+BOOST_MAX_PRICE = 21.0   # the whole bet at most +2000 before the boost
+BOOST_KEEP = 1200        # seconds a price stays in the pool after it was last seen
+
+
+class BoostPool:
+    """Pre-game FanDuel and DraftKings prices priced off the sharp line, near fair or better, from the latest checks
+    (props come every few minutes, so a price seen within BOOST_KEEP seconds counts): what profit boosts are built on."""
+
+    def __init__(self):
+        self.bets: dict[tuple, tuple["EVBet", float]] = {}
+
+    def add(self, b: "EVBet", now: datetime) -> None:
+        self.bets[(book_slug(b.book), b.key)] = (b, now.timestamp())
+
+    def fresh(self, now: datetime, book: str) -> list["EVBet"]:
+        ts = now.timestamp()
+        self.bets = {k: v for k, v in self.bets.items()
+                     if ts - v[1] <= BOOST_KEEP and _parse_time(v[0].commence_time) > now}
+        return [b for (bk, _), (b, _) in self.bets.items() if bk == book]
+
+
+def best_boosts(pool: BoostPool, book: str, boost_pct: float, now: datetime, min_legs: int = 1, max_legs: int = 3,
+                top: int = 3) -> list[dict]:
+    """The best bets for a profit boost of boost_pct at this book: singles and parlays of up to max_legs legs from
+    different games, at most +2000, ranked by expected value with the boost (it multiplies the profit, not the stake).
+    No two share a leg. Only bets that are +EV with the boost."""
+    legs = sorted(pool.fresh(now, book), key=lambda b: b.fair_prob * b.price, reverse=True)[:14]
+    cands = []
+    for n in range(max(1, min_legs), max_legs + 1):
+        for combo in itertools.combinations(legs, n):
+            if len({b.event_id for b in combo}) < n:
+                continue
+            price = math.prod(b.price for b in combo)
+            if price > BOOST_MAX_PRICE:
+                continue
+            fair = math.prod(b.fair_prob for b in combo)
+            boosted = 1 + (price - 1) * (1 + boost_pct / 100)
+            cands.append({"legs": list(combo), "price": price, "boosted": boosted, "fair": fair,
+                          "ev": (fair * boosted - 1) * 100, "base": (fair * price - 1) * 100})
+    out, used = [], set()
+    for c in sorted(cands, key=lambda c: -c["ev"]):
+        keys = {b.key for b in c["legs"]}
+        if c["ev"] <= 0 or keys & used:
+            continue
+        out.append(c)
+        used |= keys
+        if len(out) >= top:
+            break
+    return out
+
+
+def boost_lines(cfg: Config, picks: list[dict], book_title: str) -> list[str]:
+    lines = []
+    for i, c in enumerate(picks, 1):
+        legs = c["legs"]
+        what = (f"📈 {legs[0].pick} {odds(legs[0].price)}" if len(legs) == 1 else
+                f"📦 {len(legs)}-leg parlay: " + " + ".join(f"{b.pick} {odds(b.price)}" for b in legs))
+        lines.append(f"**{i}.** {what}\n     {odds(c['price'])} → **{odds(c['boosted'])} boosted** · **{c['ev']:+.1f}% EV** "
+                     f"({c['base']:+.1f}% without the boost) · {legs[0].sport if len(legs) == 1 else 'mixed games'}")
+        link = legs[0].link if len(legs) == 1 else parlay_slip_link(cfg, book_title, [b.link for b in legs])
+        if link:
+            lines.append(f"     🔗 [{'Open the bet' if len(legs) == 1 else 'Add every leg to your slip'}]({link})")
+    return lines
+
+
+BOOST_CMD = re.compile(r"^\s*(?:<@!?\d+>\s*)?!boost\b(.*)$", re.I | re.S)
+BOOK_WORDS = {"fanduel": "fanduel", "fd": "fanduel", "draftkings": "draftkings", "dk": "draftkings"}
+
+
+def boost_reply(cfg: Config, pool: BoostPool, text: str, now: datetime | None = None) -> str | None:
+    """"!boost 50 fanduel [$25] [parlay]": the best bets for that profit boost, as a message (None: not a !boost)."""
+    hit = BOOST_CMD.match(text or "")
+    if not hit:
+        return None
+    words = re.findall(r"[a-z]+|\$?\d+(?:\.\d+)?%?", hit.group(1).lower())
+    book = next((BOOK_WORDS[w] for w in words if w in BOOK_WORDS), None)
+    nums = [w for w in words if w[0].isdigit() or w[0] == "$"]
+    pct = next((float(w.rstrip("%")) for w in nums if not w.startswith("$")), None)
+    cap = next((float(w[1:]) for w in nums if w.startswith("$")), None)
+    if cap is None and len([w for w in nums if not w.startswith("$")]) > 1:
+        cap = float([w for w in nums if not w.startswith("$")][1].rstrip("%"))
+    if not book or not pct or not 5 <= pct <= 200:
+        return ("Type it like `!boost 50 fanduel` (your profit boost % and the book: fanduel or draftkings). "
+                "Add your boost's max bet and `parlay` if it's parlays only: `!boost 50 dk $25 parlay`.")
+    now = now or datetime.now(timezone.utc)
+    title = {"fanduel": "FanDuel", "draftkings": "DraftKings"}[book]
+    picks = best_boosts(pool, book, pct, now, min_legs=2 if "parlay" in words or "parlays" in words else 1)
+    head = f"🚀 **Best bets for your {pct:g}% profit boost at {title}**"
+    if not picks:
+        return head + "\nNothing worth your boost right now. Try again later today, when more games have lines up."
+    stake = f"Bet **${cap:g}** (your boost's max)." if cap else "Bet your boost's max (most are $25-$50)."
+    return "\n".join([head, *boost_lines(cfg, picks, title), "",
+                      f"{stake} Prices from the last few minutes: they move, so tap fast. Check your boost's rules "
+                      "(minimum legs or odds, sports) before you bet. 21+."])[:1990]
+
+
+def boosts_due(cfg: Config, now: datetime) -> date | None:
+    """The day the daily boosts post is owed for (BOOSTS_HOUR, once a day, remembered across restarts)."""
+    local = now.astimezone(ZoneInfo(cfg.timezone))
+    marker = _day_marker(cfg, "boosts_day.txt")
+    if cfg.boosts_hour < 0 or not cfg.boosts_webhook_url or local.hour < cfg.boosts_hour or marker is None:
+        return None
+    try:
+        return None if marker.exists() and marker.read_text().strip() == local.date().isoformat() else local.date()
+    except OSError:
+        return None
+
+
+def send_boosts(cfg: Config, pool: BoostPool, day: date, now: datetime) -> int:
+    """Post today's best bets for 25/50/100% profit boosts at FanDuel and DraftKings; returns how many were listed."""
+    embeds, n = [], 0
+    for book, title in (("fanduel", "FanDuel"), ("draftkings", "DraftKings")):
+        lines, used = [], set()
+        for pct in (25, 50, 100):
+            pick = next((c for c in best_boosts(pool, book, pct, now, top=5)
+                         if not {b.key for b in c["legs"]} & used), None)
+            if not pick:
+                continue
+            used |= {b.key for b in pick["legs"]}
+            lines.append(f"__**{pct}% boost**__")
+            lines += boost_lines(cfg, [pick], title)[0:1] + boost_lines(cfg, [pick], title)[1:]
+            n += 1
+        if lines:
+            embeds.append({"title": f"🚀 {title} profit boosts · {day:%a %b %-d}", "color": 0x1493FF if book == "fanduel" else 0x53D337,
+                           "description": "\n".join(lines).replace("**1.** ", "")[:4000]})
+    if embeds:
+        _webhook(cfg.boosts_webhook_url, {"username": BOT_NAME, "embeds": embeds, "allowed_mentions": {"parse": []},
+                                          "content": "Got a profit boost? These turn it into the most expected value right now. "
+                                                     "Your own boost size: `!boost 50 fanduel` in #units. 21+."})
+    marker = _day_marker(cfg, "boosts_day.txt")
+    if marker:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(day.isoformat())
+    return n
+
+
 def join_payload(cfg: Config) -> dict:
     """The "unlock every alert" message for a channel everyone sees: what members get, the price, and buttons to the
     checkout (STRIPE_SIGNUP_URL), the public results and the sign-up website."""
@@ -11269,6 +11426,8 @@ class Trackers:
         # ✅ bet tracking (DISCORD_BOT_TOKEN; not --once, --demo or --dry-run).
         self.reactions = BetReactions(cfg, off)
         self.members = Members(cfg, self.reactions, off)
+        self.boost_pool = BoostPool()
+        self.reactions.command = self.command
         if self.reactions.on:
             for a in (self.evs, self.outs, self.prop_evs, self.prop_outs, self.parlays, self.period_evs,
                       self.period_outs):
@@ -11302,6 +11461,15 @@ class Trackers:
         self.arb_live = LiveConfirm(cfg.live_confirm_checks, cfg.live_max_age_alert)
         self.bet_live = LiveConfirm(cfg.live_confirm_checks, cfg.live_max_age_alert)
         self.set_live_interval(cfg.poll_seconds)
+
+    def command(self, uid: str, text: str) -> str | None:
+        """Other "!" commands in the unit channel: !boost (the best bets for a profit boost, by DM), then !refer."""
+        reply = boost_reply(self.cfg, self.boost_pool, text)
+        if reply is not None:
+            if reply.startswith("🚀") and self.reactions.dm(uid, reply):
+                return "📬 Sent you the best bets for that boost by DM."
+            return reply
+        return self.members.command(uid, text) if self.members.on else None
 
     def tuned(self) -> Tuning:
         """The current tuning (TUNE_ENABLED), read again from the logs once it's TUNE_REFRESH_SECONDS old."""
@@ -11393,7 +11561,7 @@ def scan_main(t: Trackers, events: list[dict], checked_sports: list[str], now: d
     outs = find_outliers(events, cfg, at, history=t.price_history, kalshi=kq, rejects=rejects)
     misses: dict[str, int] = {}
     up = set(t.evs.open) | set(t.evs.restored)   # +EV cards up: a confirmed one stays while a source is only missing
-    evs = without_outliers(find_evs(events, cfg, at, history=t.sharp_history, kalshi=kq, keep=up,
+    evs = without_outliers(find_evs(events, cfg, at, history=t.sharp_history, kalshi=kq, keep=up, pool=t.boost_pool,
                                     confirm_misses=misses, sharp_down=t.sharp_down, rejects=rejects), outs)
     t.candidates.extend(rejects, at.timestamp())
     outs = tune_bets(outs, cfg, t.tuned(), (t.outs, t.evs))
@@ -11440,6 +11608,7 @@ def scan_props(t: Trackers, prop_events: list[dict], checked: set[str], now: dat
         print(line, file=sys.stderr)
     p_outs = find_outliers(prop_events, cfg, at, history=t.price_history, alt_seen=alt_seen, rejects=rejects)
     p_evs = without_outliers(find_evs(prop_events, t.prop_cfg, at, history=t.sharp_history, prices=t.prop_prices,
+                                      pool=t.boost_pool,
                                       keep=carded, alt_seen=alt_seen, sharp_down=t.sharp_down, rejects=rejects), p_outs)
     t.candidates.extend(rejects, ts)
     t.prop_prices.prune(at)
@@ -11527,6 +11696,7 @@ def scan_periods(t: Trackers, events: list[dict], checked: set[str], now: dateti
     rejects: list = []
     outs = find_outliers(events, cfg, now, history=t.price_history, rejects=rejects)
     evs = without_outliers(find_evs(events, cfg, now, history=t.sharp_history, keep=up, sharp_down=t.sharp_down,
+                                    pool=t.boost_pool,
                                     rejects=rejects), outs)
     t.candidates.extend(rejects, ts)
     outs = tune_bets(outs, cfg, t.tuned(), (t.period_outs, t.period_evs))
@@ -11907,6 +12077,11 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
                 print(f"  ☀️ Morning digest: {send_digest(cfg, t, day, now)} bets still good", flush=True)
             except Exception as e:  # noqa: BLE001 - never stops the bot
                 results_warned = results_trouble(status, e, results_warned, what="post the morning digest")
+        if not (args.once or args.dry_run) and (day := boosts_due(cfg, now)):
+            try:
+                print(f"  🚀 Boosts post: {send_boosts(cfg, t.boost_pool, day, now)} bets", flush=True)
+            except Exception as e:  # noqa: BLE001 - never stops the bot
+                results_warned = results_trouble(status, e, results_warned, what="post the profit boosts")
         if not (args.once or args.dry_run) and cfg.free_webhook_url and time.time() - teased > 300:
             teased = time.time()
             try:

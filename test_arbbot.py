@@ -369,6 +369,63 @@ def ev_event(sharp, books, start="2026-10-03T18:00:00Z", market="h2h"):
 EVCFG = Config(min_ev_pct=3, round_stakes=0, ev_bankroll=1000, kelly_fraction=0.25, confidence_stakes="1,1,1")
 
 
+class ProfitBoosts(unittest.TestCase):
+    def pool(self, fd_price=2.00):
+        pool = _arbbot.BoostPool()
+        evs = []
+        for i in range(3):
+            ev = ev_event([("Home", 1.91, None), ("Away", 1.91, None)],
+                          {"FanDuel": [("Home", fd_price, None)], "DraftKings": [("Home", 1.80, None)]})
+            ev["id"] = f"g{i}"
+            evs.append(ev)
+        find_evs(evs, Config(min_ev_pct=3), NOW, pool=pool)
+        return pool
+
+    def test_near_fair_prices_from_the_sharp_line_go_in_the_pool(self):
+        pool = self.pool()
+        fd = pool.fresh(NOW, "fanduel")
+        self.assertEqual(len(fd), 3)                                    # at fair: in, though not +EV
+        self.assertAlmostEqual(fd[0].fair_prob, 0.5)
+        self.assertEqual(pool.fresh(NOW, "draftkings"), [])             # 1.80 is 10% under fair: too far
+        self.assertEqual(pool.fresh(NOW + timedelta(hours=7), "fanduel"), [])   # the games started
+
+    def test_a_boost_turns_fair_bets_into_good_ones(self):
+        pool = self.pool()
+        [best] = _arbbot.best_boosts(pool, "fanduel", 50, NOW)
+        self.assertEqual(len(best["legs"]), 3)                          # +700, boosted to +1050
+        self.assertAlmostEqual(best["base"], 0.0)
+        self.assertAlmostEqual(best["ev"], 43.75)                       # 1/8 x 11.5 - 1
+        self.assertEqual(len({b.event_id for b in best["legs"]}), 3)    # different games
+        self.assertEqual(_arbbot.best_boosts(self.pool(fd_price=1.82), "fanduel", 5, NOW), [])   # not worth it
+
+    def test_the_daily_boosts_post(self):
+        from unittest import mock
+        import tempfile
+        cfg = Config(boosts_webhook_url="https://boosts", boosts_hour=12, state_dir=tempfile.mkdtemp())
+        noon = datetime(2026, 10, 3, 16, 30, tzinfo=timezone.utc)                     # 12:30 New York
+        self.assertIsNone(_arbbot.boosts_due(cfg, datetime(2026, 10, 3, 14, 0, tzinfo=timezone.utc)))   # 10 AM
+        day = _arbbot.boosts_due(cfg, noon)
+        posts = []
+        with mock.patch("arbbot._webhook", lambda url, payload, *a, **k: posts.append(payload)):
+            n = _arbbot.send_boosts(cfg, self.pool(), day, NOW)
+        self.assertEqual(n, 1)                                  # one boost pick (only 3 games' legs to use)
+        self.assertIn("FanDuel profit boosts", posts[0]["embeds"][0]["title"])
+        self.assertIn("__**25% boost**__", posts[0]["embeds"][0]["description"])
+        self.assertIsNone(_arbbot.boosts_due(cfg, noon))        # once a day
+
+    def test_the_boost_command(self):
+        pool = self.pool()
+        reply = _arbbot.boost_reply(Config(), pool, "!boost 50% fanduel $25 parlay", NOW)
+        self.assertTrue(reply.startswith("🚀 **Best bets for your 50% profit boost at FanDuel**"))
+        self.assertIn("3-leg parlay", reply)
+        self.assertIn("**+1050 boosted** · **+43.8% EV** (+0.0% without the boost)", reply)
+        self.assertIn("Bet **$25** (your boost's max)", reply)
+        self.assertIn("Type it like", _arbbot.boost_reply(Config(), pool, "!boost 50", NOW))
+        self.assertIn("Type it like", _arbbot.boost_reply(Config(), pool, "!boost", NOW))
+        self.assertIsNone(_arbbot.boost_reply(Config(), pool, "!unit 25", NOW))
+        self.assertIn("Nothing worth your boost", _arbbot.boost_reply(Config(), pool, "!boost 50 dk", NOW))
+
+
 class PlusEV(unittest.TestCase):
     def test_devig(self):
         for method in ("multiplicative", "power"):
