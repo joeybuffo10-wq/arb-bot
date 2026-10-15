@@ -390,7 +390,8 @@
     stats(bets); chart(bets); clvChart(bets); finder(bets); breakdowns(bets); table(bets);
   }
 
-  fetch("results.json", { cache: "no-store" }).then(function (r) { return r.json(); }).then(function (data) {
+  // (A copy of this page elsewhere sets window.BB_RESULTS_JSON to this site's results.json.)
+  fetch(window.BB_RESULTS_JSON || "results.json", { cache: "no-store" }).then(function (r) { return r.json(); }).then(function (data) {
     state.bets = data.bets || [];
     var when = new Date(data.updated);
     document.getElementById("sub").textContent = "Every graded " + (data.live ? "" : "pre-game ") +

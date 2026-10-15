@@ -14117,6 +14117,9 @@ class EVBotSpec(MixFiles):
     def test_the_results_cards_link_to_the_public_page(self):
         cfg, res, sent = self.results(results_site_repo="joeybuffo10-wq/ev-bot-results")
         self.assertEqual(_arbbot.site_url(cfg), "https://joeybuffo10-wq.github.io/ev-bot-results/")
+        moved = replace(cfg, results_site_url="https://buffbets.github.io/results")
+        self.assertEqual((_arbbot.site_url(moved), _arbbot.go_url(moved)),
+                         ("https://buffbets.github.io/results/", "https://buffbets.github.io/results/go.html"))
         self.log(cfg, "g1", "2026-10-03T18:00:00Z")
         res.daily(self.scores({"g1": (4, 2)}), date(2026, 10, 3), datetime(2026, 10, 4, 4, 40, tzinfo=timezone.utc))
         link = "[EV BOT results](https://joeybuffo10-wq.github.io/ev-bot-results/)"

@@ -493,6 +493,9 @@ class Config:
     parlay_dk_format: str = "plus"
     results_site_repo: str = ""
     results_site_token: str = ""
+    # RESULTS_SITE_URL: the address members are sent to for the results page (and go.html), when it isn't the GitHub
+    # Pages address of RESULTS_SITE_REPO, e.g. a copy at https://buffbets.github.io/results/ ("" = that address).
+    results_site_url: str = ""
     reaction_minutes: int = 10
     tune_slow_still_pct: float = 40.0
     tune_slow_bets: int = 30
@@ -796,6 +799,7 @@ class Config:
             social_weekly=e("SOCIAL_WEEKLY", "false").lower() in ("1", "true", "yes"),
             parlay_dk_format=(e("PARLAY_DK_FORMAT") or "plus").strip().lower(),
             results_site_token=e("RESULTS_SITE_TOKEN", "").strip(),
+            results_site_url=e("RESULTS_SITE_URL", "").strip(),
             reaction_minutes=num("REACTION_MINUTES", d.reaction_minutes, int),
             unit_channel_id="".join(c for c in e("UNIT_CHANNEL_ID", "") if c.isdigit()),
             stripe_key=e("STRIPE_KEY", "").strip(),
@@ -12282,7 +12286,10 @@ def social_text(cfg: Config, end_day: date) -> str:
 
 
 def site_url(cfg: Config) -> str:
-    """The public results page's address (GitHub Pages of RESULTS_SITE_REPO), or "" when there's none."""
+    """The public results page's address (RESULTS_SITE_URL, else GitHub Pages of RESULTS_SITE_REPO), or "" when
+    there's none."""
+    if cfg.results_site_url and cfg.results_site_repo:
+        return cfg.results_site_url.rstrip("/") + "/"
     owner, _, name = cfg.results_site_repo.partition("/")
     return f"https://{owner.lower()}.github.io/{name}/" if owner and name else ""
 
