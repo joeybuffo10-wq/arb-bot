@@ -500,6 +500,11 @@ class Config:
     # SAME_PLAYER_MAX): two players' props hardly move together, one player's do. 0 and 0: props count in the game too.
     same_player_full: int = 0
     same_player_max: int = 0
+    # Props on the same side of the same stat in one game (three players' Under 0.5 Hits, two Unders on shots) win and
+    # lose together too: the first SAME_SIDE_FULL at full stake, the next at x SAME_GAME_STAKE, none past SAME_SIDE_MAX
+    # (0 = no limit). Counted on top of the per-player limit.
+    same_side_full: int = 0
+    same_side_max: int = 0
     tune_since: str = ""   # YYYY-MM-DD: tuning counts only bets alerted from this day on (older data was off); "" = all
     # A new alert (or a much better price's re-alert) isn't posted on odds fetched longer ago than this by the
     # time it's ready (a slow pass, Discord making the bot wait): the next check looks again and sends it on its
@@ -796,6 +801,8 @@ class Config:
             same_game_max=num("SAME_GAME_MAX", d.same_game_max, int),
             same_player_full=num("SAME_PLAYER_FULL", d.same_player_full, int),
             same_player_max=num("SAME_PLAYER_MAX", d.same_player_max, int),
+            same_side_full=num("SAME_SIDE_FULL", d.same_side_full, int),
+            same_side_max=num("SAME_SIDE_MAX", d.same_side_max, int),
             min_live_profit_pct=num("MIN_LIVE_PROFIT_PCT", d.min_live_profit_pct, float),
             live_arb_max_skew=num("LIVE_ARB_MAX_SKEW", d.live_arb_max_skew, int),
             live_confirm_checks=num("LIVE_CONFIRM_CHECKS", d.live_confirm_checks, int),
@@ -11092,6 +11099,27 @@ def same_group(cfg: Config, event_id: str, market: str, line) -> tuple:
     return ("game", event_id)
 
 
+def side_group(cfg: Config, event_id: str, market: str, line, outcome: str) -> tuple | None:
+    """("side", game, stat, Over/Under) for a player prop when SAME_SIDE_* are set: the same side of the same stat in
+    one game, whatever the player (an alternate line is the same stat). None for anything else."""
+    if not (cfg.same_side_full or cfg.same_side_max) or not is_prop(line) or market == "team_totals":
+        return None
+    side = (outcome or "").split()[0].lower() if outcome else ""
+    return ("side", event_id, market.removesuffix("_alternate"), side)
+
+
+def _key_side(cfg: Config, key: str) -> tuple | None:
+    """side_group() of an alert key ("ev|game|market|line|outcome"), or None."""
+    parts = key.split("|", 4)
+    if len(parts) < 5 or parts[0] != "ev":
+        return None
+    try:
+        line = ast.literal_eval(parts[3])
+    except (ValueError, SyntaxError):
+        return None
+    return side_group(cfg, parts[1], parts[2], line, parts[4])
+
+
 def _key_group(cfg: Config, key: str) -> tuple | None:
     """same_group() of an alert key ("ev|game|market|line|outcome"), or None when it can't be read."""
     parts = key.split("|", 4)
@@ -11110,7 +11138,8 @@ def same_game(bets: list, cfg: Config, t: "Trackers", alerters: tuple) -> list:
     new alerts at full stake, the next at x SAME_GAME_STAKE, none past SAME_GAME_MAX (SAME_PLAYER_MAX). Counts every
     alert already out in the group (remembered across restarts) and the ones before it in this check, best edge
     first. Cards already up go through unchanged; what's held back is counted as "same game"."""
-    if not (cfg.same_game_full or cfg.same_game_max or cfg.same_player_full or cfg.same_player_max):
+    if not (cfg.same_game_full or cfg.same_game_max or cfg.same_player_full or cfg.same_player_max
+            or cfg.same_side_full or cfg.same_side_max):
         return bets
     up = {k for a in alerters for k in (*a.open, *a.restored)}
     every = (t.evs, t.outs, t.prop_evs, t.prop_outs, t.period_evs, t.period_outs)
@@ -11118,6 +11147,8 @@ def same_game(bets: list, cfg: Config, t: "Trackers", alerters: tuple) -> list:
     for key in {*t.alerted.until, *(k for a in every for k in (*a.open, *a.restored))}:
         if (group := _key_group(cfg, key)) is not None:
             out_on.setdefault(group, set()).add(key)
+        if (side := _key_side(cfg, key)) is not None:
+            out_on.setdefault(side, set()).add(key)
     keep = []
     for b in sorted(bets, key=lambda b: -b.ev_pct):
         if b.key in up:
@@ -11128,9 +11159,18 @@ def same_game(bets: list, cfg: Config, t: "Trackers", alerters: tuple) -> list:
                        else (cfg.same_game_full, cfg.same_game_max))
         on = out_on.setdefault(group, set())
         n = len(on - {b.key}) + 1   # this one's place in its group
-        if cap_n and n > cap_n:
+        side = side_group(cfg, b.event_id, b.market, b.line, b.outcome)
+        side_on = out_on.setdefault(side, set()) if side else set()
+        n_side = len(side_on - {b.key}) + 1
+        if (cap_n and n > cap_n) or (side and cfg.same_side_max and n_side > cfg.same_side_max):
             alerters[0].held_counts["same game"] = alerters[0].held_counts.get("same game", 0) + 1
             continue
+        if side and cfg.same_side_full and n_side > cfg.same_side_full and b.stake and not (full and n > full):
+            cap = cfg.ev_bankroll * cfg.ev_max_stake_pct / 100
+            b.stake = round_stake(b.stake * cfg.same_game_stake, min(cap, b.stake), cfg)
+            note = (f"Stake ×{cfg.same_game_stake:g}: {b.outcome.split()[0]} #{n_side} on {bet_type_name(b.market)} "
+                    f"in this game (they win and lose together)")
+            b.tune_note = f"{b.tune_note}\n📊 {note}" if b.tune_note else note
         if full and n > full and b.stake:
             cap = cfg.ev_bankroll * cfg.ev_max_stake_pct / 100
             b.stake = round_stake(b.stake * cfg.same_game_stake, min(cap, b.stake), cfg)
@@ -11138,6 +11178,7 @@ def same_game(bets: list, cfg: Config, t: "Trackers", alerters: tuple) -> list:
             note = f"Stake ×{cfg.same_game_stake:g}: alert #{n} {what} (they win and lose together)"
             b.tune_note = f"{b.tune_note}\n📊 {note}" if b.tune_note else note
         on.add(b.key)
+        side_on.add(b.key)
         keep.append(b)
     return keep
 

@@ -13801,6 +13801,24 @@ class EVBotSpec(MixFiles):
         self.assertEqual(EVAlerter(replace(on, top3=False), True).webhook_for(elite), "https://main")
         self.assertNotEqual(OutlierAlerter(on, True).webhook_for(elite), "https://top3")
 
+    def test_same_side_props_in_one_game_are_limited(self):
+        sent = []
+        t = self.live(sent, one_alert_per_bet=True, same_game_full=2, same_game_max=4, same_player_full=1,
+                      same_player_max=2, same_side_full=1, same_side_max=2)
+        [base] = find_evs([self.game({"B": 2.20})], t.cfg, NOW)
+        def prop(player, side="Under", market="batter_hits", ev_id=None):
+            return replace(base, market=market, line=(player, 0.5), point=0.5, outcome=side, stake=20.0,
+                           event_id=ev_id or base.event_id)
+        unders = [prop(p) for p in ("Kwan", "Lowe", "Bazzana", "Vilade")]           # four Under 0.5 Hits, one game
+        kept = _arbbot.same_game(unders, t.cfg, t, (t.prop_evs, t.prop_outs))
+        self.assertEqual([b.stake for b in kept], [20.0, 10.0])                     # one full, one smaller, no more
+        mixed = [prop("Kwan"), prop("Lowe", side="Over"), prop("Bazzana", market="batter_total_bases"),
+                 prop("Vilade", ev_id="other-game")]                                # different side, stat or game
+        self.assertEqual([b.stake for b in _arbbot.same_game(mixed, t.cfg, t, (t.prop_evs, t.prop_outs))],
+                         [20.0, 20.0, 20.0, 20.0])
+        alt = [prop("Kwan"), prop("Lowe", market="batter_hits_alternate"), prop("Vilade", market="batter_hits_alternate")]
+        self.assertEqual(len(_arbbot.same_game(alt, t.cfg, t, (t.prop_evs, t.prop_outs))), 2)   # alternates count too
+
     def test_props_are_limited_per_player_not_per_game(self):
         sent = []
         t = self.live(sent, one_alert_per_bet=True, same_game_full=2, same_game_max=4, same_player_full=1,
