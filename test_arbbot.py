@@ -13603,6 +13603,25 @@ class EVBotSpec(MixFiles):
             self.assertFalse(any("/roles/" in p for _, p in discord))
             self.assertTrue(any(k == "DM" and "at least 30 days old" in v for k, v in discord))
 
+    def test_a_free_sample_alert_once_a_week(self):
+        from unittest import mock
+        sent, free = [], []
+        t = self.live(sent, one_alert_per_bet=True, outliers_enabled=False, free_webhook_url="https://free",
+                      free_sample_day="sat", free_sample_hour=12, stripe_signup_url="https://buy.stripe.com/x")
+        def hook(url, payload, *a, **k):
+            free.append(payload); return {"id": f"f{len(free)}"}
+        good = lambda ev_id: self.game({"B": 2.10}, ev_id=ev_id)                    # 50% to win: 🔵 Confident
+        high = lambda *a, **k: [replace(x, confidence="high") for x in real_find_evs(*a, **k)]
+        with mock.patch("arbbot._webhook", hook), mock.patch("arbbot.find_evs", high):
+            self.main(t, [good("e1")], 0)                                         # Sat 8 AM New York: too early
+            self.assertEqual(free, [])
+            self.main(t, [good("e1"), good("e2"), good("e3")], 5 * 3600)          # Sat 1 PM New York
+        self.assertEqual(len(free), 1)                                            # the week's first, only
+        self.assertTrue(free[0]["embeds"][0]["title"].startswith("🎁 Free sample · "))
+        self.assertIn("14 days free: <https://buy.stripe.com/x>", free[0]["content"])
+        op = next(op for op in t.evs.open.values() if op.sample)
+        self.assertEqual(op.sample, "f1")
+
     def test_tracking_is_off_without_a_token_or_in_a_test_run(self):
         sent = []
         t = self.live(sent)

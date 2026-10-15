@@ -479,6 +479,11 @@ class Config:
     # at +120"), never a bet that can still be placed. FREE_CTA: a line added under those posts, e.g. how to join.
     free_webhook_url: str = ""
     free_cta: str = ""
+    # The free channel's weekly sample: on FREE_SAMPLE_DAY ("sat", "" = off), from FREE_SAMPLE_HOUR (New York), the
+    # first 🟢 Very confident or 🔵 Confident +EV bet that goes out is also posted there, live, before the game, as a
+    # real example of what members get (once a week; its copy goes GONE with it). 💎 Elite stays members-only.
+    free_sample_day: str = ""
+    free_sample_hour: int = 12
     # Mondays: a short copy-ready summary of last week for social media, in the testing (else status) channel.
     social_weekly: bool = False
     # How a DraftKings parlay link joins its legs' outcome ids (DraftKings doesn't document it; --test-dk-links posts
@@ -786,6 +791,8 @@ class Config:
             digest_hour=num("DIGEST_HOUR", d.digest_hour, int),
             free_webhook_url=e("DISCORD_FREE_WEBHOOK_URL", ""),
             free_cta=e("FREE_CTA", "").strip(),
+            free_sample_day=e("FREE_SAMPLE_DAY", "").strip().lower()[:3],
+            free_sample_hour=num("FREE_SAMPLE_HOUR", d.free_sample_hour, int),
             social_weekly=e("SOCIAL_WEEKLY", "false").lower() in ("1", "true", "yes"),
             parlay_dk_format=(e("PARLAY_DK_FORMAT") or "plus").strip().lower(),
             results_site_token=e("RESULTS_SITE_TOKEN", "").strip(),
@@ -2467,6 +2474,7 @@ class OpenArb:
                                       # card's, before a hand-over); None: none did yet
     slots: tuple = ()         # the hourly-cap slots its first post took ((times list, time) pairs): given back if
                               # it never goes out
+    sample: str = ""          # its copy in the free channel, when it was the week's free sample (message id)
     prev: tuple = ()          # (message id, webhook) of the card it was handed over from (now a pointer to this
                               # one): if it closes before its own post lands, that card says GONE
     edited: float = 0.0       # when its card was last posted or edited (CARD_EDIT_MIN_SECONDS)
@@ -2717,6 +2725,7 @@ class Alerter:
     Prices change while still an arb -> the same message is edited in place.
     Arb disappears -> the message is edited to "GONE after Ns" and logged to CSV.
     """
+    sample_ok = False   # a bet of this kind can be the free channel's weekly sample (+EV, props, halves: not outliers)
 
     noun = "arbs"
     log_fields = LOG_FIELDS
@@ -3087,6 +3096,8 @@ class Alerter:
             self.alerted.add(self.bet_identity(op.arb), self.bet_expires(op.arb), now)
         if self.once:
             op.sent_item, op.render = op.arb, self.payload
+        if self.sample_ok and op.message_id and not self.dry_run and not op.sample:
+            self.free_sample(op, now)
         if self.on_posted and op.message_id and not self.dry_run:
             try:
                 self.on_posted({"first_seen": _utc(op.first_seen), **self.row(op)}, op.message_id, op.url)
@@ -3298,6 +3309,40 @@ class Alerter:
             op.status, op.edited = status, now
             self._discord(op.render(sent, first_seen=op.first_seen, status=status), op.message_id, op.url)
 
+    def free_sample(self, op: OpenArb, now: float) -> None:
+        """FREE_SAMPLE_DAY: the week's first 🟢 / 🔵 bet from FREE_SAMPLE_HOUR that day is also posted in the free
+        channel (DISCORD_FREE_WEBHOOK_URL), labeled as a free sample, with the trial link. Remembered in
+        state/free_sample.json (ISO week), so once a week whatever restarts."""
+        cfg, b = self.cfg, op.arb
+        if not (cfg.free_webhook_url and cfg.free_sample_day and cfg.state_dir) or getattr(b, "is_live", False):
+            return
+        if is_elite(b) or bet_tier(b) not in (1, 2):   # 🟢 Very confident or 🔵 Confident (💎 stays members-only)
+            return
+        local = datetime.fromtimestamp(now, ZoneInfo(cfg.timezone))
+        if local.strftime("%a").lower()[:3] != cfg.free_sample_day or local.hour < cfg.free_sample_hour:
+            return
+        week, path = local.strftime("%G-W%V"), data_path(cfg.state_dir) / "free_sample.json"
+        try:
+            if path.exists() and json.loads(path.read_text()).get("week") == week:
+                return
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({"week": week, "bet": b.key}))   # (first, so an error never posts it twice)
+        except (OSError, ValueError) as e:
+            print(f"  ! Free sample: {e!r:.150}", file=sys.stderr)
+            return
+        payload = self.payload(op.sent_item or b, first_seen=op.first_seen)
+        emb = payload["embeds"][0]
+        emb["title"] = f"🎁 Free sample · {emb['title']}"[:256]
+        payload["content"] = ("🎁 **This week's free sample:** a real alert members just got, before the game. Members get "
+                              "every one the moment it's found." +
+                              (f" 14 days free: <{cfg.stripe_signup_url}>" if cfg.stripe_signup_url else ""))
+        payload["allowed_mentions"] = {"parse": []}
+        try:
+            op.sample = (_webhook(cfg.free_webhook_url, payload) or {}).get("id", "")
+            print(f"  🎁 Free sample posted: {self.label(b)}", flush=True)
+        except Exception as e:  # noqa: BLE001 - never holds up the alert itself
+            print(f"  ! Free sample: {e!r:.150}", file=sys.stderr)
+
     def _close(self, key: str, now: float) -> None:
         op = self.open.pop(key)
         lasted = now - op.first_seen  # first seen -> first check where it was gone
@@ -3318,6 +3363,8 @@ class Alerter:
         print(f"  ❌ gone after {_fmt_secs(lasted)}: {self.label(op.arb)}", flush=True)
         if op.message_id:
             self._discord(self.payload(op.arb, gone_after=lasted), op.message_id, op.url)
+            if op.sample:   # (its free sample copy too)
+                self._discord(self.payload(op.arb, gone_after=lasted), op.sample, self.cfg.free_webhook_url)
         self.stats["closed"] += 1
         self.stats["open_seconds"] += lasted
         if not self.log_on_open:
@@ -4770,6 +4817,7 @@ EV_LOG_FIELDS = ["first_seen", "event_id", "sport", "sport_key", "matchup",
 
 class EVAlerter(Alerter):
     noun = "+EV bets"
+    sample_ok = True
     book_pings = True   # (outliers too)
     one_alert = True
     log_fields = EV_LOG_FIELDS
@@ -5941,6 +5989,7 @@ def outlier_payload(b: EVBet, mention: str = "", gone_after: float | None = None
 
 class OutlierAlerter(EVAlerter):
     noun = "outliers"
+    sample_ok = False
 
     def text(self, item) -> str:
         t = format_ev_text(item).replace("📈", "🚨 OUTLIER", 1)
