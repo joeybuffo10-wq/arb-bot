@@ -13941,6 +13941,36 @@ class EVBotSpec(MixFiles):
         self.assertIn("$45/month", p["embeds"][0]["description"])
         self.assertEqual(len(_arbbot.join_payload(replace(cfg, join_site_url=""))["components"][0]["components"]), 2)
 
+    def test_a_proven_bet_type_gets_a_bigger_stake(self):
+        cfg = Config(tune_enabled=False, stake_boost={"icehockey_nhl:player_shots_on_goal": 1.25}, round_stakes=0)
+        [b] = find_evs([self.game({"B": 2.20})], Config(min_ev_pct=3), NOW)
+        sog = replace(b, sport_key="icehockey_nhl", market="player_shots_on_goal_alternate", stake=20.0)
+        pts = replace(b, sport_key="icehockey_nhl", market="player_points", stake=20.0)
+        a = EVAlerter(cfg, True)
+        out = _arbbot.tune_bets([sog, pts], cfg, _arbbot.Tuning(), (a,))
+        self.assertEqual([x.stake for x in out], [25.0, 20.0])
+        self.assertIn("Shots on Goal has a proven record", out[0].tune_note)
+        big = _arbbot.tune_bets([replace(sog, stake=29.0)], cfg, _arbbot.Tuning(), (a,))
+        self.assertEqual(big[0].stake, cfg.ev_bankroll * cfg.ev_max_stake_pct / 100)       # capped at the max
+
+    def test_the_timing_report_splits_bets_by_how_early_they_went_out(self):
+        from unittest import mock
+        def row(hours_before, beat, player="X", src="Pinnacle", sport="NHL", bid="b"):
+            start = datetime(2026, 10, 10, 23, 0, tzinfo=timezone.utc)
+            return {"first_seen": _arbbot._utc((start - timedelta(hours=hours_before)).timestamp()),
+                    "commence_time": "2026-10-10T23:00:00Z", "player": player, "sport": sport, "fair_from": src,
+                    "kind": "ev", "clv_pct": 5.0 if beat else -3.0, "beat_close": beat, "event_id": bid,
+                    "market": "player_points", "outcome": "Over", "point": "0.5"}
+        rows = [row(0.5, False), row(0.5, False), row(5, True), row(5, True), row(30, True, player="", src="consensus of X")]
+        with mock.patch("arbbot.clv_rows", return_value=rows), mock.patch("arbbot._graded", return_value=[]):
+            text = _arbbot.timing_report(Config())
+        self.assertIn("5 bets", text)
+        self.assertRegex(text, r"under 1 hour\s+2\s+0%")
+        self.assertRegex(text, r"3-8 hours\s+2\s+100%")
+        self.assertIn("== Props by fair price source", text)
+        with mock.patch("arbbot.clv_rows", return_value=[]):
+            self.assertEqual(_arbbot.timing_report(Config()), "No bets with a closing line yet.")
+
     def test_one_sports_props_can_need_more_edge(self):
         cfg = Config(min_ev_pct=4, prop_min_ev_pct=7, prop_sport_min_ev={"americanfootball_nfl": 10.0})
         props = cfg.for_props()

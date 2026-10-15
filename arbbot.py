@@ -585,6 +585,9 @@ class Config:
     # PROP_SPORT_MIN_EV=americanfootball_nfl=10: a higher edge bar for one sport's player props only (its game lines
     # keep SPORT_MIN_EV / MIN_EV_PCT). Empty = every sport's props use PROP_MIN_EV_PCT.
     prop_sport_min_ev: dict[str, float] = field(default_factory=dict)
+    # STAKE_BOOST=icehockey_nhl:player_shots_on_goal=1.25: stake multiplier for a sport's bet type with a proven record
+    # (alternate lines count as the same bet type). Capped at the usual maximum stake.
+    stake_boost: dict[str, float] = field(default_factory=dict)
     move_window_minutes: int = 60         # how far back to look for sharp line movement
     confidence_stakes: str = "1,0.75,0.5"  # stake multiplier for high, medium, low
     unit_size: float = 0            # dollars per unit (1u) on bet cards; 0 = EV_BANKROLL / 100 (100u = the bankroll)
@@ -854,6 +857,7 @@ class Config:
             sport_min_ev={**d.sport_min_ev, **pairs("SPORT_MIN_EV", float)},
             book_extra_edge={book_slug(k): v for k, v in pairs("BOOK_EXTRA_EDGE", float).items()},
             prop_sport_min_ev=pairs("PROP_SPORT_MIN_EV", float),
+            stake_boost=pairs("STAKE_BOOST", float),
             move_window_minutes=num("MOVE_WINDOW_MINUTES", d.move_window_minutes, int),
             confidence_stakes=(e("CONFIDENCE_STAKES") or d.confidence_stakes).replace(";", ","),
             unit_size=num("UNIT_SIZE", d.unit_size, float),
@@ -8657,6 +8661,54 @@ def _market_group(row: dict) -> str:
     return {"h2h": "Moneylines", "spreads": "Spreads", "totals": "Totals"}.get(row["market"], row["market"])
 
 
+TIMING_BUCKETS = ((1, "under 1 hour"), (3, "1-3 hours"), (8, "3-8 hours"), (24, "8-24 hours"), (1e9, "over a day"))
+
+
+def timing_report(cfg: Config) -> str:
+    """--timing: whether bets alerted earlier or later before the game beat the closing line more often (and made
+    more), overall, for props and game lines, by sport, and by where the fair price came from."""
+    rows = clv_rows(cfg)
+    if not rows:
+        return "No bets with a closing line yet."
+    unit = cfg.unit() or 1.0
+    graded = {_bet_id(r): r for r in _graded(cfg)}
+
+    def hours(r):
+        return (_parse_time(r["commence_time"]) - _parse_time(r["first_seen"])).total_seconds() / 3600
+
+    def table(title, rs, key):
+        if not rs:
+            return []
+        groups: dict[str, list] = {}
+        for r in rs:
+            groups.setdefault(key(r), []).append(r)
+        lines = [f"== {title}", f"  {'':<16}{'bets':>5}{'beat':>6}{'CLV':>7}{'units':>8}"]
+        for name, g in groups.items():
+            beat = sum(r["beat_close"] for r in g) / len(g) * 100
+            med = statistics.median(r["clv_pct"] for r in g)
+            units_ = sum(float(graded[_bet_id(r)]["profit"]) for r in g if _bet_id(r) in graded) / unit
+            lines.append(f"  {name[:16]:<16}{len(g):>5}{beat:>5.0f}%{med:>+6.1f}%{units_:>+8.1f}")
+        return lines
+
+    def bucket(r):
+        h = hours(r)
+        return next(label for top, label in TIMING_BUCKETS if h < top)
+    order = {label: i for i, (_, label) in enumerate(TIMING_BUCKETS)}
+    rows = [r for r in rows if r.get("first_seen") and r.get("commence_time")]
+    rows.sort(key=lambda r: order[bucket(r)])
+    props = [r for r in rows if r.get("player")]
+    out = [f"Alerted how long before the game (beat = % beat the close, CLV = median, units = graded profit). {len(rows)} bets."]
+    out += table("All bets", rows, bucket)
+    out += table("Player props", props, bucket)
+    out += table("Game lines & halves", [r for r in rows if not r.get("player")], bucket)
+    for sport in sorted({r.get("sport", "") for r in props}):
+        sp = [r for r in props if r.get("sport") == sport]
+        if len(sp) >= 20:
+            out += table(f"{sport} props", sp, bucket)
+    out += table("Props by fair price source", props, _fair_group)
+    return "\n".join(out)
+
+
 def _fair_group(row: dict) -> str:
     """Where a logged bet's fair price came from (fair_from): the sharp book, the other books' median
     (+EV props it doesn't price), or the outlier median. Bets logged before fair_from: "Unknown"."""
@@ -11051,7 +11103,7 @@ def tune_bets(bets: list, cfg: Config, tuning: Tuning, alerters: tuple) -> list:
     """TUNE_ENABLED: new bets (no card up in these alerters) from a book whose price is usually gone by the next
     check need TUNE_SLOW_EXTRA_PCT more edge (the others are held back, counted as "tuned out"), and each new bet's
     stake follows its book's and sport's CLV. Bets with a card up go through unchanged."""
-    if not cfg.tune_enabled and not cfg.book_extra_edge:
+    if not cfg.tune_enabled and not cfg.book_extra_edge and not cfg.stake_boost:
         return bets
     up = {k for a in alerters for k in (*a.open, *a.restored)}
     out = []
@@ -11074,6 +11126,14 @@ def tune_bets(bets: list, cfg: Config, tuning: Tuning, alerters: tuple) -> list:
                 cap = min(cap, b.stake)
             b.stake = round_stake(b.stake * mult, cap, cfg)
             b.tune_note = f"Stake ×{mult:g}: {note}"
+        boost = cfg.stake_boost.get(f"{b.sport_key}:{b.market.removesuffix('_alternate')}", 1.0)   # (STAKE_BOOST)
+        if boost != 1.0 and b.stake:
+            cap = cfg.ev_bankroll * cfg.ev_max_stake_pct / 100
+            if b.kalshi_room:
+                cap = min(cap, b.stake)
+            b.stake = round_stake(b.stake * boost, cap, cfg)
+            note = f"Stake ×{boost:g}: {bet_type_name(b.market)} has a proven record (STAKE_BOOST)"
+            b.tune_note = f"{b.tune_note}\n📊 {note}" if b.tune_note else note
         out.append(b)
     return out
 
@@ -12334,6 +12394,8 @@ def main() -> None:
     p.add_argument("--results", nargs="?", const="today", metavar="DAY",
                    help="grade finished alerts and list a day's bets with what hit (today, yesterday or "
                         "YYYY-MM-DD), plus the records (2 credits per sport with finished games)")
+    p.add_argument("--timing", action="store_true",
+                   help="how beating the closing line depends on how long before the game a bet was alerted")
     p.add_argument("--weekly", action="store_true",
                    help="print the weekly report card for the last 7 days, with suggestions (free, no credits)")
     p.add_argument("--post-weekly", action="store_true",
@@ -12387,7 +12449,7 @@ def main() -> None:
                     if u.startswith("https://")), "")   # a placeholder status URL falls back, like Status
         interactive = (args.dry_run, args.demo, args.once, args.plan, args.results, args.test_discord,
                        args.post_guide, args.post_results, args.check_kalshi, args.check_props, args.check_upcoming,
-                       args.weekly, args.post_weekly, args.test_dk_links, args.post_join is not None)
+                       args.weekly, args.post_weekly, args.test_dk_links, args.post_join is not None, args.timing)
         if url.startswith("https://") and not any(interactive):   # the service: say why it stopped
             try:
                 _webhook(url, {"username": BOT_NAME, "content": f"🔴 Bot stopped: bad setting in .env: {ex}. "
@@ -12405,6 +12467,10 @@ def main() -> None:
 
     if args.weekly or args.post_weekly:
         weekly_command(cfg, args)
+        return
+
+    if args.timing:
+        print(timing_report(cfg))
         return
 
     if args.post_join is not None:
