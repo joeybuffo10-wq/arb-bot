@@ -4785,8 +4785,8 @@ def extra_lines(b: EVBet) -> str:
     if b.sharp_move is not None and b.sharp_move >= SHARP_MOVE_POINTS:
         lines.append(f"🔥 **Sharp money:** {b.sharp_name or 'Pinnacle'} moved toward it "
                      f"(+{b.sharp_move:.1f}% win chance this hour)")
-    prices = {bk: pr for bk, pr, *_ in b.board}
-    others = [f"{bk} {odds(prices[bk])}" for bk in COMPARE_BOOKS if bk != b.book and bk in prices]
+    prices = {bk: (pr, link) for bk, pr, _, link, *_ in b.board}
+    others = [_link(f"{bk} {odds(prices[bk][0])}", prices[bk][1]) for bk in COMPARE_BOOKS if bk != b.book and bk in prices]
     if others:
         lines.append("📚 " + " · ".join(others))
     return "\n".join(lines)

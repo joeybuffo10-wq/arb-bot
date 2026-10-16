@@ -698,6 +698,9 @@ class PlusEV(unittest.TestCase):
         self.assertTrue(card.endswith("📚 FanDuel -105 · DraftKings +100"), card)          # (no Kalshi: not listed)
         self.assertIn("📚 FanDuel -105 · Kalshi +110",
                       ev_payload(replace(b, book="DraftKings", board=board + [("Kalshi", 2.1, 0, "", True)]))["embeds"][0]["description"])
+        linked = [("FanDuel", 1.95, 0, "https://sportsbook.fanduel.com/addToBetslip?marketId=1&selectionId=2", True)]
+        self.assertIn("📚 [FanDuel -105](https://sportsbook.fanduel.com/addToBetslip?marketId=1&selectionId=2)",
+                      ev_payload(replace(b, board=linked))["embeds"][0]["description"])     # tap: the bet at that book
         self.assertNotIn("⬇️", ev_payload(replace(b, price=1.52))["embeds"][0]["description"])   # no room to drop
         for gone in ("DO THIS", "won't win every time", "+EV = better price", "Can't use that book",
                      "skip if the price", "other books mostly agree"):
