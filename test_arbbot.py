@@ -13622,6 +13622,32 @@ class EVBotSpec(MixFiles):
         op = next(op for op in t.evs.open.values() if op.sample)
         self.assertEqual(op.sample, "f1")
 
+    def test_mybets_is_a_members_own_record(self):
+        from unittest import mock
+        now = datetime(2026, 10, 16, 12, 0, tzinfo=timezone.utc)
+        def row(i, result, profit, days_ago=1, market="player_points", price="2.0"):
+            return {"id": i, "result": result, "profit": str(profit), "price": price, "market": market,
+                    "commence_time": (now - timedelta(days=days_ago)).isoformat(), "player": "" if market == "parlay" else "P",
+                    "outcome": "Over", "point": "0.5", "kind": "parlay" if market == "parlay" else "ev"}
+        rows = [row("a", "win", 20), row("b", "loss", -10), row("c", "win", 40, market="parlay", price="5.0"),
+                row("d", "loss", -20, days_ago=10), row("x", "win", 99)]                       # x: not theirs
+        taken = {k: {"users": {"u1": "Joey"}} for k in ("a", "b", "c", "d", "e")}            # e: not graded yet
+        taken["x"] = {"users": {"u2": "Sam"}}
+        with mock.patch("arbbot.read_taken", return_value=taken), mock.patch("arbbot._graded", return_value=rows), \
+                mock.patch("arbbot.clv_rows", return_value=[{"id": "a", "beat_close": True}, {"id": "b", "beat_close": False}]), \
+                mock.patch("arbbot.row_bet_id", side_effect=lambda r: r["id"]), \
+                mock.patch("arbbot._bet_id", side_effect=lambda r: r["id"]), \
+                mock.patch("arbbot.row_pick", side_effect=lambda r: "Pick " + r["id"]):
+            text = _arbbot.mybets_text(Config(unit_size=10), "u1", 25.0, now)
+            none = _arbbot.mybets_text(Config(unit_size=10), "u9", None, now)
+        self.assertIn("**All time:** 4 bets · 2-2 · **+3.0u** (+$75 at your $25 unit) · 50% beat the close", text)
+        self.assertIn("**Last 7 days:** 3 bets · 2-1 · **+5.0u**", text)
+        self.assertIn("Singles: 3 bets · 1-2 · **-1.0u**", text)
+        self.assertIn("Parlays: 1 bet · 1-0 · **+4.0u**", text)
+        self.assertIn("Still to be graded: 1", text)
+        self.assertNotIn("99", text)
+        self.assertIn("haven't tapped ✅", none)
+
     def test_tracking_is_off_without_a_token_or_in_a_test_run(self):
         sent = []
         t = self.live(sent)

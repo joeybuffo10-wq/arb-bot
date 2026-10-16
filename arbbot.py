@@ -8592,6 +8592,54 @@ def post_join(cfg: Config, channel: str = "") -> str:
         return "Posted it. Pin it by hand (hover → ⋯ → Pin Message): the bot can't pin there."
 
 
+MYBETS_CMD = re.compile(r"^\s*(?:<@!?\d+>\s*)?!my\s?bets\b", re.I)
+
+
+def mybets_text(cfg: Config, uid: str, my_unit: float | None = None, now: datetime | None = None) -> str:
+    """"!mybets": one member's own record, from the bets they ✅'d (state/taken_bets.json) and how those were graded:
+    all time, the last 7 days, singles and parlays apart, beating the close, best hits, and what's still to grade.
+    Units at each card's stake; dollars at their own unit (!unit) when they set one."""
+    now = now or datetime.now(timezone.utc)
+    taken = {bid for bid, e in read_taken(cfg).items() if uid in e.get("users", {})}
+    if not taken:
+        return ("📒 You haven't tapped ✅ on any bets yet. Tap ✅ under each alert you place, then type `!mybets` after "
+                "the games to see your own record.")
+    unit = cfg.unit() or 1.0
+    rows = [r for r in _graded(cfg) if row_bet_id(r) in taken]
+    clv = {_bet_id(r): r for r in clv_rows(cfg)}
+    waiting = len(taken - {row_bet_id(r) for r in rows})
+
+    def line(rs: list[dict]) -> str:
+        w = sum(r["result"] == "win" for r in rs)
+        l = sum(r["result"] == "loss" for r in rs)
+        p = len(rs) - w - l
+        u = sum(float(r["profit"]) for r in rs) / unit
+        c = [clv[_bet_id(r)]["beat_close"] for r in rs if _bet_id(r) in clv]
+        out = f"{len(rs)} bet{'s' if len(rs) != 1 else ''} · {w}-{l}" + (f"-{p}" if p else "") + f" · **{u:+.1f}u**"
+        if my_unit:
+            out += f" ({'+' if u >= 0 else '−'}{money(abs(u) * my_unit)} at your {money(my_unit)} unit)"
+        return out + (f" · {sum(c) / len(c) * 100:.0f}% beat the close" if c else "")
+    if not rows:
+        return f"📒 You've ✅'d {len(taken)} bet{'s' if len(taken) != 1 else ''}; none graded yet. Check back after the games."
+    week = [r for r in rows if _parse_time(r["commence_time"]) >= now - timedelta(days=7)]
+    singles = [r for r in rows if _kind(r) != "parlay" and r.get("market") != "parlay"]
+    parlays = [r for r in rows if r not in singles]
+    best = sorted((r for r in rows if r["result"] == "win"), key=lambda r: -float(r["profit"]))[:3]
+    out = ["📒 **Your record** (the bets you tapped ✅ on)", f"**All time:** {line(rows)}"]
+    if week and len(week) < len(rows):
+        out.append(f"**Last 7 days:** {line(week)}")
+    if singles and parlays:
+        out += [f"Singles: {line(singles)}", f"Parlays: {line(parlays)}"]
+    if best:
+        out.append("Best hits: " + " · ".join(f"{row_pick(r) if _kind(r) != 'parlay' else 'parlay'} "
+                                              f"{odds(float(r['price']))} ({float(r['profit']) / unit:+.1f}u)" for r in best))
+    if waiting:
+        out.append(f"Still to be graded: {waiting}")
+    out.append("_Units at each card's stake and odds: if you got a different price or bet a different amount, "
+               "your real result differs a little. Keep tapping ✅ on every bet you place._")
+    return "\n".join(out)[:1990]
+
+
 def members_lines(cfg: Config, rows: list[dict], top: int = 3) -> str:
     """The results card's ✅ part for these bets: how many members took, their record at the card's stake in
     units, and the top three ("" when nobody ✅'d any of them)."""
@@ -11517,6 +11565,11 @@ class Trackers:
 
     def command(self, uid: str, text: str) -> str | None:
         """Other "!" commands in the unit channel: !boost (the best bets for a profit boost, by DM), then !refer."""
+        if MYBETS_CMD.match(text or ""):
+            mine = self.reactions.read_units()["units"].get(uid) if self.reactions.units_on else None
+            if self.reactions.dm(uid, mybets_text(self.cfg, uid, mine)):
+                return "📬 Sent you your record by DM."
+            return mybets_text(self.cfg, uid, mine)
         reply = boost_reply(self.cfg, self.boost_pool, text)
         if reply is not None:
             if reply.startswith("🚀") and self.reactions.dm(uid, reply):
