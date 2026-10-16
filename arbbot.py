@@ -11390,6 +11390,36 @@ def _key_group(cfg: Config, key: str) -> tuple | None:
     return same_group(cfg, parts[1], parts[2], line)
 
 
+def _line_sig(key: str) -> tuple[tuple, str] | None:
+    """((game, market, line), side) of an alert key ("ev|game|market|line|outcome"): both sides of one line share it
+    (Flames +1.5 and Golden Knights -1.5, Over and Under 220.5, a player's Over and Under 3.5). None for anything else."""
+    parts = key.split("|", 4)
+    if len(parts) < 5 or parts[0] != "ev":
+        return None
+    return (parts[1], parts[2].removesuffix("_alternate"), parts[3]), parts[4]
+
+
+def one_side(bets: list, t: "Trackers", alerters: tuple) -> list:
+    """Never both sides of one line: once a side has gone out (a card up, or alerted earlier: ONE_ALERT_PER_BET's
+    memory), the other side isn't alerted, whatever book or time (the two would mostly cancel out). In one check,
+    the better edge goes. What's held back is counted as "other side"."""
+    every = (t.evs, t.outs, t.prop_evs, t.prop_outs, t.period_evs, t.period_outs)
+    out_on: dict[tuple, set[str]] = {}
+    for key in {*t.alerted.until, *(k for a in every for k in (*a.open, *a.restored))}:
+        if (sig := _line_sig(key)) is not None:
+            out_on.setdefault(sig[0], set()).add(sig[1])
+    keep = []
+    for b in sorted(bets, key=lambda b: -b.ev_pct):
+        sig = _line_sig(b.key)
+        if sig and out_on.get(sig[0], set()) - {sig[1]}:
+            alerters[0].held_counts["other side"] = alerters[0].held_counts.get("other side", 0) + 1
+            continue
+        if sig:
+            out_on.setdefault(sig[0], set()).add(sig[1])
+        keep.append(b)
+    return keep
+
+
 def same_game(bets: list, cfg: Config, t: "Trackers", alerters: tuple) -> list:
     """The same-game limit: bets that win and lose together are sized down and capped. A game's lines (and, with
     SAME_PLAYER_* set, each player's props on their own) count together: the first SAME_GAME_FULL (SAME_PLAYER_FULL)
@@ -11613,7 +11643,8 @@ HELD_LABELS = {"waiting": "live, waiting for another check", "unconfirmed": "liv
                "not sent": "Discord didn't take it (tried again next check)",
                "alerted before": "alerted once already (ONE_ALERT_PER_BET)",
                "tuned out": "edge too small for a book whose price is usually gone (TUNE_ENABLED)",
-               "same game": "already enough alerts on that game (SAME_GAME_MAX)"}
+               "same game": "already enough alerts on that game (SAME_GAME_MAX)",
+               "other side": "the other side of that line already went out"}
 
 
 def take_held(*alerters: Alerter) -> dict[str, int]:
@@ -11672,7 +11703,7 @@ def scan_main(t: Trackers, events: list[dict], checked_sports: list[str], now: d
     t.candidates.extend(rejects, at.timestamp())
     outs = tune_bets(outs, cfg, t.tuned(), (t.outs, t.evs))
     evs = tune_bets(evs, cfg, t.tuned(), (t.evs, t.outs))
-    kept_keys = {b.key for b in same_game(outs + evs, cfg, t, (t.evs, t.outs))}
+    kept_keys = {b.key for b in same_game(one_side(outs + evs, t, (t.evs, t.outs)), cfg, t, (t.evs, t.outs))}
     outs, evs = [b for b in outs if b.key in kept_keys], [b for b in evs if b.key in kept_keys]
     hand_over(evs, outs, t.evs, t.outs, at.timestamp())
     kept = {id(b) for b in t.screen(t.bet_live, outs + evs, scope, at.timestamp(), (t.outs, t.evs))}
@@ -11720,7 +11751,8 @@ def scan_props(t: Trackers, prop_events: list[dict], checked: set[str], now: dat
     t.prop_prices.prune(at)
     p_outs = tune_bets(p_outs, cfg, t.tuned(), (t.prop_outs, t.prop_evs))
     p_evs = tune_bets(p_evs, t.prop_cfg, t.tuned(), (t.prop_evs, t.prop_outs))
-    kept_keys = {b.key for b in same_game(p_outs + p_evs, cfg, t, (t.prop_evs, t.prop_outs))}
+    kept_keys = {b.key for b in same_game(one_side(p_outs + p_evs, t, (t.prop_evs, t.prop_outs)), cfg, t,
+                                          (t.prop_evs, t.prop_outs))}
     p_outs, p_evs = [b for b in p_outs if b.key in kept_keys], [b for b in p_evs if b.key in kept_keys]
     hand_over(p_evs, p_outs, t.prop_evs, t.prop_outs, ts)
     note_related([(p_outs, t.prop_outs, checked), (p_evs, t.prop_evs, checked),
@@ -11807,7 +11839,8 @@ def scan_periods(t: Trackers, events: list[dict], checked: set[str], now: dateti
     t.candidates.extend(rejects, ts)
     outs = tune_bets(outs, cfg, t.tuned(), (t.period_outs, t.period_evs))
     evs = tune_bets(evs, cfg, t.tuned(), (t.period_evs, t.period_outs))
-    kept = {b.key for b in same_game(outs + evs, cfg, t, (t.period_evs, t.period_outs))}
+    kept = {b.key for b in same_game(one_side(outs + evs, t, (t.period_evs, t.period_outs)), cfg, t,
+                                     (t.period_evs, t.period_outs))}
     outs, evs = [b for b in outs if b.key in kept], [b for b in evs if b.key in kept]
     hand_over(evs, outs, t.period_evs, t.period_outs, ts)
     fetched = fetched_at(events)

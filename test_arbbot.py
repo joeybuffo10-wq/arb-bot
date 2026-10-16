@@ -5335,8 +5335,8 @@ class LiveAlertsHoldUp(MixFiles):
         check(120, True)                                                          # Away waits for its 2nd check
         self.assertEqual(home.arb.related, [])
         check(180, True)
-        self.assertEqual(home.arb.related, ["Away ML"])
-        self.assertEqual(len(t.outs.open), 2)
+        self.assertEqual(home.arb.related, [])                                    # Oct 16: the other side of a line
+        self.assertEqual(len(t.outs.open), 1)                                     # that's out is never alerted
 
     def test_test_discord_sends_an_arb_in_locks_mode(self):
         import os, contextlib, io, sys
@@ -13920,6 +13920,22 @@ class EVBotSpec(MixFiles):
                          [20.0, 20.0, 20.0, 20.0])
         alt = [prop("Kwan"), prop("Lowe", market="batter_hits_alternate"), prop("Vilade", market="batter_hits_alternate")]
         self.assertEqual(len(_arbbot.same_game(alt, t.cfg, t, (t.prop_evs, t.prop_outs))), 2)   # alternates count too
+
+    def test_never_both_sides_of_one_line(self):
+        sent = []
+        t = self.live(sent, one_alert_per_bet=True)
+        [base] = find_evs([self.game({"B": 2.20})], t.cfg, NOW)
+        spread = lambda side, pt, ev, book="B": replace(base, market="spreads", line=-1.5, outcome=side, point=pt,
+                                                    stake=10.0, price=1.0 + ev / 50, book=book)
+        flames, vegas = spread("Away", 1.5, 6), spread("Home", -1.5, 9, book="C")    # both +EV at different books
+        kept = _arbbot.one_side([flames, vegas], t, (t.evs, t.outs))
+        self.assertEqual([b.outcome for b in kept], ["Home"])                          # the better edge only
+        t.alerted.add(flames.key, time.time() + 3600, time.time())                     # Flames went out earlier...
+        self.assertEqual(_arbbot.one_side([vegas], t, (t.evs, t.outs)), [])            # ...so Vegas never does
+        self.assertEqual(len(_arbbot.one_side([flames], t, (t.evs, t.outs))), 1)       # (the same side is fine)
+        over = replace(base, market="player_points", line=("LeBron", 25.5), outcome="Over", point=25.5)
+        under = replace(over, outcome="Under")
+        self.assertEqual(len(_arbbot.one_side([over, under], t, (t.prop_evs, t.prop_outs))), 1)
 
     def test_props_are_limited_per_player_not_per_game(self):
         sent = []
