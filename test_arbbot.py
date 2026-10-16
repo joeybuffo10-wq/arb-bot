@@ -3177,7 +3177,17 @@ class LeagueStatsSites(unittest.TestCase):
         self.assertEqual(grade_prop(self.row("Clayton Keller", "player_shots_on_goal", "5.5"))[1], "6")
         self.assertEqual(grade_prop(self.row("Elvis Merzlikins", "player_total_saves", "27.5"))[1], "28")
         self.assertEqual(grade_prop(self.row("Karel Vejmelka", "player_total_saves", "30.5"))[1], "31")
-        self.espn.assert_not_called()
+        # (ESPN is only asked as a second opinion: it doesn't have these, so NHL.com's grade stands.)
+
+    def test_when_the_two_box_scores_disagree_it_waits_for_a_person(self):
+        from arbbot import grade_prop
+        from unittest import mock
+        with mock.patch("arbbot._espn_stat", return_value=0.0):          # ESPN: no assist; NHL.com: 1
+            res, why = grade_prop(self.row("Kent Johnson", "player_assists", "0.5"))
+        self.assertIsNone(res)
+        self.assertIn("box scores disagree (1; ESPN 0)", why)
+        with mock.patch("arbbot._espn_stat", return_value=2.0):          # a different number, the same result
+            self.assertEqual(grade_prop(self.row("Kent Johnson", "player_assists", "0.5"))[0], ("win", 10.0))
 
     def test_without_full_names_nobody_is_guessed(self):
         from arbbot import grade_prop
@@ -3341,6 +3351,17 @@ class ConsensusStake(unittest.TestCase):
         same = find_evs([ev], replace(cfg, consensus_stake=1.0), NOW)[0]
         self.assertEqual(same.stake, full)
 
+
+    def test_prop_outliers_can_bet_less_overall(self):
+        books = {"DK": (1.90, 1.92), "FD": (1.91, 1.91), "MGM": (1.89, 1.93), "BetOnline": (1.92, 1.90),
+                 "Pinnacle": (1.91, 1.91), "Stale": (2.60, 1.45)}
+        ev = prop_event(books)
+        ev["bookmakers"][4]["key"] = "pinnacle"
+        full = Config(round_stakes=0)
+        [o] = find_outliers([ev], full, NOW)
+        [small] = find_outliers([ev], replace(full, outlier_prop_stake=0.6), NOW)
+        self.assertAlmostEqual(small.stake, round(o.stake * 0.6, 2), places=2)
+        self.assertIn("prop outlier: stake 40% smaller (OUTLIER_PROP_STAKE)", small.confidence_notes)
 
     def test_prop_outliers_without_pinnacle_bet_less_too(self):
         books = {"DK": (1.90, 1.92), "FD": (1.91, 1.91), "MGM": (1.89, 1.93), "BetOnline": (1.92, 1.90),

@@ -568,6 +568,9 @@ class Config:
     single_source_stake: float = 0.5  # stake multiplier when only 1 of several sharps priced it
     one_source_stake: float = 1.0     # ...and when the one sharp listed priced it alone (no Kalshi in it; 1 = full)
     consensus_stake: float = 0.7      # stake multiplier when no sharp priced it (props: median of 4+ books)
+    # Stake multiplier for prop OUTLIERS (judged against the other books' median: they beat the close less often than
+    # props priced off Pinnacle). 1 = no change.
+    outlier_prop_stake: float = 1.0
     kalshi_check: bool = True         # cross-check moneylines against Kalshi's own (free) exchange prices
     kalshi_max_gap: float = 3.0       # skip a +EV bet when Kalshi's win chance differs by more (points; see kalshi_gap_limit)
     kalshi_max_spread: float = 3.0    # trust a Kalshi price only if its bid-ask spread is at most this (cents; college +2)
@@ -863,6 +866,7 @@ class Config:
             single_source_stake=num("SINGLE_SOURCE_STAKE", d.single_source_stake, float),
             one_source_stake=num("ONE_SOURCE_STAKE", d.one_source_stake, float),
             consensus_stake=num("CONSENSUS_STAKE", d.consensus_stake, float),
+            outlier_prop_stake=num("OUTLIER_PROP_STAKE", d.outlier_prop_stake, float),
             kalshi_check=e("KALSHI_CHECK", "true").lower() in ("1", "true", "yes"),
             kalshi_max_gap=num("KALSHI_MAX_GAP", d.kalshi_max_gap, float),
             kalshi_max_spread=num("KALSHI_MAX_SPREAD", d.kalshi_max_spread, float),
@@ -5801,6 +5805,10 @@ def find_outliers(events: list[dict], cfg: Config, now: datetime | None = None,
                         bet.stake = kelly_stake(fair_p, price, cfg, cfg.consensus_stake)
                         bet.confidence_notes.append(f"no {_csv(cfg.sharp_books)[0].title()} price: stake "
                                                     f"{round((1 - cfg.consensus_stake) * 100)}% smaller")
+                    if is_prop(k[1]) and 0 < cfg.outlier_prop_stake < 1 and bet.stake:
+                        bet.stake = round_stake(bet.stake * cfg.outlier_prop_stake, bet.stake, cfg)
+                        bet.confidence_notes.append(f"prop outlier: stake {round((1 - cfg.outlier_prop_stake) * 100)}% "
+                                                    "smaller (OUTLIER_PROP_STAKE)")
                     if bk == "kalshi":
                         cap_to_kalshi(bet, kq, cfg)
                     # The board shows every book you have; parlays stick to EV_BOOKS like +EV bets.
@@ -7162,11 +7170,13 @@ def _espn_box(sport_key: str, home: str, away: str, commence: str) -> tuple[str 
     return f"espn:{eid}", parse_box(_espn(f"{league}/summary?event={eid}", ttl=300))
 
 
-def game_box(sport_key: str, home: str, away: str, commence: str) -> tuple[dict | None, str]:
+def game_box(sport_key: str, home: str, away: str, commence: str, only: str = "") -> tuple[dict | None, str]:
     """(box score, "") once the game is final and the box passed its checks, else (None, why).
-    Tries the league's own stats site first (NHL, MLB), then ESPN."""
+    Tries the league's own stats site first (NHL, MLB), then ESPN (only: just that source)."""
     why = []
     for name, source in BOX_SOURCES.get(sport_key, []) + [("ESPN", _espn_box)]:
+        if only and name != only:
+            continue
         try:
             gid, box = source(sport_key, home, away, commence)
         except Exception as e:  # noqa: BLE001 - a source that's down or refuses: try the next one
@@ -7335,7 +7345,21 @@ def grade_prop(row: dict) -> tuple[tuple[str, float], str] | tuple[None, str]:
                        for t in box["teams"].values() for q in t["players"].values() if not q["dnp"])
         if box.get("touchdowns") is None or credited < box["touchdowns"]:
             return None, "not every touchdown in this game is in the box score"
-    return settle_prop(row, value), f"{value:g}"
+    result = settle_prop(row, value)
+    if row["sport_key"] in BOX_SOURCES and (other := _espn_stat(row)) is not None and settle_prop(row, other)[0] != result[0]:
+        # The league's site and ESPN would grade it differently: left for a person to check (🎯), never guessed.
+        return None, f"box scores disagree ({value:g}; ESPN {other:g}): check it by hand"
+    return result, f"{value:g}"
+
+
+def _espn_stat(row: dict) -> float | None:
+    """ESPN's number for a prop's player and stat, as a second opinion (None if ESPN doesn't have it)."""
+    try:
+        box, _ = game_box(row["sport_key"], row["home_team"], row["away_team"], row["commence_time"], only="ESPN")
+    except Exception:  # noqa: BLE001 - no second opinion then
+        return None
+    p = find_player(box, row["player"]) if box else None
+    return None if p is None or p["dnp"] else _read_stat(p, row["market"], row["sport_key"])
 
 
 # --------------------------------------------------------------------------- results by day
