@@ -2864,7 +2864,7 @@ class Alerter:
         confidence, related alerts...) edits it. Not the other books' prices or the sharp move (➕ / 🔥): those
         lines are as they were when the card went out, and their changing alone doesn't edit it."""
         if hasattr(item, "also"):
-            item = replace(item, also=[], sharp_move=None)
+            item = replace(item, also=[], sharp_move=None, board=[])
         emb = {k: v for k, v in self.payload(item, first_seen=first_seen)["embeds"][0].items() if k != "timestamp"}
         return hashlib.sha1(json.dumps(emb, sort_keys=True).encode()).hexdigest()[:16]
 
@@ -4769,11 +4769,13 @@ def fair_value_line(fair_prob: float) -> str:
 
 
 SHARP_MOVE_POINTS = 2.0   # 🔥 Sharp money: the sharp price moved this many win-% points toward the bet in the last hour
+COMPARE_BOOKS = ("FanDuel", "DraftKings", "Kalshi")   # the card's 📚 line: the same bet's odds at these books
 
 
 def extra_lines(b: EVBet) -> str:
     """The card's lines under the fair value: how far the price can drop and still be worth it, the other books
-    where it's good too (best 2), and 🔥 when the sharp price has been moving toward it."""
+    where it's good too (best 2), 🔥 when the sharp price has been moving toward it, and 📚 the same bet's odds at
+    FanDuel, DraftKings and Kalshi (the ones that list it, not the card's own book)."""
     lines = []
     worst = b.worst_ok_price()
     if _printed(worst) < _printed(b.price):
@@ -4783,6 +4785,10 @@ def extra_lines(b: EVBet) -> str:
     if b.sharp_move is not None and b.sharp_move >= SHARP_MOVE_POINTS:
         lines.append(f"🔥 **Sharp money:** {b.sharp_name or 'Pinnacle'} moved toward it "
                      f"(+{b.sharp_move:.1f}% win chance this hour)")
+    prices = {bk: pr for bk, pr, *_ in b.board}
+    others = [f"{bk} {odds(prices[bk])}" for bk in COMPARE_BOOKS if bk != b.book and bk in prices]
+    if others:
+        lines.append("📚 " + " · ".join(others))
     return "\n".join(lines)
 
 

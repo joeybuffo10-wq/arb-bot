@@ -692,6 +692,12 @@ class PlusEV(unittest.TestCase):
         self.assertTrue(more.endswith("⬇️ Good down to **+103**\n➕ Also good: D +108 · C +104\n"
                                       "🔥 **Sharp money:** Pinnacle moved toward it (+2.5% win chance this hour)"), more)
         self.assertNotIn("🔥", ev_payload(replace(b, sharp_move=1.5))["embeds"][0]["description"])   # under 2 points
+        board = [("DraftKings", 2.0, 0, "", True), ("FanDuel", 1.95, 0, "", True), ("BetMGM", 2.1, 0, "", True),
+                 ("B", 2.1, 5, "", True)]
+        card = ev_payload(replace(b, board=board))["embeds"][0]["description"]
+        self.assertTrue(card.endswith("📚 FanDuel -105 · DraftKings +100"), card)          # (no Kalshi: not listed)
+        self.assertIn("📚 FanDuel -105 · Kalshi +110",
+                      ev_payload(replace(b, book="DraftKings", board=board + [("Kalshi", 2.1, 0, "", True)]))["embeds"][0]["description"])
         self.assertNotIn("⬇️", ev_payload(replace(b, price=1.52))["embeds"][0]["description"])   # no room to drop
         for gone in ("DO THIS", "won't win every time", "+EV = better price", "Can't use that book",
                      "skip if the price", "other books mostly agree"):
