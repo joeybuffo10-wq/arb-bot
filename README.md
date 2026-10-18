@@ -97,6 +97,10 @@ Arbs, +EV, outliers, parlays and lock-in hedges only ever point to those books, 
 "Every book" list shows only them. The rest of `BOOKMAKERS` still helps: Pinnacle sets the true
 odds and the others confirm the market price for outlier alerts, at no extra cost.
 
+`PAUSED_BOOKS` takes a book out of alerts for now (e.g. `williamhill_us` or `caesars`) without
+touching your record: bets already logged there still count, which dropping it from `MY_BOOKS`
+wouldn't do.
+
 Kalshi (an exchange) charges a fee per trade, so its prices are lowered by that fee before any
 comparison (`KALSHI_FEE_RATE`).
 

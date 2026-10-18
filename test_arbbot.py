@@ -1182,6 +1182,16 @@ class MyBooks(unittest.TestCase):
         [b2] = find_evs([ev], Config(min_ev_pct=3), NOW)      # no MY_BOOKS: best of all
         self.assertEqual(b2.book, "C")
 
+    def test_paused_books_get_no_alerts_but_keep_their_results(self):
+        ev = ev_event([("Home", 1.91, None), ("Away", 1.91, None)],
+                      {"B": [("Home", 2.10, None)], "C": [("Home", 2.15, None)]})
+        [b] = find_evs([ev], Config(min_ev_pct=3, paused_books="c"), NOW)
+        self.assertEqual(b.book, "B")
+        cfg = Config(paused_books="caesars")
+        self.assertFalse(cfg.bettable("williamhill_us"))     # by name or Odds API key
+        self.assertTrue(cfg.bettable("betmgm"))
+        self.assertTrue(cfg.counts("Caesars"))               # past bets still count
+
     def test_outliers_flag_and_hedge_only_my_books(self):
         ev = outlier_event(1.85, 1.95)
         self.assertEqual(find_outliers([ev], Config(my_books="dk,fd"), NOW), [])     # "Stale" isn't yours

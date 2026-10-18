@@ -342,6 +342,9 @@ class Config:
     # Books you actually bet at. Alerts only ever tell you to bet at these; the rest of
     # BOOKMAKERS is used for reference (true odds, market consensus). Empty = all of them.
     my_books: str = ""
+    # Books paused for now: no new alerts send you there, but bets already logged there stay in your results
+    # (dropping a book from MY_BOOKS would take its past bets out too). Odds API key or name: williamhill_us or caesars.
+    paused_books: str = ""
     kalshi_fee_rate: float = 0.07   # Kalshi's trading fee factor (fee = rate x P x (1-P) per $1 contract)
     us_state: str = ""              # two letters (e.g. nj); some books' links need it (sports.{state}.betmgm.com)
     ny_rules: bool = False          # New York: no NY sportsbook on games with a New York college team
@@ -724,6 +727,7 @@ class Config:
             pregame_with_live_every=num("PREGAME_WITH_LIVE_EVERY", d.pregame_with_live_every, int),
             bookmakers=e("BOOKMAKERS", d.bookmakers),
             my_books=e("MY_BOOKS", ""),
+            paused_books=e("PAUSED_BOOKS", ""),
             kalshi_fee_rate=num("KALSHI_FEE_RATE", d.kalshi_fee_rate, float),
             us_state=e("US_STATE", "").strip().lower(),
             ny_rules=(e("NY_RULES") or ("true" if e("US_STATE", "").strip().lower() == "ny" else "false")
@@ -1158,6 +1162,9 @@ class Config:
         """Can alerts tell you to bet at this book (on this game, when given)?"""
         mine = _csv(self.my_books)
         if mine and book_key not in mine:
+            return False
+        if any(_norm(book_key) == _norm(p) or _norm(BOOK_TITLES.get(book_key, "")) == _norm(p)
+               for p in _csv(self.paused_books)):
             return False
         return not (ev is not None and self.ny_rules and book_key in NY_BOOKS and ny_college_game(ev))
 
