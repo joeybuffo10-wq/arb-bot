@@ -1,0 +1,10 @@
+[
+ [
+  "    if (best && best.profit >= 1.5 && s.u >= 0) {   // a big hit leads (only on a winning night)\n      text(x, \"LAST NIGHT'S BIGGEST HIT\", 80, 300, \"800 46px \" + D, C.amber);\n      var y = wrap(x, best.bet, 76, 420, W - 160, 112, fit(x, best.bet, \"900 SIZEpx \" + D, 120, (W - 160) * 2), C.chalk);\n      text(x, best.odds + \" · \" + best.book, 80, y + 10, \"600 48px \" + M, C.chalk2);\n      text(x, units(best.profit), 72, y + 250, \"900 230px \" + D, C.amber);\n",
+  "    if (s.u > 0) {   // a winning night: the full night leads, the biggest hit backs it up\n      text(x, \"LAST NIGHT\", 80, 300, \"800 46px \" + D, C.amber);\n      text(x, units(s.u), 72, 560, \"900 300px \" + D, C.amber);\n      text(x, record(s) + (s.beat === null ? \"\" : \" · \" + s.beat + \"% BEAT THE CLOSE\"), 80, 680, \"600 48px \" + M, C.chalk);\n      if (best) {\n        text(x, \"BIGGEST HIT\", 80, 820, \"800 40px \" + D, C.amber);\n        var y = wrap(x, best.bet, 78, 900, W - 160, 76, fit(x, best.bet, \"900 SIZEpx \" + D, 76, (W - 160) * 2), C.chalk);\n        text(x, best.odds + \" · \" + best.book + \" · \" + units(best.profit), 80, y + 4, \"600 40px \" + M, C.chalk2);\n      }\n"
+ ],
+ [
+  "    var hook = best && best.profit >= 1.5 && s.u >= 0 ? best.bet + \" \" + best.odds + \" cashed ✅ (\" + units(best.profit) + \")\"\n",
+  "    var hook = s.u > 0 ? units(s.u) + \" last night 🐂 \" + record(s) + (best ? \", led by \" + best.bet + \" \" + best.odds + \" ✅\" : \"\")\n"
+ ]
+]
