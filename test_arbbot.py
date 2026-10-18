@@ -866,7 +866,7 @@ class CLV(unittest.TestCase):
         d = Path(self.tmp.name)
         self.cfg = Config(min_ev_pct=3, ev_log_file=str(d / "ev.csv"), ev_results_file=str(d / "res.csv"),
                           outlier_log_file=str(d / "out.csv"), closing_file=str(d / "close.csv"),
-                          markout_file=str(d / "mk.csv"),
+                          markout_file=str(d / "mk.csv"), parlay_log_file=str(d / "par.csv"),
                           pregame_max_age_seconds=10**9)
 
     def tearDown(self):
@@ -913,6 +913,33 @@ class CLV(unittest.TestCase):
         [b] = find_evs([self.game(1.91, 1.91, start)], self.cfg, start_dt - timedelta(hours=1))
         a.handle([b], now=1000)
         self.assertEqual(ClosingTracker(self.cfg).needs_close(), {"e1"})
+
+    def test_parlay_legs_close_and_give_the_parlay_a_clv(self):
+        from arbbot import PARLAY_FIELDS, logged_bets
+        from datetime import datetime as dt
+        start_dt = dt.now(timezone.utc) + timedelta(hours=1)
+        start = start_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        leg = {"event_id": "e1", "sport_key": "basketball_nba", "matchup": "Away @ Home", "home_team": "Home",
+               "away_team": "Away", "commence_time": start, "market": "h2h", "outcome": "Home", "point": "",
+               "n_outcomes": 2, "player": "", "price": 2.20}
+        row = {"first_seen": (start_dt - timedelta(hours=1)).isoformat(), "book": "B", "legs": "Home ML +120",
+               "price": 2.20, "fair_prob": 0.5, "best_ev_pct": 10, "stake": 10, "games": "Away @ Home",
+               "legs_json": json.dumps([leg])}
+        append_csv(self.cfg.parlay_log_file, PARLAY_FIELDS, row)
+        tr = ClosingTracker(self.cfg)                       # a restart picks up the logged parlay's legs
+        self.assertEqual(tr.needs_close(), {"e1"})
+        tr.observe([self.game(1.80, 2.05, start)], start_dt - timedelta(minutes=3))
+        self.assertEqual(tr.finalize(start_dt + timedelta(minutes=1)), 1)
+        [p] = [r for r in logged_bets(self.cfg).values() if r["kind"] == "parlay"]
+        self.assertAlmostEqual(p["clv_pct"], clv_pct(2.20, devig([1.80, 2.05], "power")[0]), places=1)
+        self.assertEqual(clv_rows(self.cfg), [])             # the legs alone aren't bets of yours
+
+    def test_parlay_without_every_leg_closed_has_no_clv(self):
+        from arbbot import parlay_closing_prob
+        legs = [{"event_id": "a", "market": "h2h", "outcome": "X", "point": "", "player": ""},
+                {"event_id": "b", "market": "h2h", "outcome": "Y", "point": "", "player": ""}]
+        self.assertIsNone(parlay_closing_prob(legs, {"a|h2h|X|": 0.5}))
+        self.assertAlmostEqual(parlay_closing_prob(legs, {"a|h2h|X|": 0.5, "b|h2h|Y|": 0.4}), 0.2)
 
     def test_live_bets_have_no_close(self):
         tr = ClosingTracker(self.cfg)

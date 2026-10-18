@@ -6295,6 +6295,21 @@ def _blank(v):
     return "" if v is None else v
 
 
+def parlay_legs(r: dict) -> list[dict]:
+    """A logged parlay's legs (from its legs_json; [] for parlays logged before legs were saved)."""
+    try:
+        legs = json.loads(r.get("legs_json") or "[]")
+    except ValueError:
+        return []
+    return legs if isinstance(legs, list) else []
+
+
+def parlay_closing_prob(legs: list[dict], closing: dict[str, float]) -> float | None:
+    """A parlay's closing fair chance: its legs' closing chances multiplied (None until every leg has one)."""
+    probs = [closing.get(_bet_id(leg)) for leg in legs]
+    return math.prod(probs) if probs and None not in probs else None
+
+
 def _parlay_row(r: dict) -> dict | None:
     """A logged parlay as a result-file row (None for parlays logged before legs were saved)."""
     try:
@@ -6331,7 +6346,7 @@ def logged_bets(cfg: Config, since: datetime | None = None) -> dict[str, dict]:
                 continue  # repeats count once
             if not cfg.counts(r.get("book", "")):
                 continue  # not one of your books
-            cp = closing.get(bid)
+            cp = parlay_closing_prob(r["_legs"], closing) if kind == "parlay" else closing.get(bid)
             out[bid] = {**r, "kind": kind,
                         "closing_fair_odds": round(1 / cp, 3) if cp else "",
                         "clv_pct": round(clv_pct(float(r["price"]), cp), 2) if cp else ""}
@@ -8868,6 +8883,16 @@ class ClosingTracker:
             for r in _read_csv(name) if name else []:
                 if _parse_time(r["commence_time"]) > now:
                     self.add(r, kind)
+        for r in _read_csv(cfg.parlay_log_file) if cfg.parlay_log_file else []:
+            self.add_parlay(r, now)
+
+    def add_parlay(self, row: dict, now: datetime | None = None) -> None:
+        """Follow each leg of a logged parlay to its kickoff, like a single bet, so the parlay gets a closing line too
+        (its legs' closing lines multiplied: parlay_closing_prob)."""
+        now = now or datetime.now(timezone.utc)
+        for leg in parlay_legs(row):
+            if _parse_time(leg["commence_time"]) > now:
+                self.add({**leg, "first_seen": row["first_seen"], "book": row.get("book", "")})
 
     def add(self, row: dict, kind: str = "ev") -> None:
         """Follow a logged bet to kickoff. kind: "ev" or "outlier" (its alert's yardstick)."""
@@ -11574,6 +11599,7 @@ class Trackers:
             a.on_log = self.closing.add
         for a in (self.outs, self.prop_outs, self.period_outs):
             a.on_log = functools.partial(self.closing.add, kind="outlier")
+        self.parlays.on_log = self.closing.add_parlay
         # Every new alert's price is checked again on the next checks (markouts; not for --once,
         # --demo or --dry-run).
         self.markouts = make_markouts(cfg, args, [self.arbs, self.evs, self.outs, self.prop_arbs, self.prop_evs,
@@ -12445,10 +12471,13 @@ def site_data(cfg: Config, now: datetime | None = None) -> dict:
     stake its card showed, with its closing-line value. Nothing ungraded: no pick goes out before its game is over."""
     now = now or datetime.now(timezone.utc)
     unit = cfg.unit() or 1.0
-    bets = []
+    bets, logged = [], None
     for r in sorted(bettable(cfg, _graded(cfg)), key=lambda r: r["commence_time"]):
         pick = r.get("outcome", "") if r.get("market") == "parlay" else row_pick(r)
         clv = r.get("clv_pct")
+        if clv in ("", None) and r.get("market") == "parlay":   # a losing leg grades a parlay before its last legs close
+            logged = logged if logged is not None else logged_bets(cfg)
+            clv = logged.get(_bet_id(r), {}).get("clv_pct")
         bets.append({"date": local_day(cfg, r["commence_time"]).isoformat(), "sport": r.get("sport", ""),
                      "game": r.get("matchup", ""), "bet": pick, "book": r.get("book", ""),
                      "odds": odds(float(r["price"])), "units": round(float(r["stake"]) / unit, 2),
