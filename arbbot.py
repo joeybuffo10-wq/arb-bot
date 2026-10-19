@@ -675,6 +675,9 @@ class Config:
     outlier_live_min_pct: float = 0  # live outliers need this edge (0 = OUTLIER_MIN_PCT)
     outlier_min_books: int = 3      # need at least this many other books to compare against
     outlier_prop_max_pct: float = 40.0  # a prop price further off the other books than this is bad data, left out
+    # OUTLIER_PROP_OFF_SPORTS=americanfootball_nfl: no prop outliers for these sports (their props still go out as
+    # +EV when a sharp book prices them): a sport whose few prop books make a poor median.
+    outlier_prop_off_sports: list[str] = field(default_factory=list)
                                         # of every prop check (0 = no cap)
     outlier_prop_cluster: int = 4   # one book off on this many players of one prop type in a game (and on at least
                                     # half the players it lists there): its whole market there is left out (0 = off)
@@ -940,6 +943,7 @@ class Config:
             outlier_live_min_pct=num("OUTLIER_LIVE_MIN_PCT", d.outlier_live_min_pct, float),
             outlier_min_books=num("OUTLIER_MIN_BOOKS", d.outlier_min_books, int),
             outlier_prop_max_pct=num("OUTLIER_PROP_MAX_PCT", d.outlier_prop_max_pct, float),
+            outlier_prop_off_sports=_csv(e("OUTLIER_PROP_OFF_SPORTS", "")),
             outlier_prop_cluster=num("OUTLIER_PROP_CLUSTER", d.outlier_prop_cluster, int),
             outlier_live=e("OUTLIER_LIVE", "true").lower() in ("1", "true", "yes"),
             outlier_mention=e("OUTLIER_MENTION", ""),
@@ -5726,7 +5730,10 @@ def find_outliers(events: list[dict], cfg: Config, now: datetime | None = None,
                         stamps[(k, bm["key"])] = _parse_time(stamp)
 
         sharp = sharp_fair(ev, cfg, now, is_live)[0] if lines else {}
+        no_props = ev.get("sport_key") in cfg.outlier_prop_off_sports   # (OUTLIER_PROP_OFF_SPORTS)
         for k, books in lines.items():
+            if no_props and is_prop(k[1]):
+                continue
             n_out = max(len(o) for o in books.values())
             full = {bk: o for bk, o in books.items() if len(o) == n_out and n_out >= 2}
             names = set().union(*full.values()) if full else set()

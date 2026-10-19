@@ -3409,6 +3409,19 @@ class ConsensusStake(unittest.TestCase):
         self.assertAlmostEqual(small.stake, round(o.stake * 0.6, 2), places=2)
         self.assertIn("prop outlier: stake 40% smaller (OUTLIER_PROP_STAKE)", small.confidence_notes)
 
+    def test_prop_outliers_can_be_off_for_one_sport(self):
+        books = {"DK": (1.90, 1.92), "FD": (1.91, 1.91), "MGM": (1.89, 1.93), "BetOnline": (1.92, 1.90),
+                 "Stale": (2.60, 1.45)}
+        off = Config(round_stakes=0, outlier_prop_off_sports=["basketball_nba"])
+        self.assertEqual(find_outliers([prop_event(books)], off, NOW), [])          # NBA props: none
+        self.assertEqual(len(find_outliers([prop_event(books)], replace(off, outlier_prop_off_sports=[
+            "americanfootball_nfl"]), NOW)), 1)                                      # another sport's: still on
+        game = ev_event([("Home", 1.91, None), ("Away", 1.91, None)],
+                        {"A": [("Home", 1.90, None), ("Away", 1.92, None)], "B": [("Home", 1.91, None), ("Away", 1.91, None)],
+                         "C": [("Home", 1.89, None), ("Away", 1.93, None)], "D": [("Home", 2.60, None), ("Away", 1.45, None)]})
+        game["sport_key"] = "basketball_nba"
+        self.assertEqual([o.book for o in find_outliers([game], off, NOW)], ["D"])   # its game lines: still on
+
     def test_prop_outliers_without_pinnacle_bet_less_too(self):
         books = {"DK": (1.90, 1.92), "FD": (1.91, 1.91), "MGM": (1.89, 1.93), "BetOnline": (1.92, 1.90),
                  "Stale": (2.60, 1.45)}
