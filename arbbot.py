@@ -6106,22 +6106,39 @@ def leg_id(event_id, market, player, outcome, point) -> str:
 _TAKEN_CACHE: dict[str, tuple[tuple, set[str]]] = {}
 
 
-def parlay_legs_taken(cfg: Config, now: datetime) -> set[str]:
-    """Every leg (leg_id) of a parlay already posted whose game hasn't started: a bet goes into one parlay only,
-    so one leg that misses can't sink several parlays. Read from the parlay log (re-read only when it changes)."""
-    if not cfg.parlay_log_file:
-        return set()
-    path = data_path(cfg.parlay_log_file)
+BOOST_LEGS_FILE = "boost_legs.csv"   # (in STATE_DIR) the daily boosts post's legs: commence_time, leg
+BOOST_LEG_FIELDS = ["commence_time", "leg"]
+
+
+def _taken_from(name: str, read) -> set[tuple[str, str]]:
+    """{(commence_time, leg_id)} from a file, re-read only when it changes (read: the file's rows -> those pairs)."""
+    path = data_path(name)
     try:
         st = path.stat()
     except OSError:
         return set()
     sig = (st.st_mtime_ns, st.st_size)
-    if _TAKEN_CACHE.get(cfg.parlay_log_file, ((), set()))[0] != sig:
-        legs = [l for r in _read_csv(cfg.parlay_log_file) for l in parlay_legs(r)]
-        _TAKEN_CACHE[cfg.parlay_log_file] = (sig, {(l.get("commence_time", ""), leg_id(
-            l.get("event_id"), l.get("market"), l.get("player"), l.get("outcome"), l.get("point"))) for l in legs})
-    return {lid for start, lid in _TAKEN_CACHE[cfg.parlay_log_file][1] if start and _parse_time(start) > now}
+    if _TAKEN_CACHE.get(name, ((), set()))[0] != sig:
+        _TAKEN_CACHE[name] = (sig, read(_read_csv(name)))
+    return _TAKEN_CACHE[name][1]
+
+
+def parlay_legs_taken(cfg: Config, now: datetime) -> set[str]:
+    """Every leg (leg_id) already in a posted slip whose game hasn't started: a parlay (the parlay log) or a pick
+    of the daily boosts post (BOOST_LEGS_FILE). A bet goes into one slip only, so one leg that misses can't sink
+    several of them."""
+    pairs: set[tuple[str, str]] = set()
+    if cfg.parlay_log_file:
+        pairs |= _taken_from(cfg.parlay_log_file, lambda rows: {(l.get("commence_time", ""), leg_id(
+            l.get("event_id"), l.get("market"), l.get("player"), l.get("outcome"), l.get("point")))
+            for r in rows for l in parlay_legs(r)})
+    if marker := _day_marker(cfg, BOOST_LEGS_FILE):
+        pairs |= _taken_from(str(marker), lambda rows: {(r.get("commence_time", ""), r.get("leg", "")) for r in rows})
+    return {lid for start, lid in pairs if start and _parse_time(start) > now}
+
+
+def bet_leg_id(b: "EVBet") -> str:
+    return leg_id(b.event_id, b.market, b.player, b.outcome, b.point)
 
 
 def find_parlays(bets: list["EVBet"], cfg: Config, keep: frozenset | set = frozenset(),
@@ -6155,7 +6172,7 @@ def find_parlays(bets: list["EVBet"], cfg: Config, keep: frozenset | set = froze
             per_book.setdefault(bk, []).append((b, price, link))
     found: dict[str, Parlay] = {}
     for book, legs in per_book.items():
-        legs = sorted(legs, key=lambda x: (x[0].fair_prob * x[1]), reverse=True)[:8]  # keep it small
+        legs = sorted(legs, key=lambda x: (x[0].fair_prob * x[1]), reverse=True)[:12]  # keep it small
         for n in range(2, cfg.parlay_max_legs + 1):
             for combo in itertools.combinations(legs, n):
                 if len({b.event_id for b, _, _ in combo}) < n:
@@ -6187,8 +6204,7 @@ def find_parlays(bets: list["EVBet"], cfg: Config, keep: frozenset | set = froze
         keys = {b.key for b, _, _ in p.legs}
         if keys & used:
             continue
-        if p.key not in keep and any(leg_id(b.event_id, b.market, b.player, b.outcome, b.point) in taken
-                                     for b, _, _ in p.legs):
+        if p.key not in keep and any(bet_leg_id(b) in taken for b, _, _ in p.legs):
             continue   # a leg already in another parlay that was posted
         p.stake = round_stake(kelly_stake(p.fair_prob, p.price, cfg),
                               cfg.ev_bankroll * cfg.parlay_max_stake_pct / 100, cfg)
@@ -8520,11 +8536,12 @@ class BoostPool:
 
 
 def best_boosts(pool: BoostPool, book: str, boost_pct: float, now: datetime, min_legs: int = 1, max_legs: int = 3,
-                top: int = 3) -> list[dict]:
+                top: int = 3, taken: frozenset | set = frozenset()) -> list[dict]:
     """The best bets for a profit boost of boost_pct at this book: singles and parlays of up to max_legs legs from
     different games, at most +2000, ranked by expected value with the boost (it multiplies the profit, not the stake).
-    No two share a leg. Only bets that are +EV with the boost."""
-    legs = sorted(pool.fresh(now, book), key=lambda b: b.fair_prob * b.price, reverse=True)[:14]
+    No two share a leg, and none uses a leg in taken (leg_id). Only bets that are +EV with the boost."""
+    legs = sorted((b for b in pool.fresh(now, book) if bet_leg_id(b) not in taken),
+                  key=lambda b: b.fair_prob * b.price, reverse=True)[:14]
     cands = []
     for n in range(max(1, min_legs), max_legs + 1):
         for combo in itertools.combinations(legs, n):
@@ -8539,7 +8556,7 @@ def best_boosts(pool: BoostPool, book: str, boost_pct: float, now: datetime, min
                           "ev": (fair * boosted - 1) * 100, "base": (fair * price - 1) * 100})
     out, used = [], set()
     for c in sorted(cands, key=lambda c: -c["ev"]):
-        keys = {b.key for b in c["legs"]}
+        keys = {bet_leg_id(b) for b in c["legs"]}
         if c["ev"] <= 0 or keys & used:
             continue
         out.append(c)
@@ -8609,14 +8626,20 @@ def boosts_due(cfg: Config, now: datetime) -> date | None:
 def send_boosts(cfg: Config, pool: BoostPool, day: date, now: datetime) -> int:
     """Post today's best bets for 25/50/100% profit boosts at FanDuel and DraftKings; returns how many were listed."""
     embeds, n = [], 0
+    used = parlay_legs_taken(cfg, now)   # every leg in one slip only: not a posted parlay's, not another pick's
+    legs_file = _day_marker(cfg, BOOST_LEGS_FILE)
+    if legs_file:
+        legs_file.parent.mkdir(parents=True, exist_ok=True)
     for book, title in (("fanduel", "FanDuel"), ("draftkings", "DraftKings")):
-        lines, used = [], set()
+        lines = []
         for pct in (25, 50, 100):
-            pick = next((c for c in best_boosts(pool, book, pct, now, top=5)
-                         if not {b.key for b in c["legs"]} & used), None)
+            pick = next(iter(best_boosts(pool, book, pct, now, top=1, taken=used)), None)
             if not pick:
                 continue
-            used |= {b.key for b in pick["legs"]}
+            used |= {bet_leg_id(b) for b in pick["legs"]}
+            if legs_file:
+                for b in pick["legs"]:
+                    append_csv(str(legs_file), BOOST_LEG_FIELDS, {"commence_time": b.commence_time, "leg": bet_leg_id(b)})
             lines.append(f"__**{pct}% boost**__")
             lines += boost_lines(cfg, [pick], title)[0:1] + boost_lines(cfg, [pick], title)[1:]
             n += 1

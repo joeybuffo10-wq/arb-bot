@@ -413,6 +413,28 @@ class ProfitBoosts(unittest.TestCase):
         self.assertIn("__**25% boost**__", posts[0]["embeds"][0]["description"])
         self.assertIsNone(_arbbot.boosts_due(cfg, noon))        # once a day
 
+    def test_no_leg_in_two_slips_across_books_and_parlays(self):
+        from unittest import mock
+        import tempfile
+        pool = _arbbot.BoostPool()
+        evs = []
+        for i in range(9):
+            ev = ev_event([("Home", 1.91, None), ("Away", 1.91, None)],
+                          {"FanDuel": [("Home", 2.00, None)], "DraftKings": [("Home", 2.00, None)]})
+            ev["id"] = f"g{i}"
+            evs.append(ev)
+        find_evs(evs, Config(min_ev_pct=3), NOW, pool=pool)
+        cfg = Config(boosts_webhook_url="https://boosts", boosts_hour=12, state_dir=tempfile.mkdtemp(),
+                     parlay_log_file="")
+        with mock.patch("arbbot._webhook", lambda *a, **k: None):
+            n = _arbbot.send_boosts(cfg, pool, NOW.date(), NOW)
+        self.assertEqual(n, 3)                      # 9 games, 3-leg picks: three slips, then no legs left
+        legs = [r["leg"] for r in _arbbot._read_csv(str(Path(cfg.state_dir) / _arbbot.BOOST_LEGS_FILE))]
+        self.assertEqual(len(legs), 9)
+        self.assertEqual(len(set(legs)), 9)         # FanDuel's and DraftKings' picks share nothing
+        self.assertEqual(_arbbot.parlay_legs_taken(cfg, NOW), set(legs))   # and the parlays won't use them
+        self.assertEqual(_arbbot.best_boosts(pool, "fanduel", 50, NOW, taken=set(legs)), [])
+
     def test_the_boost_command(self):
         pool = self.pool()
         reply = _arbbot.boost_reply(Config(), pool, "!boost 50% fanduel $25 parlay", NOW)
