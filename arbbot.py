@@ -6097,10 +6097,38 @@ def _parlay_leg_keys(key: str) -> tuple[str, list[str]]:
     return book, re.split(r"\|(?=ev\|)", rest)
 
 
+def leg_id(event_id, market, player, outcome, point) -> str:
+    """One bet as a parlay leg, the same from a live bet (EVBet) and from a logged parlay's legs_json."""
+    pt = "" if point in ("", None) else f"{float(point):g}"
+    return f"{event_id}|{market}|{player or ''}|{outcome}|{pt}"
+
+
+_TAKEN_CACHE: dict[str, tuple[tuple, set[str]]] = {}
+
+
+def parlay_legs_taken(cfg: Config, now: datetime) -> set[str]:
+    """Every leg (leg_id) of a parlay already posted whose game hasn't started: a bet goes into one parlay only,
+    so one leg that misses can't sink several parlays. Read from the parlay log (re-read only when it changes)."""
+    if not cfg.parlay_log_file:
+        return set()
+    path = data_path(cfg.parlay_log_file)
+    try:
+        st = path.stat()
+    except OSError:
+        return set()
+    sig = (st.st_mtime_ns, st.st_size)
+    if _TAKEN_CACHE.get(cfg.parlay_log_file, ((), set()))[0] != sig:
+        legs = [l for r in _read_csv(cfg.parlay_log_file) for l in parlay_legs(r)]
+        _TAKEN_CACHE[cfg.parlay_log_file] = (sig, {(l.get("commence_time", ""), leg_id(
+            l.get("event_id"), l.get("market"), l.get("player"), l.get("outcome"), l.get("point"))) for l in legs})
+    return {lid for start, lid in _TAKEN_CACHE[cfg.parlay_log_file][1] if start and _parse_time(start) > now}
+
+
 def find_parlays(bets: list["EVBet"], cfg: Config, keep: frozenset | set = frozenset(),
-                 now: datetime | None = None) -> list[Parlay]:
+                 now: datetime | None = None, taken: frozenset | set = frozenset()) -> list[Parlay]:
     """Best +EV parlays from the current +EV bets: same book, different games, pre-game only.
-    keep = keys of parlays already posted (kept ahead of new ones while they still qualify)."""
+    keep = keys of parlays already posted (kept ahead of new ones while they still qualify).
+    taken = legs (leg_id) already in a posted parlay: a new parlay never reuses one (parlay_legs_taken)."""
     if not cfg.parlays_enabled:
         return []
 
@@ -6159,6 +6187,9 @@ def find_parlays(bets: list["EVBet"], cfg: Config, keep: frozenset | set = froze
         keys = {b.key for b, _, _ in p.legs}
         if keys & used:
             continue
+        if p.key not in keep and any(leg_id(b.event_id, b.market, b.player, b.outcome, b.point) in taken
+                                     for b, _, _ in p.legs):
+            continue   # a leg already in another parlay that was posted
         p.stake = round_stake(kelly_stake(p.fair_prob, p.price, cfg),
                               cfg.ev_bankroll * cfg.parlay_max_stake_pct / 100, cfg)
         out.append(p)
@@ -11990,9 +12021,10 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
 
     def update_parlays() -> int:
         open_bets = parlay_bets(ev_alerter, prop_evs, out_alerter, prop_outs)
+        now = datetime.now(timezone.utc)
         return parlay_alerter.handle(find_parlays(open_bets, cfg,
                                                   keep=set(parlay_alerter.open) | set(parlay_alerter.restored),
-                                                  now=datetime.now(timezone.utc)))
+                                                  now=now, taken=parlay_legs_taken(cfg, now)))
 
     if args.demo:
         # Sample data must never reach the real logs (it would be graded and counted).

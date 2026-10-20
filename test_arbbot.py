@@ -1114,6 +1114,25 @@ class Parlays(unittest.TestCase):
         self.assertEqual(len(used), len(set(used)))
         self.assertEqual(len(ps), 2)   # 4 legs -> two 2-leg parlays, no leg twice
 
+    def test_a_leg_already_in_a_posted_parlay_isnt_reused(self):
+        import tempfile
+        from arbbot import PARLAY_FIELDS, OpenArb, parlay_legs_taken, leg_id, _parse_time
+        cfg = Config(parlay_min_ev_pct=1, parlay_leg_min_ev_pct=1, parlay_max_legs=2, parlay_max_alerts=5)
+        a, b, c, d = (ev_leg(f"g{i}", {"DK": 2.20}) for i in range(4))
+        [first] = find_parlays([a, b], cfg)
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = replace(cfg, parlay_log_file=str(Path(tmp) / "par.csv"))
+            row = ParlayAlerter(cfg, dry_run=True).row(OpenArb(first, 0, 0, first.ev_pct))
+            append_csv(cfg.parlay_log_file, PARLAY_FIELDS, {"first_seen": "2026-10-03T12:00:00+00:00", **row})
+            taken = parlay_legs_taken(cfg, NOW)
+            self.assertEqual(taken, {leg_id(x.event_id, x.market, x.player, x.outcome, x.point) for x in (a, b)})
+            later = parlay_legs_taken(cfg, _parse_time(a.commence_time) + timedelta(minutes=1))
+            self.assertEqual(later, set())                        # its games started: the legs are free again
+        ps = find_parlays([a, b, c, d], cfg, taken=taken, now=NOW)
+        self.assertEqual([{x.event_id for x, _, _ in p.legs} for p in ps], [{"g2", "g3"}])   # only fresh legs
+        kept = find_parlays([a, b, c, d], cfg, keep={first.key}, taken=taken, now=NOW)
+        self.assertIn(first.key, {p.key for p in kept})           # the posted parlay itself stays up
+
     def test_stake_cap_and_threshold(self):
         legs = [ev_leg("g1", {"DK": 2.40}), ev_leg("g2", {"DK": 2.40})]
         [p] = find_parlays(legs, Config(parlay_min_ev_pct=5, ev_bankroll=1000, parlay_max_stake_pct=1))
