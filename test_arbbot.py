@@ -11558,7 +11558,10 @@ class AlternateLines(MixFiles):
         find_arbs(events, cfg, NOW)
         took = time.perf_counter() - t0
         self.assertGreater(len(seen), 0)          # ladder steps at the main lines' points were matched
-        self.assertLess(took, 3.0, f"prop pass took {took:.2f}s")
+        # About 0.5s on a laptop and about 3s on the bot's own server (a small VPS that also runs the live bot while the
+        # update tests): 10s still catches a real slowdown there (a pass growing many times over) without failing on
+        # an ordinary busy minute, which blocked the Oct 21 update at 3.35s.
+        self.assertLess(took, 10.0, f"prop pass took {took:.2f}s")
 
 
 
