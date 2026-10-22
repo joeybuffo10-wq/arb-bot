@@ -14863,10 +14863,11 @@ class NtfyPush(unittest.TestCase):
         with mock.patch("arbbot._webhook", return_value={"id": "m1"}), mock.patch("urllib.request.urlopen", urlopen):
             self.assertEqual(a._discord(payload, url="https://discord/hook"), "m1")
             [req] = sent
-            self.assertEqual(req.full_url, "https://ntfy.example/buff-secret")
-            self.assertEqual(req.data.decode(), "Cale Makar Over 0.5 Assists +120\n$20 (2u)")
-            self.assertEqual(req.get_header("Click"), "https://fd/bet")
-            self.assertIn("6.1% EV", req.get_header("Title"))
+            msg = json.loads(req.data)
+            self.assertEqual((req.full_url, msg["topic"]), ("https://ntfy.example", "buff-secret"))
+            self.assertEqual(msg["message"], "Cale Makar Over 0.5 Assists +120\n$20 (2u)")
+            self.assertEqual(msg["click"], "https://fd/bet")
+            self.assertEqual(msg["title"], "📈 +6.1% EV · Prop · FanDuel")
             a._discord(payload, message_id="m1", url="https://discord/hook")           # an edit: no push
             a._discord({"embeds": payload["embeds"]}, url="https://discord/hook")      # no ping (quiet): no push
             self.assertEqual(len(sent), 1)

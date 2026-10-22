@@ -2311,15 +2311,17 @@ def ntfy_push(cfg: "Config", payload: dict) -> bool:
     emb = (payload.get("embeds") or [{}])[0]
     title = emb.get("title") or BOT_NAME
     body = re.sub(r"<[@#][!&]?\d+>", "", emb.get("description") or payload.get("content") or "")
+    body = re.sub(r"\s*\(<t:\d+:R>\)", "", body)                       # Discord's "in 2 hours": the time says it
+    body = re.sub(r"<t:(\d+)(?::[a-zA-Z])?>", lambda m: datetime.fromtimestamp(int(m.group(1)), ZoneInfo(
+        cfg.timezone)).strftime("%a %-I:%M %p"), body)                   # Discord's own times, in your time zone
     body = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", body)           # [text](link) -> text
     body = re.sub(r"[*_`~|#>]+", "", body)
     body = "\n".join(ln.strip() for ln in body.splitlines() if ln.strip())[:400] or title
-    headers = {"Title": title.encode("ascii", "ignore").decode().strip()[:200] or BOT_NAME,
-               "Priority": "high", "Tags": "moneybag", "User-Agent": "arbbot/3.0 (ntfy)"}
+    msg = {"topic": cfg.ntfy_topic, "title": title[:200], "message": body, "priority": 4, "tags": ["moneybag"]}
     if emb.get("url"):
-        headers["Click"] = emb["url"]
-    req = urllib.request.Request(f"{cfg.ntfy_server}/{urllib.parse.quote(cfg.ntfy_topic, safe='')}",
-                                 data=body.encode(), method="POST", headers=headers)
+        msg["click"] = emb["url"]
+    req = urllib.request.Request(cfg.ntfy_server, data=json.dumps(msg).encode(), method="POST",
+                                 headers={"Content-Type": "application/json", "User-Agent": "arbbot/3.0 (ntfy)"})
     try:
         urllib.request.urlopen(req, timeout=5).close()
         return True
