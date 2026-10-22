@@ -11522,23 +11522,43 @@ def _line_sig(key: str) -> tuple[tuple, str] | None:
     return (parts[1], parts[2].removesuffix("_alternate"), parts[3]), parts[4]
 
 
+PROP_UP = {"over": "up", "yes": "up", "under": "down", "no": "down"}
+
+
+def _player_sig(key: str) -> tuple[tuple, str] | None:
+    """((game, "player", name), "up"/"down") of a player-prop alert key: an Over (or Yes) bets the player does more,
+    an Under (or No) less, whatever the stat or line. None for anything else (game lines, team totals)."""
+    parts = key.split("|", 4)
+    if len(parts) < 5 or parts[0] != "ev" or parts[2] == "team_totals":
+        return None
+    try:
+        line = ast.literal_eval(parts[3])
+    except (ValueError, SyntaxError):
+        return None
+    way = PROP_UP.get((parts[4].split() or [""])[0].lower())
+    return ((parts[1], "player", line[0]), way) if is_prop(line) and way else None
+
+
 def one_side(bets: list, t: "Trackers", alerters: tuple) -> list:
     """Never both sides of one line: once a side has gone out (a card up, or alerted earlier: ONE_ALERT_PER_BET's
-    memory), the other side isn't alerted, whatever book or time (the two would mostly cancel out). In one check,
-    the better edge goes. What's held back is counted as "other side"."""
+    memory), the other side isn't alerted, whatever book or time (the two would mostly cancel out). The same goes for
+    a player in one game: once an Over (or Yes) on them has gone out, no Under on any of their stats or lines, and
+    the other way round (Under 4.5 and Over 5.5 rebounds, or Under points and Over threes, work against each other).
+    In one check, the better edge goes. What's held back is counted as "other side"."""
     every = (t.evs, t.outs, t.prop_evs, t.prop_outs, t.period_evs, t.period_outs)
     out_on: dict[tuple, set[str]] = {}
     for key in {*t.alerted.until, *(k for a in every for k in (*a.open, *a.restored))}:
-        if (sig := _line_sig(key)) is not None:
-            out_on.setdefault(sig[0], set()).add(sig[1])
+        for sig in (_line_sig(key), _player_sig(key)):
+            if sig is not None:
+                out_on.setdefault(sig[0], set()).add(sig[1])
     keep = []
     for b in sorted(bets, key=lambda b: -b.ev_pct):
-        sig = _line_sig(b.key)
-        if sig and out_on.get(sig[0], set()) - {sig[1]}:
+        sigs = [sig for sig in (_line_sig(b.key), _player_sig(b.key)) if sig is not None]
+        if any(out_on.get(g, set()) - {side} for g, side in sigs):
             alerters[0].held_counts["other side"] = alerters[0].held_counts.get("other side", 0) + 1
             continue
-        if sig:
-            out_on.setdefault(sig[0], set()).add(sig[1])
+        for g, side in sigs:
+            out_on.setdefault(g, set()).add(side)
         keep.append(b)
     return keep
 

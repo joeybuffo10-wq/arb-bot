@@ -14061,6 +14061,28 @@ class EVBotSpec(MixFiles):
         under = replace(over, outcome="Under")
         self.assertEqual(len(_arbbot.one_side([over, under], t, (t.prop_evs, t.prop_outs))), 1)
 
+    def test_one_direction_per_player_per_game(self):
+        sent = []
+        t = self.live(sent, one_alert_per_bet=True)
+        [base] = find_evs([self.game({"B": 2.20})], t.cfg, NOW)
+        prop = lambda player, side, market, pt, ev=5, ev_id=None: replace(
+            base, market=market, line=(player, pt), outcome=side, point=pt, stake=10.0, price=1.0 + ev / 50,
+            event_id=ev_id or base.event_id)
+        under45 = prop("Edgecombe", "Under", "player_rebounds", 4.5, ev=9)
+        over55 = prop("Edgecombe", "Over", "player_rebounds_alternate", 5.5)       # another line of the same stat
+        kept = _arbbot.one_side([under45, over55], t, (t.prop_evs, t.prop_outs))
+        self.assertEqual([b.outcome for b in kept], ["Under"])                       # the better edge only
+        t.alerted.add(under45.key, time.time() + 3600, time.time())                  # the Under went out earlier
+        for b in (prop("Edgecombe", "Over", "player_threes", 1.5),                   # another stat, other way
+                  prop("Edgecombe", "Yes", "player_double_double", None)):           # a Yes counts as an Over
+            self.assertEqual(_arbbot.one_side([b], t, (t.prop_evs, t.prop_outs)), [])
+        fine = [prop("Edgecombe", "Under", "player_assists", 3.5),                   # same way: fine
+                prop("Maxey", "Over", "player_points", 25.5),                        # another player: fine
+                prop("Edgecombe", "Over", "player_points", 12.5, ev_id="next-game")] # another game: fine
+        self.assertEqual(len(_arbbot.one_side(fine, t, (t.prop_evs, t.prop_outs))), 3)
+        team = replace(base, market="team_totals", line=("Lakers", 110.5), outcome="Over", point=110.5)
+        self.assertEqual(len(_arbbot.one_side([team], t, (t.evs, t.outs))), 1)          # team totals aren't players
+
     def test_props_are_limited_per_player_not_per_game(self):
         sent = []
         t = self.live(sent, one_alert_per_bet=True, same_game_full=2, same_game_max=4, same_player_full=1,
