@@ -14847,5 +14847,33 @@ class UpdateStall(unittest.TestCase):
             self.assertEqual(run(), "")
 
 
+
+class NtfyPush(unittest.TestCase):
+    def test_a_new_pinging_alert_also_goes_to_ntfy(self):
+        from unittest import mock
+        cfg = Config(webhook_url="https://discord/hook", ntfy_topic="buff-secret", ntfy_server="https://ntfy.example")
+        a = EVAlerter(cfg, dry_run=False)
+        payload = {"content": "<@&123> <@&456>", "embeds": [{"title": "📈 +6.1% EV · Prop · FanDuel",
+                   "description": "**[Cale Makar Over 0.5 Assists](https://fd/bet) +120**\n## $20 (2u)",
+                   "url": "https://fd/bet"}]}
+        sent = []
+        def urlopen(req, timeout=0):
+            sent.append(req)
+            return mock.MagicMock()
+        with mock.patch("arbbot._webhook", return_value={"id": "m1"}), mock.patch("urllib.request.urlopen", urlopen):
+            self.assertEqual(a._discord(payload, url="https://discord/hook"), "m1")
+            [req] = sent
+            self.assertEqual(req.full_url, "https://ntfy.example/buff-secret")
+            self.assertEqual(req.data.decode(), "Cale Makar Over 0.5 Assists +120\n$20 (2u)")
+            self.assertEqual(req.get_header("Click"), "https://fd/bet")
+            self.assertIn("6.1% EV", req.get_header("Title"))
+            a._discord(payload, message_id="m1", url="https://discord/hook")           # an edit: no push
+            a._discord({"embeds": payload["embeds"]}, url="https://discord/hook")      # no ping (quiet): no push
+            self.assertEqual(len(sent), 1)
+        with mock.patch("arbbot._webhook", return_value={"id": "m2"}), \
+             mock.patch("urllib.request.urlopen", side_effect=OSError("down")):
+            self.assertEqual(a._discord(payload, url="https://discord/hook"), "m2")   # ntfy down: alert still out
+        self.assertFalse(_arbbot.ntfy_push(Config(), payload))                       # no topic: off
+
 if __name__ == "__main__":
     unittest.main()

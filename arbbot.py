@@ -414,6 +414,11 @@ class Config:
     include_links: bool = True    # ask for bet-slip deep links where books support them
     include_sids: bool = True     # ...and each book's own ids, to build a bet-slip link where it sent none (no credits)
     discord_mention: str = ""     # e.g. @everyone or <@USER_ID> to force a phone ping
+    # A second way to your phone besides Discord: every new alert that pings in Discord is also pushed to this ntfy
+    # topic (the free ntfy app: subscribe to the same topic). The topic name works like a password: set it on the
+    # server with --set NTFY_TOPIC=..., never in remote.env (that file is public). "" = off.
+    ntfy_topic: str = ""
+    ntfy_server: str = "https://ntfy.sh"
     arbs_enabled: bool = True     # look for arbs (main lines and props) at all; false = no arb alerts
     # Discord role ids by book (BOOK_ROLES=draftkings=123,fanduel=456): a new +EV, prop, outlier or parlay
     # card pings its book's role instead of EV_MENTION / OUTLIER_MENTION / PARLAY_MENTION. Empty = those.
@@ -936,6 +941,8 @@ class Config:
             parlay_max_alerts=num("PARLAY_MAX_ALERTS", d.parlay_max_alerts, int),
             parlay_max_stake_pct=num("PARLAY_MAX_STAKE_PCT", d.parlay_max_stake_pct, float),
             parlay_mention=e("PARLAY_MENTION", ""),
+            ntfy_topic=e("NTFY_TOPIC", "").strip(),
+            ntfy_server=(e("NTFY_SERVER", "") or d.ntfy_server).strip().rstrip("/"),
             parlay_log_file=e("PARLAY_LOG_FILE", d.parlay_log_file),
             closing_minutes=num("CLOSING_MINUTES", d.closing_minutes, int),
             outliers_enabled=e("OUTLIERS_ENABLED", "true").lower() in ("1", "true", "yes"),
@@ -2296,6 +2303,31 @@ def _card(title: str, description: str, color: int, url: str = "", footer: str =
     return payload
 
 
+def ntfy_push(cfg: "Config", payload: dict) -> bool:
+    """NTFY_TOPIC: a new alert card, short, as a phone notification through ntfy (its title, the card's first lines,
+    a tap opens the bet). Never holds up or breaks the alert itself. True when ntfy took it."""
+    if not cfg.ntfy_topic:
+        return False
+    emb = (payload.get("embeds") or [{}])[0]
+    title = emb.get("title") or BOT_NAME
+    body = re.sub(r"<[@#][!&]?\d+>", "", emb.get("description") or payload.get("content") or "")
+    body = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", body)           # [text](link) -> text
+    body = re.sub(r"[*_`~|#>]+", "", body)
+    body = "\n".join(ln.strip() for ln in body.splitlines() if ln.strip())[:400] or title
+    headers = {"Title": title.encode("ascii", "ignore").decode().strip()[:200] or BOT_NAME,
+               "Priority": "high", "Tags": "moneybag", "User-Agent": "arbbot/3.0 (ntfy)"}
+    if emb.get("url"):
+        headers["Click"] = emb["url"]
+    req = urllib.request.Request(f"{cfg.ntfy_server}/{urllib.parse.quote(cfg.ntfy_topic, safe='')}",
+                                 data=body.encode(), method="POST", headers=headers)
+    try:
+        urllib.request.urlopen(req, timeout=5).close()
+        return True
+    except Exception as e:  # noqa: BLE001 - the Discord alert already went out
+        print(f"  ! ntfy push failed: {e!r:.150}", file=sys.stderr)
+        return False
+
+
 def allowed_mentions(mention: str) -> dict:
     """Discord may ping only what the message names: these roles and users, and @everyone/@here only
     when it says so. A book's role mention can't ping anyone else."""
@@ -3063,6 +3095,8 @@ class Alerter:
             # A new alert's post: a longer wait than DISCORD_MAX_WAIT_SECONDS isn't waited out, the next check sends it.
             msg = _webhook(url, payload, max_wait=self.cfg.discord_max_wait_seconds)
             self.send_retryable = not msg   # rate-limited (3 times, or for too long): Discord never took it
+            if msg and payload.get("content"):   # a new alert that pings: to the phone through ntfy too
+                ntfy_push(self.cfg, payload)
             return msg.get("id") if msg else None
         except Exception as e:  # keep scanning even if Discord hiccups
             print(f"  ! Discord send failed: {e}", file=sys.stderr)
