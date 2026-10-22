@@ -14465,7 +14465,17 @@ class EVBotSpec(MixFiles):
         self.assertEqual(to, "dksb://sb/addbet/0QA1%2311_1,0QA2%2322_2")                # (ids kept intact)
         self.assertEqual(_arbbot.parlay_slip_link(replace(cfg, results_site_repo=""), "DraftKings", legs), "")
         page = (Path(_arbbot.__file__).parent / "site" / "go.html").read_text()
-        self.assertIn("^dksb:\\/\\/sb\\/addbet\\/", page)                          # only DraftKings app links
+        self.assertIn("^(dksb:\\/\\/sb\\/addbet\\/|fanduelsportsbook:\\/\\/|fdsb:\\/\\/)", page)   # only the books' app links
+        self.assertIn("sportsbook\\.fanduel\\.com\\/addToBetslip", page)            # (and FanDuel's own slip pages)
+
+    def test_fanduel_app_links_to_try(self):
+        web = "https://sportsbook.fanduel.com/addToBetslip?marketId=734.1&selectionId=4242"
+        found = _arbbot.fd_app_links(web, "https://x.github.io/r/go.html")
+        self.assertEqual([h.split(":")[0] for h, _ in found], ["app", "app", "app", "tap through (the bet-slip page, opened from a button)"])
+        import urllib.parse
+        q = urllib.parse.parse_qs(urllib.parse.urlsplit(found[0][1]).query)
+        self.assertEqual(q["to"][0], "fanduelsportsbook://addToBetslip?marketId=734.1&selectionId=4242")
+        self.assertEqual(urllib.parse.parse_qs(urllib.parse.urlsplit(found[-1][1]).query)["web"][0], web)
 
     def test_every_card_says_how_likely_it_is_to_hit(self):
         tier = _arbbot.tier_line

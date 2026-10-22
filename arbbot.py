@@ -1843,6 +1843,38 @@ def test_dk_links(cfg: Config, api: "OddsAPI") -> list[tuple[str, str]]:
             + [(how, _draftkings_slip(links, how, go)) for how in DK_FORMATS if how.startswith("app-")])
 
 
+FD_APP_TRIES = (   # FanDuel publishes no app link: the ways --test-fd-links tries (an app scheme, then a tap)
+    ("app: fanduelsportsbook://addToBetslip", "fanduelsportsbook://addToBetslip?{q}"),
+    ("app: fanduelsportsbook://launch", "fanduelsportsbook://launch?deeplink={web_q}"),
+    ("app: fdsb://addToBetslip", "fdsb://addToBetslip?{q}"),
+)
+
+
+def fd_app_links(web: str, go: str) -> list[tuple[str, str]]:
+    """The FanDuel ways to try for one bet-slip link (https://...fanduel.com/addToBetslip?marketId=..&selectionId=..):
+    each app scheme through go.html, then go.html's button to the web link itself (a tap there can open the app)."""
+    q = urllib.parse.urlsplit(web).query
+    out = [(how, f"{go}?to=" + urllib.parse.quote(tpl.format(q=q, web_q=urllib.parse.quote(web, safe="")), safe=""))
+           for how, tpl in FD_APP_TRIES]
+    return out + [("tap through (the bet-slip page, opened from a button)", f"{go}?web={urllib.parse.quote(web, safe='')}")]
+
+
+def test_fd_links(cfg: Config, api: "OddsAPI") -> list[tuple[str, str]]:
+    """--test-fd-links: one real FanDuel bet with a bet-slip link (moneylines, 1 credit per sport asked), as each way in
+    fd_app_links plus the card's own link, to find the one that opens the FanDuel app with it in the slip."""
+    fd = replace(cfg, bookmakers="fanduel")
+    now, go = datetime.now(timezone.utc), go_url(cfg)
+    for sport in [sp for sp in cfg.sports if not sp.startswith("mma")]:
+        for ev in api.odds(sport, now + timedelta(hours=72), markets="h2h", since=now, kind="test"):
+            for bm in ev.get("bookmakers", []):
+                for mkt in bm.get("markets", []):
+                    oc = (mkt.get("outcomes") or [None])[0]
+                    link = book_link(ev, bm, mkt, oc, fd) if oc else ""
+                    if "addToBetslip" in link:
+                        return [("the card's own link (as now)", link)] + (fd_app_links(link, go) if go else [])
+    return []
+
+
 def _feed_link_only(ev: dict, bm: dict, mkt: dict, oc: dict) -> str:
     """No link of its own: the feed's (BetMGM's per-state template filled in with US_STATE)."""
     return ""
@@ -12990,6 +13022,8 @@ def main() -> None:
     p.add_argument("--test-discord", action="store_true", help="send one sample alert to Discord and exit")
     p.add_argument("--test-dk-links", action="store_true",
                    help="post 4 DraftKings parlay links (each joining 2 real bets a different way) to the testing channel")
+    p.add_argument("--test-fd-links", action="store_true",
+                   help="post one real FanDuel bet as each kind of app link to try, to the testing channel")
     p.add_argument("--set", metavar="KEY=VALUE", action="append",
                    help="change a setting in .env, e.g. --set MY_BOOKS=fanduel,draftkings (repeatable)")
     p.add_argument("--set-webhook", choices=sorted(WEBHOOK_SETTINGS), metavar="CHANNEL",
@@ -13067,7 +13101,7 @@ def main() -> None:
                     if u.startswith("https://")), "")   # a placeholder status URL falls back, like Status
         interactive = (args.dry_run, args.demo, args.once, args.plan, args.results, args.test_discord,
                        args.post_guide, args.post_results, args.check_kalshi, args.check_props, args.check_upcoming,
-                       args.weekly, args.post_weekly, args.test_dk_links, args.post_join is not None, args.timing, args.speed)
+                       args.weekly, args.post_weekly, args.test_dk_links, args.test_fd_links, args.post_join is not None, args.timing, args.speed)
         if url.startswith("https://") and not any(interactive):   # the service: say why it stopped
             try:
                 _webhook(url, {"username": BOT_NAME, "content": f"🔴 Bot stopped: bad setting in .env: {ex}. "
@@ -13104,6 +13138,23 @@ def main() -> None:
 
     if args.test_discord:
         send_samples(cfg)
+        return
+
+    if args.test_fd_links:
+        if cfg.results_site_repo and cfg.results_site_token and (HERE / "site" / "go.html").exists():
+            github_put(cfg, "go.html", (HERE / "site" / "go.html").read_bytes(), "go.html updated (FanDuel links test)")
+            print("go.html uploaded to the results site (GitHub Pages takes a minute or two to show it).")
+        found = test_fd_links(cfg, OddsAPI(replace(cfg, bookmakers="fanduel")))
+        if not found:
+            sys.exit("Couldn't find a FanDuel bet with a bet-slip link in upcoming games. Try again later.")
+        text = ("🧪 **FanDuel app link test** (one real bet; don't place it, just look). Wait 2 minutes, then tap each on "
+                "your phone and tell Claude which ones open the FanDuel app with the bet in the slip:\n"
+                + "\n".join(f"**{i}. {how}:** <{link}>" for i, (how, link) in enumerate(found, 1)))
+        url = cfg.test_webhook_url or cfg.status_webhook_url or cfg.webhook_url
+        print(re.sub(r"\*\*|<|>", "", text))
+        if url:
+            _webhook(url, {"username": BOT_NAME, "content": text[:1990]})
+            print("Posted to the testing channel." if cfg.test_webhook_url else "Posted to the status channel.")
         return
 
     if args.test_dk_links:
