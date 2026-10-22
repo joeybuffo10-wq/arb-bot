@@ -7356,9 +7356,33 @@ def same_fighter(a: str, b: str) -> bool:
     return bool(wa and wb) and (wa == wb or (wa[-1] == wb[-1] and wa[0][:1] == wb[0][:1]))
 
 
+ROUND_SECONDS = 300   # a UFC round: 5 minutes
+
+
+def fight_length(comp: dict) -> float | None:
+    """How long a finished fight lasted, in rounds (2.5 = halfway through round 3), from ESPN's status: the round it
+    ended in (period) and the time on the clock then (clock, seconds into the round, or displayClock "m:ss"). None
+    when ESPN doesn't say clearly (then the bet waits, and goes to you by hand)."""
+    st = comp.get("status", {})
+    try:
+        rnd = int(st.get("period") or 0)
+        secs = st.get("clock")
+        if not secs:   # (missing, or 0: then the "m:ss" on the clock)
+            m, _, sec = str(st.get("displayClock", "")).partition(":")
+            secs = int(m) * 60 + int(sec)
+        secs = float(secs)
+    except (TypeError, ValueError):
+        return None
+    if rnd < 1 or not 0 < secs <= ROUND_SECONDS:
+        return None
+    return rnd - 1 + secs / ROUND_SECONDS
+
+
 def grade_fight(row: dict) -> tuple[tuple[str, float], str] | tuple[None, str]:
-    """An MMA moneyline from ESPN's UFC results (the Odds API has no MMA scores): ((result, profit), who won), or
-    (None, why not yet). A draw or no contest refunds a 2-way bet. Fights ESPN doesn't list wait (then: by hand)."""
+    """An MMA bet from ESPN's UFC results (the Odds API has no MMA scores): ((result, profit), what happened), or
+    (None, why not yet). A moneyline: who won (a draw or no contest refunds a 2-way bet). Total rounds (Over/Under
+    1.5, 2.5...): how long the fight lasted, X.5 being halfway through round X+1, as the books grade it (a fight
+    with no winner refunds). Fights ESPN doesn't list, or whose length it doesn't give, wait (then: by hand)."""
     start = _parse_time(row["commence_time"])
     days = sorted({(start + timedelta(hours=h)).date() for h in (-12, 0, 12)})
     for d in days:
@@ -7380,6 +7404,13 @@ def grade_fight(row: dict) -> tuple[tuple[str, float], str] | tuple[None, str]:
                 stake, price = float(row["stake"]), float(row["price"])
                 if not won:
                     return ("push", 0.0), "draw / no contest"
+                if market_kind(row.get("market", "")) == "totals":
+                    length = fight_length(comp)
+                    if length is None:
+                        return None, "ESPN doesn't say when the fight ended"
+                    rnd, secs = int(length) + 1, round((length % 1) * ROUND_SECONDS)
+                    said = f"ended {secs // 60}:{secs % 60:02d} into round {rnd}" if length % 1 else f"went {rnd - 1} rounds"
+                    return settle_prop(row, length), said
                 res = "win" if same_fighter(row["outcome"], won[0]) else "loss"
                 return (res, round(stake * (price - 1) if res == "win" else -stake, 2)), f"{won[0]} won"
     return None, "fight not found on ESPN"

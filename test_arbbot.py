@@ -14541,6 +14541,31 @@ class EVBotSpec(MixFiles):
         self.assertTrue(_arbbot.same_fighter("Alexander Hernandez", "Alex Hernandez"))
         self.assertFalse(_arbbot.same_fighter("Alexander Hernandez", "Beneil Hernandez"))
 
+    def test_an_mma_total_rounds_bet_is_graded_from_when_the_fight_ended(self):
+        from unittest import mock
+        row = {"sport_key": "mma_mixed_martial_arts", "home_team": "Eric Nolan", "away_team": "Court McGee",
+               "commence_time": "2026-10-03T22:00:00Z", "market": "totals", "outcome": "Over", "point": "1.5",
+               "stake": "10", "price": "2.0"}
+        def ended(rnd, clock, **kw):
+            data = self.fight_data(**kw)
+            data["events"][0]["competitions"][0]["status"].update(period=rnd, displayClock=clock)
+            return data
+        with mock.patch("arbbot._espn", return_value=ended(2, "3:10")):      # 1.63 rounds: past halfway in round 2
+            self.assertEqual(_arbbot.grade_fight(row), (("win", 10.0), "ended 3:10 into round 2"))
+            self.assertEqual(_arbbot.grade_fight(dict(row, outcome="Under"))[0], ("loss", -10.0))
+        with mock.patch("arbbot._espn", return_value=ended(2, "1:45")):      # 1.35 rounds: before 2:30 of round 2
+            self.assertEqual(_arbbot.grade_fight(row)[0], ("loss", -10.0))
+        with mock.patch("arbbot._espn", return_value=ended(3, "5:00")):      # the distance (a decision)
+            self.assertEqual(_arbbot.grade_fight(dict(row, point="2.5")), (("win", 10.0), "went 3 rounds"))
+        with mock.patch("arbbot._espn", return_value=ended(None, "")):       # ESPN doesn't say: waits, then by hand
+            self.assertEqual(_arbbot.grade_fight(row), (None, "ESPN doesn't say when the fight ended"))
+        with mock.patch("arbbot._espn", return_value=ended(1, "2:00", winner="")):   # no contest: refunded
+            self.assertEqual(_arbbot.grade_fight(row)[0], ("push", 0.0))
+        clocked = ended(1, "")
+        clocked["events"][0]["competitions"][0]["status"]["clock"] = 280.0   # seconds, when ESPN gives them
+        with mock.patch("arbbot._espn", return_value=clocked):
+            self.assertEqual(_arbbot.grade_fight(dict(row, point="0.5"))[0], ("win", 10.0))   # 0.93 rounds
+
     def test_mma_bets_are_graded_without_paying_for_scores(self):
         from unittest import mock
         cfg, res, sent = self.results()
