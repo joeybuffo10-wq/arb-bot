@@ -14296,6 +14296,23 @@ class EVBotSpec(MixFiles):
         self.assertEqual([(x.book, round(x.ev_pct, 1)) for x in kept], [("Kalshi", 8.0), ("FanDuel", 5.0)])  # 5% < 4+3
         self.assertEqual(len(_arbbot.tune_bets([at("Kalshi", 2.10)], replace(cfg, book_extra_edge={}), t, (a,))), 1)
 
+    def test_one_side_of_a_sports_props_can_need_more_edge(self):
+        from unittest import mock
+        import os
+        with mock.patch.dict(os.environ, {"SIDE_EXTRA_EDGE": "basketball_nba:over=3"}):
+            self.assertEqual(Config.from_env().side_extra_edge, {"basketball_nba:over": 3.0})
+        cfg = Config(min_ev_pct=4, prop_min_ev_pct=7, tune_enabled=False,
+                     side_extra_edge={"basketball_nba:over": 3.0}).for_props()
+        [b] = find_evs([self.game({"B": 2.20})], Config(min_ev_pct=3), NOW)
+        prop = lambda side, price, sport="basketball_nba": replace(
+            b, market="player_points", line=("Tatum", 25.5), point=25.5, outcome=side, price=price, sport_key=sport)
+        t, a = _arbbot.Tuning(), EVAlerter(cfg, True)
+        kept = _arbbot.tune_bets([prop("Over", 2.16), prop("Over", 2.22), prop("Under", 2.16), prop("Yes", 2.16),
+                                  prop("Over", 2.16, "icehockey_nhl")], cfg, t, (a,))
+        self.assertEqual([(x.outcome, round(x.ev_pct), x.sport_key) for x in kept],
+                         [("Over", 11, "basketball_nba"), ("Under", 8, "basketball_nba"), ("Over", 8, "icehockey_nhl")])
+        # +8% NBA Over: under 7+3, out; +11%: in; the Under, the NHL Over: the usual 7%; a Yes counts as an Over
+
     def test_the_results_page_knows_each_bets_kind_for_the_clv_finder(self):
         n = _arbbot.bet_type_name
         self.assertEqual([n("player_assists"), n("player_assists_alternate"), n("spreads_h1"), n("h2h"), n("parlay")],

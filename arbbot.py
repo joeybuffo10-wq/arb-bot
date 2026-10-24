@@ -611,6 +611,9 @@ class Config:
     # BOOK_EXTRA_EDGE=kalshi=3: points of edge a new +EV/prop/half bet at that book needs on top of the usual bar
     # (a book whose alerts keep losing to the closing line). Book names as in book_slug ("kalshi", "betmgm").
     book_extra_edge: dict[str, float] = field(default_factory=dict)
+    # SIDE_EXTRA_EDGE=basketball_nba:over=3: points of edge a sport's player props on one side need on top of the usual
+    # bar (over: Overs and Yes; under: Unders and No), for a side that keeps losing to the closing line.
+    side_extra_edge: dict[str, float] = field(default_factory=dict)
     # PROP_SPORT_MIN_EV=americanfootball_nfl=10: a higher edge bar for one sport's player props only (its game lines
     # keep SPORT_MIN_EV / MIN_EV_PCT). Empty = every sport's props use PROP_MIN_EV_PCT.
     prop_sport_min_ev: dict[str, float] = field(default_factory=dict)
@@ -897,6 +900,7 @@ class Config:
             confident_hours=num("CONFIDENT_HOURS", d.confident_hours, float),
             sport_min_ev={**d.sport_min_ev, **pairs("SPORT_MIN_EV", float)},
             book_extra_edge={book_slug(k): v for k, v in pairs("BOOK_EXTRA_EDGE", float).items()},
+            side_extra_edge={k.strip().lower(): v for k, v in pairs("SIDE_EXTRA_EDGE", float).items()},
             prop_sport_min_ev=pairs("PROP_SPORT_MIN_EV", float),
             stake_boost=pairs("STAKE_BOOST", float),
             move_window_minutes=num("MOVE_WINDOW_MINUTES", d.move_window_minutes, int),
@@ -11717,7 +11721,7 @@ def tune_bets(bets: list, cfg: Config, tuning: Tuning, alerters: tuple) -> list:
     """TUNE_ENABLED: new bets (no card up in these alerters) from a book whose price is usually gone by the next
     check need TUNE_SLOW_EXTRA_PCT more edge (the others are held back, counted as "tuned out"), and each new bet's
     stake follows its book's and sport's CLV. Bets with a card up go through unchanged."""
-    if not cfg.tune_enabled and not cfg.book_extra_edge and not cfg.stake_boost:
+    if not cfg.tune_enabled and not cfg.book_extra_edge and not cfg.stake_boost and not cfg.side_extra_edge:
         return bets
     up = {k for a in alerters for k in (*a.open, *a.restored)}
     out = []
@@ -11728,6 +11732,9 @@ def tune_bets(bets: list, cfg: Config, tuning: Tuning, alerters: tuple) -> list:
         extra, why = tuning.extra_edge(cfg, b) if cfg.tune_enabled else (0.0, "")
         if own := cfg.book_extra_edge.get(book_slug(b.book), 0.0):   # (BOOK_EXTRA_EDGE)
             extra, why = extra + own, (f"{why}; " if why else "") + f"+{own:g} for {b.book} (BOOK_EXTRA_EDGE)"
+        way = PROP_UP.get((b.outcome.split() or [""])[0].lower()) if is_prop(b.line) and b.market != "team_totals" else None
+        if way and (own := cfg.side_extra_edge.get(f"{b.sport_key}:{'over' if way == 'up' else 'under'}", 0.0)):
+            extra, why = extra + own, (f"{why}; " if why else "") + f"+{own:g} for {b.sport} {b.outcome.split()[0]}s (SIDE_EXTRA_EDGE)"
         bar = max(cfg.min_ev_pct if not is_prop(b.line) else cfg.prop_min_ev_pct, cfg.sport_min_ev.get(b.sport_key, 0))
         if extra and b.ev_pct < bar + extra:
             alerters[0].held_counts["tuned out"] = alerters[0].held_counts.get("tuned out", 0) + 1
