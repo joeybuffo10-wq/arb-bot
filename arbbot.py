@@ -1663,10 +1663,11 @@ def base_market(key: str) -> str:
 # Period markets (first half, first quarter...): the same three bet types on part of a game. The Odds API sends them
 # per game, with the player props (PROP_MARKETS), and they're graded from the box score's period scores.
 PERIOD_NAMES = {"h1": "1st Half", "h2": "2nd Half", "q1": "1st Quarter", "q2": "2nd Quarter", "q3": "3rd Quarter",
-                "q4": "4th Quarter"}
-PERIOD_SHORT = {"h1": "1H", "h2": "2H", "q1": "1Q", "q2": "2Q", "q3": "3Q", "q4": "4Q"}
-PERIOD_QUARTERS = {"h1": (0, 1), "h2": (2, 3), "q1": (0,), "q2": (1,), "q3": (2,), "q4": (3,)}   # box-score periods
-_PERIOD_RE = re.compile(r"^(h2h|spreads|totals)_(h1|h2|q[1-4])$")
+                "q4": "4th Quarter", "p1": "1st Period", "p2": "2nd Period", "p3": "3rd Period"}
+PERIOD_SHORT = {"h1": "1H", "h2": "2H", "q1": "1Q", "q2": "2Q", "q3": "3Q", "q4": "4Q", "p1": "1P", "p2": "2P", "p3": "3P"}
+PERIOD_QUARTERS = {"h1": (0, 1), "h2": (2, 3), "q1": (0,), "q2": (1,), "q3": (2,), "q4": (3,),   # box-score periods
+                   "p1": (0,), "p2": (1,), "p3": (2,)}   # (hockey: a period bet never counts overtime)
+_PERIOD_RE = re.compile(r"^(h2h|spreads|totals)_(h1|h2|q[1-4]|p[1-3])$")
 
 
 def split_period(key: str) -> tuple[str, str]:
@@ -2141,6 +2142,8 @@ MARKET_NAMES = {
     **{f"{kind}_{p}": f"{name} {bet}" for p, name in (("h2", "2nd Half"), ("q2", "2nd Quarter"), ("q3", "3rd Quarter"),
                                                        ("q4", "4th Quarter"))
        for kind, bet in (("h2h", "Moneyline"), ("spreads", "Spread"), ("totals", "Total"))},
+    **{f"{kind}_p{n}": f"{name} Period {bet}" for n, name in ((1, "1st"), (2, "2nd"), (3, "3rd"))
+       for kind, bet in (("h2h", "Moneyline"), ("spreads", "Puck Line"), ("totals", "Total"))},
     # player props
     "player_pass_yds": "Passing Yards", "player_pass_tds": "Passing TDs", "player_rush_yds": "Rushing Yards",
     "player_reception_yds": "Receiving Yards", "player_receptions": "Receptions",
@@ -7407,7 +7410,10 @@ def period_scores(box: dict, market: str) -> tuple[float, float] | None:
     out = []
     for team in (sides[True], sides[False]):
         per = team.get("periods") or []
-        if len(per) <= max(quarters) or None in per or team["score"] is None or sum(per) != team["score"]:
+        # (A shootout's winner gets one goal in the final score that no period has: hockey's periods may come up 1 short.)
+        short = 1 if period.startswith("p") else 0
+        if (len(per) <= max(quarters) or None in per or team["score"] is None
+                or not 0 <= team["score"] - sum(per) <= short):
             return None
         out.append(float(sum(per[i] for i in quarters) + (sum(per[4:]) if overtime else 0)))
     return out[0], out[1]

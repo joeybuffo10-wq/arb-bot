@@ -2909,6 +2909,21 @@ class PropGrading(unittest.TestCase):
         self.assertEqual(_arbbot.row_pick(row("spreads_h2", "Buffalo Bills", "-1.5")), "2H Buffalo Bills -1.5")
         self.assertEqual(_arbbot.bet_type_name("spreads_q3"), "3rd Quarter Spread")
 
+    def test_hockey_periods_are_graded_from_each_periods_goals(self):
+        ps = _arbbot.period_scores
+        box = {"teams": {"1": {"home": True, "score": 3, "periods": [1, 0, 1, 0]},      # won in a shootout: 2 + 1
+                         "2": {"home": False, "score": 2, "periods": [0, 2, 0, 0]}}}
+        self.assertEqual(ps(box, "h2h_p1"), (1.0, 0.0))
+        self.assertEqual(ps(box, "spreads_p2"), (0.0, 2.0))
+        self.assertEqual(ps(box, "totals_p3"), (1.0, 0.0))                       # overtime never counts
+        self.assertIsNone(ps({"teams": {"1": {"home": True, "score": 5, "periods": [1, 0, 1]},
+                                        "2": {"home": False, "score": 2, "periods": [0, 2, 0]}}}, "h2h_p1"))  # doesn't add up
+        row = {"home_team": "H", "away_team": "A", "market": "h2h_p2", "outcome": "Draw", "n_outcomes": "3",
+               "stake": "10", "price": "4.0", "point": ""}
+        self.assertEqual(_arbbot.settle(row, 1, 1)[0], "win")                     # a tied period: the Draw wins
+        self.assertEqual(_arbbot.settle(dict(row, outcome="H"), 1, 1)[0], "loss")
+        self.assertEqual(_arbbot.row_pick(dict(row, market="spreads_p1", outcome="H", point="-0.5")), "1P H -0.5")
+
     def test_a_period_bet_waits_when_the_period_scores_dont_add_up(self):
         box = {"teams": {"1": {"home": True, "score": 20, "periods": [7, 7, 3, 0]},       # adds to 17, not 20
                          "2": {"home": False, "score": 10, "periods": [0, 3, 7, 0]}}}
