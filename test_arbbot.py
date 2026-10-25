@@ -2900,6 +2900,14 @@ class PropGrading(unittest.TestCase):
         self.assertEqual(_arbbot.row_pick(row("spreads_h1", "Buffalo Bills", "-9.5")), "1H Buffalo Bills -9.5")
         self.assertEqual(_arbbot.row_pick(row("h2h_h1", "New York Jets")), "1H New York Jets ML")
         self.assertEqual(_arbbot.row_pick(row("totals_q1", "Under", "10")), "1Q Under 10")
+        # Oct 25: the 2nd half and the 4th quarter count overtime (Jets: 7+7, then a field goal in overtime)
+        self.assertEqual(grade_period(row("h2h_h2", "New York Jets"))[1], "17-10")
+        self.assertEqual(grade_period(row("h2h_h2", "New York Jets"))[0][0], "win")
+        self.assertEqual(grade_period(row("spreads_q4", "Buffalo Bills", "+2.5"))[0][0], "loss")   # 7-10 with OT
+        self.assertEqual(grade_period(row("h2h_q3", "New York Jets"))[0][0], "win")                # 7-3
+        self.assertEqual(grade_period(row("h2h_q2", "New York Jets", n=2))[0][0], "loss")          # 3-10
+        self.assertEqual(_arbbot.row_pick(row("spreads_h2", "Buffalo Bills", "-1.5")), "2H Buffalo Bills -1.5")
+        self.assertEqual(_arbbot.bet_type_name("spreads_q3"), "3rd Quarter Spread")
 
     def test_a_period_bet_waits_when_the_period_scores_dont_add_up(self):
         box = {"teams": {"1": {"home": True, "score": 20, "periods": [7, 7, 3, 0]},       # adds to 17, not 20

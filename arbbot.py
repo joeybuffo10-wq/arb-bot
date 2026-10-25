@@ -2138,6 +2138,9 @@ MARKET_NAMES = {
     "h2h": "Moneyline", "spreads": "Spread", "totals": "Total",
     "h2h_h1": "1st Half Moneyline", "spreads_h1": "1st Half Spread", "totals_h1": "1st Half Total",
     "h2h_q1": "1st Quarter Moneyline", "spreads_q1": "1st Quarter Spread", "totals_q1": "1st Quarter Total",
+    **{f"{kind}_{p}": f"{name} {bet}" for p, name in (("h2", "2nd Half"), ("q2", "2nd Quarter"), ("q3", "3rd Quarter"),
+                                                       ("q4", "4th Quarter"))
+       for kind, bet in (("h2h", "Moneyline"), ("spreads", "Spread"), ("totals", "Total"))},
     # player props
     "player_pass_yds": "Passing Yards", "player_pass_tds": "Passing TDs", "player_rush_yds": "Rushing Yards",
     "player_reception_yds": "Receiving Yards", "player_receptions": "Receptions",
@@ -7392,9 +7395,12 @@ def find_player(box: dict, name: str) -> dict | None:
 
 
 def period_scores(box: dict, market: str) -> tuple[float, float] | None:
-    """(home, away) points in a period market's part of the game (spreads_h1: quarters 1 and 2), from the box
+    """(home, away) points in a period market's part of the game (spreads_h1: quarters 1 and 2; the 2nd half and the
+    4th quarter with any overtime, as the books grade them), from the box
     score's period scores, or None when they aren't all there or don't add up to the final score."""
-    quarters = PERIOD_QUARTERS[split_period(market)[1]]
+    period = split_period(market)[1]
+    quarters = PERIOD_QUARTERS[period]
+    overtime = period in ("h2", "q4")   # at the books a 2nd-half or 4th-quarter bet includes overtime
     sides = {t["home"]: t for t in box["teams"].values()}
     if set(sides) != {True, False}:
         return None
@@ -7403,7 +7409,7 @@ def period_scores(box: dict, market: str) -> tuple[float, float] | None:
         per = team.get("periods") or []
         if len(per) <= max(quarters) or None in per or team["score"] is None or sum(per) != team["score"]:
             return None
-        out.append(float(sum(per[i] for i in quarters)))
+        out.append(float(sum(per[i] for i in quarters) + (sum(per[4:]) if overtime else 0)))
     return out[0], out[1]
 
 
