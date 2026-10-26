@@ -684,6 +684,7 @@ class Config:
     more_parlays_webhook_url: str = ""
     more_parlays_min_ev_pct: float = 3.0
     more_parlays_max: int = 10
+    more_parlays_legs: int = 3          # legs per parlay, each at least fair at that book
     more_parlay_log_file: str = "more_parlays.csv"
     closing_minutes: int = 5        # one last check this close to kickoff for games with logged bets
     # Outliers: one book far off every other book's price
@@ -960,6 +961,7 @@ class Config:
             more_parlays_webhook_url=e("DISCORD_MORE_PARLAYS_WEBHOOK_URL", ""),
             more_parlays_min_ev_pct=num("MORE_PARLAYS_MIN_EV_PCT", d.more_parlays_min_ev_pct, float),
             more_parlays_max=num("MORE_PARLAYS_MAX", d.more_parlays_max, int),
+            more_parlays_legs=num("MORE_PARLAYS_LEGS", d.more_parlays_legs, int),
             more_parlay_log_file=e("MORE_PARLAY_LOG_FILE", d.more_parlay_log_file),
             closing_minutes=num("CLOSING_MINUTES", d.closing_minutes, int),
             outliers_enabled=e("OUTLIERS_ENABLED", "true").lower() in ("1", "true", "yes"),
@@ -8720,7 +8722,8 @@ MORE_PARLAY_FRESH = 600   # seconds: a more parlays leg's price was seen this re
 def find_more_parlays(pool: BoostPool, cfg: Config, now: datetime, keep: frozenset | set = frozenset(),
                       taken: frozenset | set = frozenset()) -> list[Parlay]:
     """More parlays, built like the profit boost picks (best_boosts) from the FanDuel/DraftKings prices near fair, but
-    +EV with no boost: 2 to PARLAY_MAX_LEGS legs from different games, at most +2000, at least MORE_PARLAYS_MIN_EV_PCT.
+    +EV with no boost: MORE_PARLAYS_LEGS legs from different games, each at least fair (priced off the sharp line,
+    so they should beat the close), at most +2000, at least MORE_PARLAYS_MIN_EV_PCT.
     Parlays already posted (keep) that still qualify first, then best first; no two share a leg, and a new one uses
     no leg in taken (leg_id: another posted slip). Pre-game only, no MMA or halves/quarters (graded from the scores)."""
     if not cfg.more_parlays_webhook_url:
@@ -8730,11 +8733,11 @@ def find_more_parlays(pool: BoostPool, cfg: Config, now: datetime, keep: frozens
         seen = {k[1]: ts for k, (_, ts) in pool.bets.items() if k[0] == book}
         legs = [b for b in pool.fresh(now, book)
                 if now.timestamp() - seen.get(b.key, 0) <= MORE_PARLAY_FRESH and not b.sport_key.startswith("mma")
-                and not is_period(b.market)]
+                and not is_period(b.market) and b.fair_prob * b.price >= 1]
         ranked = sorted((b for b in legs if bet_leg_id(b) not in taken),
                         key=lambda b: b.fair_prob * b.price, reverse=True)[:14]
         by_key = {b.key: b for b in legs}
-        combos = [c for n in range(2, cfg.parlay_max_legs + 1) for c in itertools.combinations(ranked, n)]
+        combos = list(itertools.combinations(ranked, max(2, cfg.more_parlays_legs)))
         for key in keep:   # posted ones, re-scored from the current prices
             try:
                 bk, leg_keys = _parlay_leg_keys(key)

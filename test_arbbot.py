@@ -452,6 +452,10 @@ class ProfitBoosts(unittest.TestCase):
         self.assertEqual(len({_arbbot.bet_leg_id(b) for p in out for b, _, _ in p.legs}), 9)
         self.assertAlmostEqual(out[0].ev_pct, (1.03 ** 3 - 1) * 100)    # each leg 3% over fair at FanDuel
         self.assertTrue(all(p.book == "FanDuel" and p.stake > 0 for p in out))
+        self.assertTrue(all(len(p.legs) == 3 for p in out))
+        self.assertEqual(len(_arbbot.find_more_parlays(self.more_pool(games=8), cfg, NOW)), 2)   # 3 legs, never 2
+        self.assertEqual(_arbbot.find_more_parlays(self.more_pool(price=1.97), replace(cfg, more_parlays_min_ev_pct=-9),
+                                                   NOW), [])                    # a leg under fair is never used
         self.assertEqual(_arbbot.find_more_parlays(self.more_pool(price=2.00), cfg, NOW), [])   # fair: not +EV
         self.assertEqual(_arbbot.find_more_parlays(self.more_pool(), Config(), NOW), [])        # no channel: off
         taken = {_arbbot.bet_leg_id(b) for b, _, _ in out[0].legs}
