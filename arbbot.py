@@ -686,6 +686,8 @@ class Config:
     more_parlays_max: int = 10
     more_parlays_legs: int = 3          # legs per parlay, each at least fair at that book
     more_parlays_units: float = 0.0     # every one this many units (0 = sized like the parlays)
+    # Or dollars, "5-15": the low end at MORE_PARLAYS_MIN_EV_PCT, up to the high end at MORE_PARLAY_FULL_EV (wins).
+    more_parlays_stake: str = ""
     more_parlay_log_file: str = "more_parlays.csv"
     closing_minutes: int = 5        # one last check this close to kickoff for games with logged bets
     # Outliers: one book far off every other book's price
@@ -964,6 +966,7 @@ class Config:
             more_parlays_max=num("MORE_PARLAYS_MAX", d.more_parlays_max, int),
             more_parlays_legs=num("MORE_PARLAYS_LEGS", d.more_parlays_legs, int),
             more_parlays_units=num("MORE_PARLAYS_UNITS", d.more_parlays_units, float),
+            more_parlays_stake=e("MORE_PARLAYS_STAKE", "").strip(),
             more_parlay_log_file=e("MORE_PARLAY_LOG_FILE", d.more_parlay_log_file),
             closing_minutes=num("CLOSING_MINUTES", d.closing_minutes, int),
             outliers_enabled=e("OUTLIERS_ENABLED", "true").lower() in ("1", "true", "yes"),
@@ -8719,6 +8722,19 @@ def best_boosts(pool: BoostPool, book: str, boost_pct: float, now: datetime, min
 
 
 MORE_PARLAY_FRESH = 600   # seconds: a more parlays leg's price was seen this recently
+MORE_PARLAY_FULL_EV = 15.0   # % EV: a more parlay this good gets the top of MORE_PARLAYS_STAKE
+
+
+def more_parlay_stake(p: Parlay, cfg: Config) -> float:
+    """MORE_PARLAYS_STAKE ("5-15" dollars, more the better its EV), else MORE_PARLAYS_UNITS, else like the parlays."""
+    if m := re.fullmatch(r"\$?(\d+(?:\.\d+)?)\s*-\s*\$?(\d+(?:\.\d+)?)", cfg.more_parlays_stake):
+        lo, hi = float(m.group(1)), float(m.group(2))
+        span = MORE_PARLAY_FULL_EV - cfg.more_parlays_min_ev_pct
+        f = min(1.0, max(0.0, (p.ev_pct - cfg.more_parlays_min_ev_pct) / span)) if span > 0 else 1.0
+        return float(round(lo + (hi - lo) * f))
+    if cfg.more_parlays_units > 0:
+        return round(cfg.more_parlays_units * cfg.unit(), 2)
+    return round_stake(kelly_stake(p.fair_prob, p.price, cfg), cfg.ev_bankroll * cfg.parlay_max_stake_pct / 100, cfg)
 
 
 def find_more_parlays(pool: BoostPool, cfg: Config, now: datetime, keep: frozenset | set = frozenset(),
@@ -8758,8 +8774,7 @@ def find_more_parlays(pool: BoostPool, cfg: Config, now: datetime, keep: frozens
         keys = {bet_leg_id(b) for b, _, _ in p.legs}
         if keys & used or (p.key not in keep and keys & set(taken)):
             continue
-        p.stake = (round(cfg.more_parlays_units * cfg.unit(), 2) if cfg.more_parlays_units > 0 else
-                   round_stake(kelly_stake(p.fair_prob, p.price, cfg), cfg.ev_bankroll * cfg.parlay_max_stake_pct / 100, cfg))
+        p.stake = more_parlay_stake(p, cfg)
         out.append(p)
         used |= keys
         if len(out) >= cfg.more_parlays_max:

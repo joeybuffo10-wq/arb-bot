@@ -455,6 +455,11 @@ class ProfitBoosts(unittest.TestCase):
         self.assertTrue(all(len(p.legs) == 3 for p in out))
         flat = _arbbot.find_more_parlays(self.more_pool(), replace(cfg, more_parlays_units=1, unit_size=20), NOW)
         self.assertEqual([p.stake_label for p in flat], ["$20 (1u)"] * 3)    # MORE_PARLAYS_UNITS: 1 unit each
+        dollars = replace(cfg, more_parlays_stake="5-15", more_parlays_min_ev_pct=6, more_parlays_units=1)
+        self.assertEqual([p.stake for p in _arbbot.find_more_parlays(self.more_pool(), dollars, NOW)], [9.0] * 3)   # +9.3% EV
+        self.assertEqual([p.stake for p in _arbbot.find_more_parlays(self.more_pool(price=2.20), dollars, NOW)],
+                         [15.0] * 3)                                     # +33% EV: the top of the range
+        self.assertEqual(_arbbot.more_parlay_stake(out[0], replace(dollars, more_parlays_min_ev_pct=9.3)), 5.0)
         self.assertEqual(len(_arbbot.find_more_parlays(self.more_pool(games=8), cfg, NOW)), 2)   # 3 legs, never 2
         self.assertEqual(_arbbot.find_more_parlays(self.more_pool(price=1.97), replace(cfg, more_parlays_min_ev_pct=-9),
                                                    NOW), [])                    # a leg under fair is never used
