@@ -685,6 +685,7 @@ class Config:
     more_parlays_min_ev_pct: float = 3.0
     more_parlays_max: int = 10
     more_parlays_legs: int = 3          # legs per parlay, each at least fair at that book
+    more_parlays_leg_min_ev_pct: float = 0.0   # and each leg at least this +EV on its own
     more_parlays_units: float = 0.0     # every one this many units (0 = sized like the parlays)
     # Or dollars, "5-15": the low end at MORE_PARLAYS_MIN_EV_PCT, up to the high end at MORE_PARLAY_FULL_EV (wins).
     more_parlays_stake: str = ""
@@ -965,6 +966,7 @@ class Config:
             more_parlays_min_ev_pct=num("MORE_PARLAYS_MIN_EV_PCT", d.more_parlays_min_ev_pct, float),
             more_parlays_max=num("MORE_PARLAYS_MAX", d.more_parlays_max, int),
             more_parlays_legs=num("MORE_PARLAYS_LEGS", d.more_parlays_legs, int),
+            more_parlays_leg_min_ev_pct=num("MORE_PARLAYS_LEG_MIN_EV_PCT", d.more_parlays_leg_min_ev_pct, float),
             more_parlays_units=num("MORE_PARLAYS_UNITS", d.more_parlays_units, float),
             more_parlays_stake=e("MORE_PARLAYS_STAKE", "").strip(),
             more_parlay_log_file=e("MORE_PARLAY_LOG_FILE", d.more_parlay_log_file),
@@ -8741,7 +8743,7 @@ def find_more_parlays(pool: BoostPool, cfg: Config, now: datetime, keep: frozens
                       taken: frozenset | set = frozenset()) -> list[Parlay]:
     """More parlays, built like the profit boost picks (best_boosts) from the FanDuel/DraftKings prices near fair, but
     +EV with no boost: MORE_PARLAYS_LEGS legs from different games, each at least fair (priced off the sharp line,
-    so they should beat the close), at most +2000, at least MORE_PARLAYS_MIN_EV_PCT.
+    so they should beat the close) and at least MORE_PARLAYS_LEG_MIN_EV_PCT, at most +2000, at least MORE_PARLAYS_MIN_EV_PCT.
     Parlays already posted (keep) that still qualify first, then best first; no two share a leg, and a new one uses
     no leg in taken (leg_id: another posted slip). Pre-game only, no MMA or halves/quarters (graded from the scores)."""
     if not cfg.more_parlays_webhook_url:
@@ -8751,7 +8753,8 @@ def find_more_parlays(pool: BoostPool, cfg: Config, now: datetime, keep: frozens
         seen = {k[1]: ts for k, (_, ts) in pool.bets.items() if k[0] == book}
         legs = [b for b in pool.fresh(now, book)
                 if now.timestamp() - seen.get(b.key, 0) <= MORE_PARLAY_FRESH and not b.sport_key.startswith("mma")
-                and not is_period(b.market) and b.fair_prob * b.price >= 1]
+                and not is_period(b.market)
+                and (b.fair_prob * b.price - 1) * 100 >= max(0.0, cfg.more_parlays_leg_min_ev_pct) - 1e-9]
         ranked = sorted((b for b in legs if bet_leg_id(b) not in taken),
                         key=lambda b: b.fair_prob * b.price, reverse=True)[:14]
         by_key = {b.key: b for b in legs}

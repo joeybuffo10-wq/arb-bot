@@ -453,6 +453,10 @@ class ProfitBoosts(unittest.TestCase):
         self.assertAlmostEqual(out[0].ev_pct, (1.03 ** 3 - 1) * 100)    # each leg 3% over fair at FanDuel
         self.assertTrue(all(p.book == "FanDuel" and p.stake > 0 for p in out))
         self.assertTrue(all(len(p.legs) == 3 for p in out))
+        self.assertEqual(_arbbot.find_more_parlays(self.more_pool(), replace(cfg, more_parlays_leg_min_ev_pct=10), NOW),
+                         [])                                             # legs +3%: under MORE_PARLAYS_LEG_MIN_EV_PCT
+        self.assertEqual(len(_arbbot.find_more_parlays(self.more_pool(price=2.20),
+                                                       replace(cfg, more_parlays_leg_min_ev_pct=10), NOW)), 3)
         flat = _arbbot.find_more_parlays(self.more_pool(), replace(cfg, more_parlays_units=1, unit_size=20), NOW)
         self.assertEqual([p.stake_label for p in flat], ["$20 (1u)"] * 3)    # MORE_PARLAYS_UNITS: 1 unit each
         dollars = replace(cfg, more_parlays_stake="5-15", more_parlays_min_ev_pct=6, more_parlays_units=1)
