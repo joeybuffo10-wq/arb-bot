@@ -9,6 +9,7 @@ markouts.csv
 score_checks.csv
 candidates.csv
 parlays.csv
+more_parlays.csv
 state/
 .update-skipped
 .update-fetch-failed

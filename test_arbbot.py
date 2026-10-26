@@ -435,6 +435,47 @@ class ProfitBoosts(unittest.TestCase):
         self.assertEqual(_arbbot.parlay_legs_taken(cfg, NOW), set(legs))   # and the parlays won't use them
         self.assertEqual(_arbbot.best_boosts(pool, "fanduel", 50, NOW, taken=set(legs)), [])
 
+    def more_pool(self, price=2.06, games=9):
+        pool = _arbbot.BoostPool()
+        evs = []
+        for i in range(games):
+            ev = ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"FanDuel": [("Home", price, None)]})
+            ev["id"] = f"g{i}"
+            evs.append(ev)
+        find_evs(evs, Config(min_ev_pct=3), NOW, pool=pool)
+        return pool
+
+    def test_more_parlays_are_boost_style_parlays_that_are_ev_with_no_boost(self):
+        cfg = Config(more_parlays_webhook_url="https://more", ev_bankroll=1000, round_stakes=0)
+        out = _arbbot.find_more_parlays(self.more_pool(), cfg, NOW)
+        self.assertEqual(len(out), 3)                                    # 9 games, 3 legs each, no leg twice
+        self.assertEqual(len({_arbbot.bet_leg_id(b) for p in out for b, _, _ in p.legs}), 9)
+        self.assertAlmostEqual(out[0].ev_pct, (1.03 ** 3 - 1) * 100)    # each leg 3% over fair at FanDuel
+        self.assertTrue(all(p.book == "FanDuel" and p.stake > 0 for p in out))
+        self.assertEqual(_arbbot.find_more_parlays(self.more_pool(price=2.00), cfg, NOW), [])   # fair: not +EV
+        self.assertEqual(_arbbot.find_more_parlays(self.more_pool(), Config(), NOW), [])        # no channel: off
+        taken = {_arbbot.bet_leg_id(b) for b, _, _ in out[0].legs}
+        later = _arbbot.find_more_parlays(self.more_pool(), cfg, NOW, taken=taken)
+        self.assertEqual(len(later), 2)                                  # another slip's legs aren't reused
+        keep = _arbbot.find_more_parlays(self.more_pool(), cfg, NOW, keep={out[0].key}, taken=taken)
+        self.assertIn(out[0].key, {p.key for p in keep})                 # but a posted one stays up
+
+    def test_more_parlays_post_to_their_channel_and_take_their_legs(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        cfg = Config(more_parlays_webhook_url="https://more", ev_webhook_url="https://ev", parlay_mention="<@&1>",
+                     parlay_log_file="", more_parlay_log_file=str(Path(d) / "more.csv"))
+        a = _arbbot.MoreParlayAlerter(cfg, dry_run=True)
+        out = _arbbot.find_more_parlays(self.more_pool(), cfg, NOW)
+        self.assertEqual(a.webhook_for(out[0]), "https://more")
+        self.assertEqual(a.mention(), "")                                # no pings: there can be a lot of them
+        self.assertEqual(a.log_path(), cfg.more_parlay_log_file)
+        for p in out:
+            _arbbot.append_csv(cfg.more_parlay_log_file, _arbbot.PARLAY_FIELDS,
+                       {"first_seen": "2026-10-03T12:00:00+00:00", **a.row(_arbbot.OpenArb(p, 0, 0, p.ev_pct))})
+        self.assertEqual(len(_arbbot.parlay_legs_taken(cfg, NOW)), 9)   # the parlays and boosts won't reuse them
+        self.assertEqual(len([b for b in _arbbot.logged_bets(cfg).values() if b["kind"] == "parlay"]), 3)   # graded
+
     def test_the_boost_command(self):
         pool = self.pool()
         reply = _arbbot.boost_reply(Config(), pool, "!boost 50% fanduel $25 parlay", NOW)

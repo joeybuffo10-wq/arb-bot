@@ -186,6 +186,7 @@ WEBHOOK_SETTINGS = {
     "free": ("DISCORD_FREE_WEBHOOK_URL", "the free preview: each winning player prop, once it's graded"),
     "top3": ("DISCORD_TOP3_WEBHOOK_URL", "💎 Elite bets (they go there instead of the +EV channel)"),
     "boosts": ("DISCORD_BOOSTS_WEBHOOK_URL", "the daily best bets for profit boosts at FanDuel and DraftKings"),
+    "more-parlays": ("DISCORD_MORE_PARLAYS_WEBHOOK_URL", "more parlays: built like the profit boost picks, no boost needed"),
 }
 
 
@@ -676,6 +677,14 @@ class Config:
     parlay_max_stake_pct: float = 1.0   # of EV_BANKROLL
     parlay_mention: str = ""
     parlay_log_file: str = "parlays.csv"
+    # More parlays (DISCORD_MORE_PARLAYS_WEBHOOK_URL; empty = off): built the way the profit boost picks are, from
+    # FanDuel/DraftKings prices near fair against the sharp line, but +EV on their own (MORE_PARLAYS_MIN_EV_PCT, no
+    # boost needed). Up to MORE_PARLAYS_MAX at once, none sharing a leg with each other or any other posted slip.
+    # Logged to MORE_PARLAY_LOG_FILE, graded and in the record like the parlays.
+    more_parlays_webhook_url: str = ""
+    more_parlays_min_ev_pct: float = 3.0
+    more_parlays_max: int = 10
+    more_parlay_log_file: str = "more_parlays.csv"
     closing_minutes: int = 5        # one last check this close to kickoff for games with logged bets
     # Outliers: one book far off every other book's price
     outliers_enabled: bool = True
@@ -948,6 +957,10 @@ class Config:
             ntfy_topic=e("NTFY_TOPIC", "").strip(),
             ntfy_server=(e("NTFY_SERVER", "") or d.ntfy_server).strip().rstrip("/"),
             parlay_log_file=e("PARLAY_LOG_FILE", d.parlay_log_file),
+            more_parlays_webhook_url=e("DISCORD_MORE_PARLAYS_WEBHOOK_URL", ""),
+            more_parlays_min_ev_pct=num("MORE_PARLAYS_MIN_EV_PCT", d.more_parlays_min_ev_pct, float),
+            more_parlays_max=num("MORE_PARLAYS_MAX", d.more_parlays_max, int),
+            more_parlay_log_file=e("MORE_PARLAY_LOG_FILE", d.more_parlay_log_file),
             closing_minutes=num("CLOSING_MINUTES", d.closing_minutes, int),
             outliers_enabled=e("OUTLIERS_ENABLED", "true").lower() in ("1", "true", "yes"),
             outlier_min_pct=num("OUTLIER_MIN_PCT", d.outlier_min_pct, float),
@@ -1166,7 +1179,8 @@ class Config:
                           ("backup_webhook_url", "DISCORD_BACKUP_WEBHOOK_URL"),
                           ("free_webhook_url", "DISCORD_FREE_WEBHOOK_URL"),
                           ("top3_webhook_url", "DISCORD_TOP3_WEBHOOK_URL"),
-                          ("boosts_webhook_url", "DISCORD_BOOSTS_WEBHOOK_URL")):
+                          ("boosts_webhook_url", "DISCORD_BOOSTS_WEBHOOK_URL"),
+                          ("more_parlays_webhook_url", "DISCORD_MORE_PARLAYS_WEBHOOK_URL")):
             value = getattr(self, attr)
             if value and not value.startswith(("https://", "http://")):
                 bad.append(env)
@@ -6201,13 +6215,18 @@ def _taken_from(name: str, read) -> set[tuple[str, str]]:
     return _TAKEN_CACHE[name][1]
 
 
+def parlay_log_files(cfg: Config) -> list[str]:
+    """The parlay logs: the parlays' and the more parlays' (MORE_PARLAY_LOG_FILE)."""
+    return [n for n in (cfg.parlay_log_file, cfg.more_parlay_log_file) if n]
+
+
 def parlay_legs_taken(cfg: Config, now: datetime) -> set[str]:
     """Every leg (leg_id) already in a posted slip whose game hasn't started: a parlay (the parlay log) or a pick
-    of the daily boosts post (BOOST_LEGS_FILE). A bet goes into one slip only, so one leg that misses can't sink
+    of the daily boosts post (BOOST_LEGS_FILE), the more parlays included. A bet goes into one slip only, so one leg that misses can't sink
     several of them."""
     pairs: set[tuple[str, str]] = set()
-    if cfg.parlay_log_file:
-        pairs |= _taken_from(cfg.parlay_log_file, lambda rows: {(l.get("commence_time", ""), leg_id(
+    for name in parlay_log_files(cfg):
+        pairs |= _taken_from(name, lambda rows: {(l.get("commence_time", ""), leg_id(
             l.get("event_id"), l.get("market"), l.get("player"), l.get("outcome"), l.get("point")))
             for r in rows for l in parlay_legs(r)})
     if marker := _day_marker(cfg, BOOST_LEGS_FILE):
@@ -6371,6 +6390,20 @@ class ParlayAlerter(Alerter):
                                          for b, pr, _ in p.legs])}
 
 
+class MoreParlayAlerter(ParlayAlerter):
+    """The more parlays channel (DISCORD_MORE_PARLAYS_WEBHOOK_URL): the same cards, its own log, no pings."""
+    noun = "more parlays"
+
+    def log_path(self) -> str:
+        return self.cfg.more_parlay_log_file
+
+    def webhook_for(self, item) -> str:
+        return self.cfg.more_parlays_webhook_url
+
+    def mention(self) -> str:
+        return ""
+
+
 # --------------------------------------------------------------------------- +EV results
 
 RESULT_FIELDS = EV_LOG_FIELDS + ["home_score", "away_score", "result", "profit", "kind",
@@ -6467,7 +6500,7 @@ def logged_bets(cfg: Config, since: datetime | None = None) -> dict[str, dict]:
     out: dict[str, dict] = {}
     closing = {r["bet_id"]: float(r["closing_fair_prob"]) for r in _read_csv(cfg.closing_file)}
     for kind, name in (("ev", cfg.ev_log_file), ("outlier", cfg.outlier_log_file),
-                       ("parlay", cfg.parlay_log_file)):
+                       *(("parlay", n) for n in parlay_log_files(cfg))):
         for r in _read_csv(name) if name else []:
             if kind == "parlay":
                 r = _parlay_row(r)
@@ -8681,6 +8714,54 @@ def best_boosts(pool: BoostPool, book: str, boost_pct: float, now: datetime, min
     return out
 
 
+MORE_PARLAY_FRESH = 600   # seconds: a more parlays leg's price was seen this recently
+
+
+def find_more_parlays(pool: BoostPool, cfg: Config, now: datetime, keep: frozenset | set = frozenset(),
+                      taken: frozenset | set = frozenset()) -> list[Parlay]:
+    """More parlays, built like the profit boost picks (best_boosts) from the FanDuel/DraftKings prices near fair, but
+    +EV with no boost: 2 to PARLAY_MAX_LEGS legs from different games, at most +2000, at least MORE_PARLAYS_MIN_EV_PCT.
+    Parlays already posted (keep) that still qualify first, then best first; no two share a leg, and a new one uses
+    no leg in taken (leg_id: another posted slip). Pre-game only, no MMA or halves/quarters (graded from the scores)."""
+    if not cfg.more_parlays_webhook_url:
+        return []
+    found: dict[str, Parlay] = {}
+    for book in BOOST_BOOKS:
+        seen = {k[1]: ts for k, (_, ts) in pool.bets.items() if k[0] == book}
+        legs = [b for b in pool.fresh(now, book)
+                if now.timestamp() - seen.get(b.key, 0) <= MORE_PARLAY_FRESH and not b.sport_key.startswith("mma")
+                and not is_period(b.market)]
+        ranked = sorted((b for b in legs if bet_leg_id(b) not in taken),
+                        key=lambda b: b.fair_prob * b.price, reverse=True)[:14]
+        by_key = {b.key: b for b in legs}
+        combos = [c for n in range(2, cfg.parlay_max_legs + 1) for c in itertools.combinations(ranked, n)]
+        for key in keep:   # posted ones, re-scored from the current prices
+            try:
+                bk, leg_keys = _parlay_leg_keys(key)
+            except ValueError:
+                continue
+            if book_slug(bk) == book and all(k in by_key for k in leg_keys):
+                combos.append(tuple(by_key[k] for k in leg_keys))
+        for combo in combos:
+            if len({b.event_id for b in combo}) < len(combo) or math.prod(b.price for b in combo) > BOOST_MAX_PRICE:
+                continue
+            p = Parlay(combo[0].book, [(b, b.price, b.link) for b in combo], unit_size=cfg.unit())
+            if p.ev_pct >= cfg.more_parlays_min_ev_pct:
+                found[p.key] = p
+    out, used = [], set()
+    for p in sorted(found.values(), key=lambda p: (p.key in keep, p.ev_pct), reverse=True):
+        keys = {bet_leg_id(b) for b, _, _ in p.legs}
+        if keys & used or (p.key not in keep and keys & set(taken)):
+            continue
+        p.stake = round_stake(kelly_stake(p.fair_prob, p.price, cfg),
+                              cfg.ev_bankroll * cfg.parlay_max_stake_pct / 100, cfg)
+        out.append(p)
+        used |= keys
+        if len(out) >= cfg.more_parlays_max:
+            break
+    return out
+
+
 def boost_lines(cfg: Config, picks: list[dict], book_title: str) -> list[str]:
     lines = []
     for i, c in enumerate(picks, 1):
@@ -9059,8 +9140,9 @@ class ClosingTracker:
             for r in _read_csv(name) if name else []:
                 if _parse_time(r["commence_time"]) > now:
                     self.add(r, kind)
-        for r in _read_csv(cfg.parlay_log_file) if cfg.parlay_log_file else []:
-            self.add_parlay(r, now)
+        for name in parlay_log_files(cfg):
+            for r in _read_csv(name):
+                self.add_parlay(r, now)
 
     def add_parlay(self, row: dict, now: datetime | None = None) -> None:
         """Follow each leg of a logged parlay to its kickoff, like a single bet, so the parlay gets a closing line too
@@ -11799,6 +11881,8 @@ class Trackers:
         for a in (self.outs, self.prop_outs, self.period_outs):
             a.on_log = functools.partial(self.closing.add, kind="outlier")
         self.parlays.on_log = self.closing.add_parlay
+        self.more_parlays = MoreParlayAlerter(cfg, dry_run=dry)
+        self.more_parlays.on_log = self.closing.add_parlay
         # Every new alert's price is checked again on the next checks (markouts; not for --once,
         # --demo or --dry-run).
         self.markouts = make_markouts(cfg, args, [self.arbs, self.evs, self.outs, self.prop_arbs, self.prop_evs,
@@ -11808,13 +11892,14 @@ class Trackers:
         off = any(getattr(args, flag, False) for flag in ("once", "demo", "dry_run"))
         self.held = HeldTally(cfg, None if off else held_path(cfg))
         for a in (self.arbs, self.evs, self.outs, self.prop_arbs, self.prop_evs, self.prop_outs, self.parlays,
-                  self.period_evs, self.period_outs):
+                  self.more_parlays, self.period_evs, self.period_outs):
             a.on_held = self.held.add
         # Bets alerted once already (ONE_ALERT_PER_BET), one memory for every bet alerter: +EV and outliers share
         # keys. Saved only by the service (not --once, --demo or --dry-run), so a restart remembers them.
         self.alerted = AlertedBets(None if off or not cfg.state_dir or not cfg.webhook_url
                                    else data_path(cfg.state_dir) / "alerted_bets.json")
-        for a in (self.evs, self.outs, self.prop_evs, self.prop_outs, self.parlays, self.period_evs, self.period_outs):
+        for a in (self.evs, self.outs, self.prop_evs, self.prop_outs, self.parlays, self.more_parlays, self.period_evs,
+                  self.period_outs):
             a.alerted = self.alerted
         # ✅ bet tracking (DISCORD_BOT_TOKEN; not --once, --demo or --dry-run).
         self.reactions = BetReactions(cfg, off)
@@ -11822,8 +11907,8 @@ class Trackers:
         self.boost_pool = BoostPool()
         self.reactions.command = self.command
         if self.reactions.on:
-            for a in (self.evs, self.outs, self.prop_evs, self.prop_outs, self.parlays, self.period_evs,
-                      self.period_outs):
+            for a in (self.evs, self.outs, self.prop_evs, self.prop_outs, self.parlays, self.more_parlays,
+                      self.period_evs, self.period_outs):
                 a.on_posted = self.reactions.add
         # Bets that came close and what happened to them (CANDIDATE_LOG_FILE; not for --once, --demo or --dry-run).
         self.candidates = CandidateLog(replace(cfg, candidate_log_file="") if off else cfg)
@@ -12183,13 +12268,18 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
     def update_parlays() -> int:
         open_bets = parlay_bets(ev_alerter, prop_evs, out_alerter, prop_outs)
         now = datetime.now(timezone.utc)
-        return parlay_alerter.handle(find_parlays(open_bets, cfg,
-                                                  keep=set(parlay_alerter.open) | set(parlay_alerter.restored),
-                                                  now=now, taken=parlay_legs_taken(cfg, now)))
+        n = parlay_alerter.handle(find_parlays(open_bets, cfg,
+                                               keep=set(parlay_alerter.open) | set(parlay_alerter.restored),
+                                               now=now, taken=parlay_legs_taken(cfg, now)))
+        if cfg.more_parlays_webhook_url:   # (after the parlays: their new legs are taken by now)
+            more = t.more_parlays
+            n += more.handle(find_more_parlays(t.boost_pool, cfg, now, keep=set(more.open) | set(more.restored),
+                                               taken=parlay_legs_taken(cfg, now)))
+        return n
 
     if args.demo:
         # Sample data must never reach the real logs (it would be graded and counted).
-        for a in (alerter, ev_alerter, out_alerter, parlay_alerter):
+        for a in (alerter, ev_alerter, out_alerter, parlay_alerter, t.more_parlays):
             a.log_path = lambda: ""
             a._state_path = lambda: None
             a.restored = {}
@@ -12302,11 +12392,12 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
             if periods_on(cfg):
                 sections.append(("🕐 **Halves & quarters**", f"{t.period_evs.summary()}; {t.period_outs.summary()}"))
             if cfg.parlays_enabled:
-                sections.append(("📦 **Parlays**", parlay_alerter.summary()))
+                sections.append(("📦 **Parlays**", parlay_alerter.summary()
+                                 + (f"; more parlays: {t.more_parlays.summary()}" if cfg.more_parlays_webhook_url else "")))
             book = getattr(api, "costs", None)
             status.send_card(summary_payload(cfg, sections, api.remaining, book.take_today() if book else None))
-            for a in (alerter, ev_alerter, out_alerter, parlay_alerter, prop_arbs, prop_evs, prop_outs, t.period_evs,
-                      t.period_outs):
+            for a in (alerter, ev_alerter, out_alerter, parlay_alerter, t.more_parlays, prop_arbs, prop_evs, prop_outs,
+                      t.period_evs, t.period_outs):
                 a.reset_stats()
 
         if cfg.log_keep_days and not (args.once or args.dry_run) and local.date() != pruned_day:
