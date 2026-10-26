@@ -685,6 +685,7 @@ class Config:
     more_parlays_min_ev_pct: float = 3.0
     more_parlays_max: int = 10
     more_parlays_legs: int = 3          # legs per parlay, each at least fair at that book
+    more_parlays_units: float = 0.0     # every one this many units (0 = sized like the parlays)
     more_parlay_log_file: str = "more_parlays.csv"
     closing_minutes: int = 5        # one last check this close to kickoff for games with logged bets
     # Outliers: one book far off every other book's price
@@ -962,6 +963,7 @@ class Config:
             more_parlays_min_ev_pct=num("MORE_PARLAYS_MIN_EV_PCT", d.more_parlays_min_ev_pct, float),
             more_parlays_max=num("MORE_PARLAYS_MAX", d.more_parlays_max, int),
             more_parlays_legs=num("MORE_PARLAYS_LEGS", d.more_parlays_legs, int),
+            more_parlays_units=num("MORE_PARLAYS_UNITS", d.more_parlays_units, float),
             more_parlay_log_file=e("MORE_PARLAY_LOG_FILE", d.more_parlay_log_file),
             closing_minutes=num("CLOSING_MINUTES", d.closing_minutes, int),
             outliers_enabled=e("OUTLIERS_ENABLED", "true").lower() in ("1", "true", "yes"),
@@ -8756,8 +8758,8 @@ def find_more_parlays(pool: BoostPool, cfg: Config, now: datetime, keep: frozens
         keys = {bet_leg_id(b) for b, _, _ in p.legs}
         if keys & used or (p.key not in keep and keys & set(taken)):
             continue
-        p.stake = round_stake(kelly_stake(p.fair_prob, p.price, cfg),
-                              cfg.ev_bankroll * cfg.parlay_max_stake_pct / 100, cfg)
+        p.stake = (round(cfg.more_parlays_units * cfg.unit(), 2) if cfg.more_parlays_units > 0 else
+                   round_stake(kelly_stake(p.fair_prob, p.price, cfg), cfg.ev_bankroll * cfg.parlay_max_stake_pct / 100, cfg))
         out.append(p)
         used |= keys
         if len(out) >= cfg.more_parlays_max:
