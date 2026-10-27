@@ -469,6 +469,7 @@ class ProfitBoosts(unittest.TestCase):
                                                    NOW), [])                    # a leg under fair is never used
         self.assertEqual(_arbbot.find_more_parlays(self.more_pool(price=2.00), cfg, NOW), [])   # fair: not +EV
         self.assertEqual(_arbbot.find_more_parlays(self.more_pool(), Config(), NOW), [])        # no channel: off
+        self.assertEqual(_arbbot.find_more_parlays(self.more_pool(), replace(cfg, more_parlays_max=0), NOW), [])   # off
         taken = {_arbbot.bet_leg_id(b) for b, _, _ in out[0].legs}
         later = _arbbot.find_more_parlays(self.more_pool(), cfg, NOW, taken=taken)
         self.assertEqual(len(later), 2)                                  # another slip's legs aren't reused

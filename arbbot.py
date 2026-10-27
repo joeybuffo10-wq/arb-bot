@@ -679,7 +679,7 @@ class Config:
     parlay_log_file: str = "parlays.csv"
     # More parlays (DISCORD_MORE_PARLAYS_WEBHOOK_URL; empty = off): built the way the profit boost picks are, from
     # FanDuel/DraftKings prices near fair against the sharp line, but +EV on their own (MORE_PARLAYS_MIN_EV_PCT, no
-    # boost needed). Up to MORE_PARLAYS_MAX at once, none sharing a leg with each other or any other posted slip.
+    # boost needed). Up to MORE_PARLAYS_MAX at once (0 = off, cards already up are left as they are), none sharing a leg with each other or any other posted slip.
     # Logged to MORE_PARLAY_LOG_FILE, graded and in the record like the parlays.
     more_parlays_webhook_url: str = ""
     more_parlays_min_ev_pct: float = 3.0
@@ -8746,7 +8746,7 @@ def find_more_parlays(pool: BoostPool, cfg: Config, now: datetime, keep: frozens
     so they should beat the close) and at least MORE_PARLAYS_LEG_MIN_EV_PCT, at most +2000, at least MORE_PARLAYS_MIN_EV_PCT.
     Parlays already posted (keep) that still qualify first, then best first; no two share a leg, and a new one uses
     no leg in taken (leg_id: another posted slip). Pre-game only, no MMA or halves/quarters (graded from the scores)."""
-    if not cfg.more_parlays_webhook_url:
+    if not cfg.more_parlays_webhook_url or cfg.more_parlays_max <= 0:
         return []
     found: dict[str, Parlay] = {}
     for book in BOOST_BOOKS:
@@ -12294,7 +12294,7 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
         n = parlay_alerter.handle(find_parlays(open_bets, cfg,
                                                keep=set(parlay_alerter.open) | set(parlay_alerter.restored),
                                                now=now, taken=parlay_legs_taken(cfg, now)))
-        if cfg.more_parlays_webhook_url:   # (after the parlays: their new legs are taken by now)
+        if cfg.more_parlays_webhook_url and cfg.more_parlays_max > 0:   # (after the parlays: their legs are taken)
             more = t.more_parlays
             n += more.handle(find_more_parlays(t.boost_pool, cfg, now, keep=set(more.open) | set(more.restored),
                                                taken=parlay_legs_taken(cfg, now)))
