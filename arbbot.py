@@ -433,6 +433,10 @@ class Config:
     # results=..,graveyard=..,weekly=..,free=..,lines=..,middles=..,freebets=..,sgps=..; SPORT_CHANNELS and
     # LINEUP_CHANNELS: NFL=..,NCAAF=..,NBA=..,NCAAB=..,MLB=..,NHL=..,SOCCER=..,UFC=..
     routing: bool = False
+    # NEW_CARDS=true: the new bet card (one line each: game, bet, odds, fair price and its sharp source, units,
+    # trigger, tier colors) and stakes in units: ¼ Kelly x 100, to the nearest 0.25u, 0.25u-2u (kelly_units). The
+    # same-game, STAKE_BOOST and TUNE cuts still apply, then the 0.25u steps and the 0.25u-2u range again.
+    new_cards: bool = False
     guild_id: str = ""
     channels: dict = field(default_factory=dict)
     sport_channels: dict = field(default_factory=dict)
@@ -809,6 +813,7 @@ class Config:
             book_roles=parse_book_roles(e("BOOK_ROLES", "")),
             tier_roles=parse_tier_roles(e("TIER_ROLES", "")),
             routing=e("ROUTING", "false").lower() in ("1", "true", "yes"),
+            new_cards=e("NEW_CARDS", "false").lower() in ("1", "true", "yes"),
             guild_id=e("GUILD_ID", "").strip(),
             channels=parse_id_map(e("CHANNELS", ""), "CHANNELS", lower=True),
             sport_channels=parse_id_map(e("SPORT_CHANNELS", ""), "SPORT_CHANNELS"),
@@ -4045,16 +4050,39 @@ def devig(prices: list[float], method: str = "multiplicative") -> list[float]:
     return [x / total for x in probs]
 
 
+UNITS_MIN, UNITS_MAX, UNITS_STEP = 0.25, 2.0, 0.25   # NEW_CARDS: every stake 0.25u-2u, in 0.25u steps
+
+
+def snap_units(units: float) -> float:
+    """To the nearest 0.25u (halves up), then into 0.25u-2u."""
+    return min(UNITS_MAX, max(UNITS_MIN, math.floor(units / UNITS_STEP + 0.5) * UNITS_STEP))
+
+
+def kelly_units(fair_prob: float, price: float) -> float:
+    """NEW_CARDS units: kelly = (b*p - q) / b (b = decimal odds - 1, p = fair win chance, q = 1 - p); units =
+    0.25 x kelly x 100, to the nearest 0.25u, 0.25u-2u."""
+    b, p = price - 1, fair_prob
+    kelly = (b * p - (1 - p)) / b if b > 0 else 0.0
+    return snap_units(0.25 * kelly * 100)
+
+
 def kelly_stake(fair_prob: float, price: float, cfg: Config, mult: float = 1.0) -> float:
     """Fractional Kelly, capped at EV_MAX_STAKE_PCT of EV_BANKROLL, then scaled by mult
-    (confidence, single source) so smaller-confidence bets are smaller even at the cap."""
+    (confidence, single source) so smaller-confidence bets are smaller even at the cap.
+    NEW_CARDS: kelly_units x the unit instead (no mult: the formula alone)."""
+    if cfg.new_cards:
+        return round(kelly_units(fair_prob, price) * (cfg.unit() or 1.0), 2)
     edge = (fair_prob * price - 1) / (price - 1)
     cap = cfg.ev_bankroll * cfg.ev_max_stake_pct / 100
     return round_stake(min(cfg.ev_bankroll * cfg.kelly_fraction * max(0.0, edge), cap) * mult, cap, cfg)
 
 
 def round_stake(stake: float, cap: float, cfg: Config) -> float:
-    """Round to ROUND_STAKES (else whole dollars, else cents) without ever going over cap."""
+    """Round to ROUND_STAKES (else whole dollars, else cents) without ever going over cap.
+    NEW_CARDS: to 0.25u steps, 0.25u-2u, whatever the cap."""
+    if cfg.new_cards:
+        unit = cfg.unit() or 1.0
+        return round(snap_units(stake / unit) * unit, 2)
     stake = min(stake, cap)
     rs = cfg.round_stakes
     if rs > 0 and stake >= rs:
@@ -5147,6 +5175,66 @@ def bet_lines(b: EVBet, status: str = "", note: str = "") -> str:
     return "\n\n".join(x for x in (game, bet, status_line(status, b.book), note) if x)
 
 
+TIER_COLORS = {"elite": 0x1ABC9C, "very": 0x2ECC71, "confident": 0x3498DB, "somewhat": 0xF1C40F,
+               "slight": 0xE67E22}   # NEW_CARDS: the card's color by its tier (teal, green, blue, yellow, orange)
+CARD_FOOTER = "21+ · bet only where legal · 1-800-GAMBLER"
+
+
+def alert_id(b) -> str:
+    """A short id for a card ("A3F9C2"), the same for the same bet at the same book (its footer, "alert #...")."""
+    return hashlib.sha1(f"{b.key}|{getattr(b, 'book', '')}".encode()).hexdigest()[:6].upper()
+
+
+def trigger_name(b: EVBet, outlier: bool = False) -> str:
+    """What made it an alert, for the card's 🏷️ line: outlier, confirmed_pregame, prop_sharp_ev, prop_consensus,
+    period_sharp_ev or sharp_ev (live ones end in _live)."""
+    if outlier:
+        name = "outlier"
+    elif b.tier == CONFIRMED:
+        name = "confirmed_pregame"
+    elif b.player:
+        name = "prop_sharp_ev" if b.sharp_prob is not None else "prop_consensus"
+    else:
+        name = "period_sharp_ev" if is_period(b.market) else "sharp_ev"
+    return name + ("_live" if b.is_live else "")
+
+
+def fair_source(b: EVBet) -> str:
+    """"Pinnacle -110 / -110": the sharp book and its prices on both sides (the bet's side first); without a sharp
+    price, where the fair odds came from ("median of 5 books")."""
+    quotes = b.first_sharp_quotes or b.sharp_quotes
+    if quotes:
+        bk, prs = quotes[0]
+        return f"{bk} {' / '.join(odds(x) for x in prs[:2])}"
+    return b.sharp_book or "the other books"
+
+
+def new_card(b: EVBet, mention: str = "", gone_after: float | None = None, status: str = "",
+             outlier: bool = False, note: str = "") -> dict:
+    """NEW_CARDS: the bet card, one line per fact. GONE: grey, the bet struck through."""
+    if gone_after is not None:
+        return _gone_card(f"❌ GONE after {_fmt_secs(gone_after)} · ~~{b.pick} {odds(b.price)}~~",
+                          f"Ignore this one: {b.book} moved and the value is gone. ({sport_icon(b.sport_key)} {b.matchup})")
+    _, icon, tier, key = TIERS[bet_tier(b)]
+    sport = sport_of(b.sport_key) or b.sport
+    if b.is_live:
+        when = "🔴 LIVE"
+    else:
+        ts = int(_parse_time(b.commence_time).timestamp())
+        when = f"⏰ <t:{ts}:t> (<t:{ts}:R>)"
+    worst = b.worst_ok_price()
+    lines = [f"{sport_icon(b.sport_key)} {sport} · {b.matchup} · {when}",
+             f"🎯 **{_link(b.pick, b.link)}**{ALT_NOTE if b.alt else ''}",
+             f"💵 **{odds(b.price)}**" + (f" · good down to {odds(worst)}" if _printed(worst) < _printed(b.price) else ""),
+             f"⚖️ Fair **{odds(b.fair_odds)}** ({b.fair_prob * 100:.1f}%) · from {fair_source(b)}, vig removed",
+             f"📏 **{b.stake / b.unit_size if b.unit_size > 0 else kelly_units(b.fair_prob, b.price):g}u** "
+             f"(¼ Kelly, capped at 2u)",
+             f"🏷️ Trigger: `{trigger_name(b, outlier)}` · tier {tier}"]
+    body = "\n".join(lines) + "".join(f"\n\n{x}" for x in (status_line(status, b.book), note) if x)
+    return _card(f"📈 +{b.ev_pct:.1f}% EV · {b.book} · {icon} {tier}", body, TIER_COLORS[key], url=b.link,
+                 footer=f"{CARD_FOOTER} · alert #{alert_id(b)}", mention=mention)
+
+
 def ev_payload(b: EVBet, mention: str = "", gone_after: float | None = None,
                 first_seen: float | None = None, status: str = "") -> dict:
     """+EV card, short: the game and when, the bet, its units and confidence (the why stays out; the console and
@@ -5186,6 +5274,8 @@ class EVAlerter(Alerter):
         return format_ev_text(item)
 
     def payload(self, item, mention="", gone_after=None, first_seen=None, status="") -> dict:
+        if self.cfg.new_cards:
+            return new_card(item, mention, gone_after, status)
         return ev_payload(item, mention, gone_after, first_seen, status)
 
     def value(self, item) -> float:
@@ -6363,6 +6453,9 @@ class OutlierAlerter(EVAlerter):
         return t
 
     def payload(self, item, mention="", gone_after=None, first_seen=None, status="") -> dict:
+        if self.cfg.new_cards:
+            void = "⚠️ May be a pricing error the book can void." if item.ev_pct >= VOID_WARN_PCT else ""
+            return new_card(item, mention, gone_after, status, outlier=True, note=void)
         return outlier_payload(item, mention, gone_after, first_seen, status)
 
     def mention(self) -> str:

@@ -15095,3 +15095,57 @@ class Routing(unittest.TestCase):
         self.assertEqual(c.sport_channels, {"NBA": "1564976110062542898"})   # (whole: no float rounding)
         with self.assertRaises(ValueError):
             _arbbot.parse_id_map("main=abc", "CHANNELS")
+
+
+class NewCards(unittest.TestCase):
+    """NEW_CARDS: the new bet card and stakes in units (¼ Kelly x 100, 0.25u steps, 0.25u-2u)."""
+
+    def test_kelly_units(self):
+        self.assertAlmostEqual(_arbbot.kelly_units(0.5, 2.10), 1.25)    # kelly 4.55% -> 1.14u -> 1.25u
+        self.assertAlmostEqual(_arbbot.kelly_units(0.5, 2.04), 0.5)     # kelly 1.92% -> 0.48u -> 0.5u
+        self.assertAlmostEqual(_arbbot.kelly_units(0.6, 2.00), 2.0)     # kelly 20% -> 5u: capped at 2u
+        self.assertAlmostEqual(_arbbot.kelly_units(0.5, 2.005), 0.25)   # a sliver: never under 0.25u
+        self.assertAlmostEqual(_arbbot.kelly_units(0.3, 4.0), 1.75)     # (b*p - q)/b = 0.0667 -> 1.67u -> 1.75u
+        b, p = 3.0, 0.3
+        self.assertAlmostEqual(_arbbot.kelly_units(p, b + 1), _arbbot.snap_units(25 * (b * p - (1 - p)) / b))
+        self.assertEqual([_arbbot.snap_units(x) for x in (0.1, 0.374, 0.375, 1.0, 2.6)], [0.25, 0.25, 0.5, 1.0, 2.0])
+
+    def test_stakes_are_units_times_the_unit_and_cuts_stay_on_the_steps(self):
+        cfg = Config(new_cards=True, unit_size=20, ev_bankroll=2000, round_stakes=5)
+        self.assertEqual(_arbbot.kelly_stake(0.5, 2.10, cfg, mult=0.5), 25.0)   # 1.25u x $20 (no confidence cut)
+        self.assertEqual(_arbbot.round_stake(25.0 * 0.5, 9999, cfg), 15.0)     # halved: 0.625u -> 0.75u
+        self.assertEqual(_arbbot.round_stake(1.0, 9999, cfg), 5.0)             # never under 0.25u
+        self.assertEqual(_arbbot.round_stake(500.0, 9999, cfg), 40.0)          # never over 2u
+        self.assertEqual(_arbbot.kelly_stake(0.5, 2.10, Config(ev_bankroll=1000, round_stakes=0)), 11.0)  # (off: as before)
+
+    def bet(self):
+        ev = ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"DraftKings": [("Home", 2.10, None)]})
+        ev["sport_key"] = "basketball_nba"
+        return find_evs([ev], Config(min_ev_pct=0.1, round_stakes=0, new_cards=True, unit_size=10,
+                                     ev_bankroll=1000), NOW)[0]
+
+    def test_the_card(self):
+        b = self.bet()
+        card = _arbbot.new_card(b)["embeds"][0]
+        _, icon, tier, key = _arbbot.TIERS[_arbbot.bet_tier(b)]
+        self.assertEqual(card["title"], f"📈 +{b.ev_pct:.1f}% EV · DraftKings · {icon} {tier}")
+        lines = card["description"].split("\n")
+        self.assertTrue(lines[0].startswith("🏀 NBA · Away @ Home · ⏰ <t:"))
+        self.assertIn("🎯 **Home", lines[1])
+        self.assertTrue(lines[2].startswith("💵 **+110** · good down to "))
+        self.assertEqual(lines[3], f"⚖️ Fair **+100** (50.0%) · from Pinnacle -110 / -110, vig removed")
+        self.assertEqual(lines[4], "📏 **1.25u** (¼ Kelly, capped at 2u)")
+        self.assertEqual(lines[5], f"🏷️ Trigger: `sharp_ev` · tier {tier}")
+        self.assertEqual(card["color"], _arbbot.TIER_COLORS[key])
+        self.assertEqual(card["footer"]["text"], f"21+ · bet only where legal · 1-800-GAMBLER · alert #{_arbbot.alert_id(b)}")
+        gone = _arbbot.new_card(b, gone_after=95)["embeds"][0]
+        self.assertTrue(gone["title"].startswith("❌ GONE after 1m 35s · ~~Home"))
+        self.assertEqual(gone["color"], _arbbot.GREY)
+
+    def test_the_alerters_use_it_when_it_is_on(self):
+        b = self.bet()
+        on = EVAlerter(Config(new_cards=True), dry_run=True).payload(b)["embeds"][0]
+        off = EVAlerter(Config(), dry_run=True).payload(b)["embeds"][0]
+        self.assertIn("🏷️ Trigger", on["description"])
+        self.assertNotIn("🏷️ Trigger", off["description"])
+        self.assertIn("`outlier`", _arbbot.OutlierAlerter(Config(new_cards=True), dry_run=True).payload(b)["embeds"][0]["description"])
