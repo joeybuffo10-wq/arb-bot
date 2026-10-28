@@ -1120,9 +1120,9 @@ class Config:
         """Settings that load but probably aren't what you meant, in plain English (the bot says
         them at startup, in the console and the health channel)."""
         out = []
-        if self.routing and not (self.channels.get("main") and self.discord_bot_token and self.guild_id):
-            out.append("ROUTING=true needs CHANNELS (with main=...), DISCORD_BOT_TOKEN and GUILD_ID: cards still go "
-                       "to the webhooks until all three are set")
+        if self.routing and self.discord_bot_token and not (self.channels.get("main") and self.guild_id):
+            out.append("ROUTING=true needs CHANNELS (with main=...) and GUILD_ID: cards still go to the webhooks "
+                       "until both are set")
         if self.unit_size > 0 and not math.isclose(self.unit_size * 100, self.ev_bankroll):
             unit = _plain(self.unit_size)
             out.append(f"UNIT_SIZE={unit} but EV_BANKROLL={_plain(self.ev_bankroll)}: cards say 1u = "
