@@ -15194,6 +15194,7 @@ class RecapAndGraveyard(unittest.TestCase):
         for r in rows:
             _arbbot.append_csv(self.cfg.ev_results_file, list(r), r)
         now = datetime(2026, 10, 27, 12, tzinfo=timezone.utc)
+        _arbbot._save_state(self.dir / "state" / "graveyard_posted.json", {})   # (not the first pass)
         losses = _arbbot.graveyard_losses(self.cfg, now)
         self.assertEqual(len(losses), 2)
         self.assertEqual(_arbbot.graveyard_line(losses[0], self.cfg),
@@ -15408,3 +15409,36 @@ class Interactions(unittest.TestCase):
 def struct_pack(n):
     import struct
     return struct.pack(">H", n)
+
+
+class RoutingFallback(unittest.TestCase):
+    def test_a_main_feed_the_bot_cant_post_in_falls_back_to_the_webhook(self):
+        from unittest import mock
+        calls = []
+
+        def fake(url, payload, method="POST", message_id=None, max_wait=0):
+            calls.append((url, method, message_id))
+            if url.startswith("discord://channel/100") and method == "POST":
+                raise urllib.error.HTTPError(url, 403, "Missing Access", {}, None)
+            return {"id": "w1"} if method == "POST" else None
+        url = _arbbot.route_url([("100", "main"), ("200", "nba!")], "https://hooks/ev")
+        self.assertEqual(_arbbot.route_targets(url), [("100", False), ("200", True)])
+        with mock.patch("arbbot._webhook", fake):
+            mid = _arbbot.route_send({"embeds": [{"title": "x"}]}, url)
+            self.assertEqual(mid, "wh:w1")
+            _arbbot.route_send({"embeds": [{"title": "❌ GONE"}]}, url, mid)
+        self.assertEqual(calls[1], ("https://hooks/ev", "POST", None))
+        self.assertEqual(calls[2], ("https://hooks/ev", "PATCH", "w1"))
+
+    def test_the_first_graveyard_pass_posts_no_backlog(self):
+        import tempfile
+        d = Path(tempfile.mkdtemp())
+        cfg = Config(routing=True, discord_bot_token="t", channels={"main": "1", "graveyard": "2"},
+                     state_dir=str(d / "state"), ev_results_file=str(d / "res.csv"))
+        r = {"event_id": "e1", "commence_time": "2026-10-26T23:00:00+00:00", "result": "loss", "book": "DraftKings",
+             "market": "h2h", "outcome": "B", "point": "", "player": ""}
+        _arbbot.append_csv(cfg.ev_results_file, list(r), r)
+        now = datetime(2026, 10, 27, 12, tzinfo=timezone.utc)
+        self.assertEqual(_arbbot.graveyard_losses(cfg, now), [])     # learned, not posted
+        self.assertEqual(_arbbot.graveyard_losses(cfg, now), [])     # and never later
+

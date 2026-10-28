@@ -2706,13 +2706,20 @@ def route(cfg: "Config", item, kind: str, roles: dict[str, str] | None = None) -
     return out, " ".join(dict.fromkeys(pings))
 
 
-def route_url(targets: list[tuple[str, str]]) -> str:
-    return ROUTE_URL + ",".join(cid + ("!" if name.endswith("!") else "") for cid, name in targets)
+def route_url(targets: list[tuple[str, str]], fallback: str = "") -> str:
+    """The channels as one "webhook URL"; fallback: the webhook a card goes to instead when Discord won't take the
+    main feed's copy from the bot (no permission there yet)."""
+    return (ROUTE_URL + ",".join(cid + ("!" if name.endswith("!") else "") for cid, name in targets)
+            + (f"~{fallback}" if fallback else ""))
 
 
 def route_targets(url: str) -> list[tuple[str, bool]]:
     """[(channel id, pings?)] of a ROUTE_URL."""
-    return [(x.rstrip("!"), x.endswith("!")) for x in url[len(ROUTE_URL):].split(",") if x]
+    return [(x.rstrip("!"), x.endswith("!")) for x in url[len(ROUTE_URL):].split("~")[0].split(",") if x]
+
+
+def route_fallback(url: str) -> str:
+    return url.split("~", 1)[1] if "~" in url else ""
 
 
 def quiet_copy(payload: dict) -> dict:
@@ -2729,6 +2736,9 @@ def route_send(payload: dict, url: str, message_id: str | None = None, max_wait:
             payload = {**payload, "components": [] if gone else card_buttons()}
         for pair in message_id.split("|"):
             cid, _, mid = pair.partition(":")
+            if cid == "wh":   # (a card the fallback webhook posted: edited there)
+                _webhook(route_fallback(url), {k: v for k, v in payload.items() if k != "components"}, "PATCH", mid)
+                continue
             try:
                 _webhook(CHANNEL_URL + cid, quiet_copy(payload), "PATCH", mid)
             except urllib.error.HTTPError as e:
@@ -2741,8 +2751,15 @@ def route_send(payload: dict, url: str, message_id: str | None = None, max_wait:
     for i, (cid, ping) in enumerate(route_targets(url)):
         try:
             msg = _webhook(CHANNEL_URL + cid, payload if ping else quiet_copy(payload), max_wait=max_wait)
-        except Exception:   # noqa: BLE001
+        except Exception as e:   # noqa: BLE001
             if not done and i == 0:
+                fb = route_fallback(url)
+                if fb and isinstance(e, urllib.error.HTTPError) and e.code in (401, 403, 404):
+                    print(f"  ! Discord won't take the bot's post in the main feed ({e.code}): sent with the old "
+                          "webhook instead. Give the bot Send Messages and Embed Links there.", file=sys.stderr, flush=True)
+                    plain = {k: v for k, v in payload.items() if k != "components"}
+                    msg = _webhook(fb, plain, max_wait=max_wait)
+                    return f"wh:{msg['id']}" if msg and msg.get("id") else None
                 raise   # (the main feed's copy: as for one webhook, the caller decides about a retry)
             print(f"  ! Discord: a copy for channel {cid} didn't go out", file=sys.stderr, flush=True)
             continue
@@ -3253,7 +3270,7 @@ class Alerter:
             if self.dry_run:
                 pings = route(self.cfg, item, self.route_kind(item))[1]
                 print(route_preview(targets, pings, route_roles(self.cfg)), flush=True)
-            return route_url(targets)
+            return route_url(targets, self.webhook_for(item))
         return self.webhook_for(item)
 
     def mention_for(self, item) -> str:
@@ -8619,7 +8636,7 @@ class BetReactions:
         if webhook.startswith(ROUTE_URL):
             for pair in message_id.split("|"):
                 cid, _, mid = pair.partition(":")
-                self.add(row, mid, CHANNEL_URL + cid)
+                self.add(row, mid, route_fallback(webhook) if cid == "wh" else CHANNEL_URL + cid)
             return
         channel = self.channel(webhook)
         self.messages[message_id] = {"bet": row_bet_id(row), "channel": channel,
@@ -13425,6 +13442,7 @@ def graveyard_losses(cfg: Config, now: datetime) -> list[dict]:
     if not (cfg.routes() and cfg.channels.get("graveyard") and cfg.ev_results_file):
         return []
     path, posted = _posted_state(cfg, "graveyard_posted.json")
+    first = path is not None and not path.exists()   # (the first pass only learns what's there: no backlog dump)
     cutoff, out = now - timedelta(days=2), []
     for r in _read_csv(cfg.ev_results_file):
         bid = _bet_id(r)
@@ -13434,7 +13452,7 @@ def graveyard_losses(cfg: Config, now: datetime) -> list[dict]:
         posted[bid] = r["commence_time"]
         out.append(r)
     _save_state(path, {k: v for k, v in posted.items() if _parse_time(v) > now - timedelta(days=4)})
-    return out
+    return [] if first else out
 
 
 def send_graveyard(cfg: Config, losses: list[dict]) -> None:
