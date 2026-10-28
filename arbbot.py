@@ -36,6 +36,11 @@ import json
 import math
 import re
 import os
+import queue
+import socket
+import sqlite3
+import ssl
+import struct
 import statistics
 import sys
 import textwrap
@@ -437,6 +442,9 @@ class Config:
     # trigger, tier colors) and stakes in units: ¼ Kelly x 100, to the nearest 0.25u, 0.25u-2u (kelly_units). The
     # same-game, STAKE_BOOST and TUNE cuts still apply, then the 0.25u steps and the 0.25u-2u range again.
     new_cards: bool = False
+    # INTERACTIONS=true (with ROUTING): a live gateway connection for /unit /mybets /record /feed and the cards'
+    # 🔄 Refresh / ✅ I bet this / 🙈 Hide buttons; /feed members get a DM copy of the alerts that fit.
+    interactions: bool = False
     guild_id: str = ""
     channels: dict = field(default_factory=dict)
     sport_channels: dict = field(default_factory=dict)
@@ -814,6 +822,7 @@ class Config:
             tier_roles=parse_tier_roles(e("TIER_ROLES", "")),
             routing=e("ROUTING", "false").lower() in ("1", "true", "yes"),
             new_cards=e("NEW_CARDS", "false").lower() in ("1", "true", "yes"),
+            interactions=e("INTERACTIONS", "false").lower() in ("1", "true", "yes"),
             guild_id=e("GUILD_ID", "").strip(),
             channels=parse_id_map(e("CHANNELS", ""), "CHANNELS", lower=True),
             sport_channels=parse_id_map(e("SPORT_CHANNELS", ""), "SPORT_CHANNELS"),
@@ -2712,6 +2721,9 @@ def route_send(payload: dict, url: str, message_id: str | None = None, max_wait:
     """Post a card to every channel of a ROUTE_URL (only the "!" copy keeps its pings), or edit every copy
     (message_id "channel:message|..."; edits never ping). Returns the copies' ids that way, None if none went out."""
     if message_id:
+        if BUTTONS["on"] and payload.get("embeds"):   # (a GONE card loses its buttons)
+            gone = str(payload["embeds"][0].get("title", "")).startswith("❌")
+            payload = {**payload, "components": [] if gone else card_buttons()}
         for pair in message_id.split("|"):
             cid, _, mid = pair.partition(":")
             try:
@@ -2721,6 +2733,8 @@ def route_send(payload: dict, url: str, message_id: str | None = None, max_wait:
                     raise
         return message_id
     done = []
+    if BUTTONS["on"] and payload.get("embeds"):
+        payload = {**payload, "components": card_buttons()}
     for i, (cid, ping) in enumerate(route_targets(url)):
         try:
             msg = _webhook(CHANNEL_URL + cid, payload if ping else quiet_copy(payload), max_wait=max_wait)
@@ -3063,6 +3077,7 @@ class Alerter:
     on_held = None  # optional callback(item, why, now) when the caps or live rules hold one back (weekly card)
     on_candidate = None  # optional callback(item, decision, now, post_delay) for the candidate log (bets)
     on_posted = None     # optional callback(log row, message id, webhook) when a bet's card goes up (✅ tracking)
+    on_card = None       # optional callback(item, payload, log row) when a new card goes up (/feed DMs)
     log_on_open = False  # arbs are logged when they close, so the row has how long it lasted
     log_held = True      # arbs the caps or live rules held back go in the log too, with the reason
 
@@ -3459,6 +3474,11 @@ class Alerter:
                 self.on_posted({"first_seen": _utc(op.first_seen), **self.row(op)}, op.message_id, op.url)
             except Exception as e:  # noqa: BLE001 - ✅ tracking must never hold up an alert
                 print(f"  ! ✅ tracking: {e!r:.150}", file=sys.stderr)
+        if self.on_card and op.message_id and not self.dry_run:
+            try:
+                self.on_card(op.arb, self.payload(op.arb, first_seen=op.first_seen), self.row(op))
+            except Exception as e:  # noqa: BLE001 - the DMs must never hold up an alert
+                print(f"  ! /feed DMs: {e!r:.150}", file=sys.stderr)
         if not op.sent:
             op.sent = True
             if self.log_on_open:
@@ -8476,6 +8496,7 @@ TAKEN = "✅"
 TAKEN_GRACE = 1800   # seconds after kickoff a ✅ still counts (a bet placed right at the start), then it's final
 UNIT_DM = "💵"         # tap it under a card: the bot DMs you its stake in dollars at your own unit (UNIT_CHANNEL_ID)
 UNIT_DM_SECONDS = 60  # how often the 💵 taps and the "!unit" messages are read
+UNITS_LOCK = threading.Lock()   # units.json: the main loop (!unit) and the gateway (/unit) both write it
 UNIT_CMD = re.compile(r"^\s*(?:<@!?\d+>\s*)?!?unit\b\s*\$?\s*([\d,]*\.?\d*)\s*$", re.I)
 
 
@@ -8513,12 +8534,22 @@ def taken_path(cfg: Config) -> Path | None:
 
 
 def read_taken(cfg: Config) -> dict[str, dict]:
-    """{bet id: {"start": game start, "users": {user id: name}}}: who ✅'d each bet card ({} before any)."""
+    """{bet id: {"start": game start, "users": {user id: name}}}: who ✅'d each bet card ({} before any), with the
+    ones who tapped ✅ I bet this (INTERACTIONS, state/bet_buttons.json) in too."""
     path = taken_path(cfg)
     try:
-        return json.loads(path.read_text()) if path and path.exists() else {}
+        taken = json.loads(path.read_text()) if path and path.exists() else {}
     except (OSError, ValueError):
-        return {}
+        taken = {}
+    bpath = buttons_path(cfg)
+    try:
+        buttons = json.loads(bpath.read_text()) if bpath and bpath.exists() else {}
+    except (OSError, ValueError):
+        buttons = {}
+    for bet, e in buttons.items():
+        entry = taken.setdefault(bet, {"start": e.get("start", ""), "users": {}})
+        entry["users"] = {**entry.get("users", {}), **{u: v.get("name", u) for u, v in e.get("users", {}).items()}}
+    return taken
 
 
 class BetReactions:
@@ -8726,16 +8757,17 @@ class BetReactions:
             except urllib.error.HTTPError as e:
                 self._say(f"me{e.code}", f"Discord turned the bot token down ({e.code}): check DISCORD_BOT_TOKEN")
                 return 0
-        data = self.read_units()
-        try:
-            self.unit_commands(data)
-        except urllib.error.HTTPError as e:
-            self._say(f"unitch{e.code}", f"couldn't read the unit channel (Discord said {e.code}): check "
-                                         "UNIT_CHANNEL_ID and give the bot View Channel and Read Message History there")
-        except OSError as e:
-            self._say("net", f"couldn't reach Discord ({e!r:.100}); trying again later")
-            return 0
-        self._save_units(data)
+        with UNITS_LOCK:   # (/unit writes the same file from the gateway thread)
+            data = self.read_units()
+            try:
+                self.unit_commands(data)
+            except urllib.error.HTTPError as e:
+                self._say(f"unitch{e.code}", f"couldn't read the unit channel (Discord said {e.code}): check "
+                                             "UNIT_CHANNEL_ID and give the bot View Channel and Read Message History there")
+            except OSError as e:
+                self._say("net", f"couldn't reach Discord ({e!r:.100}); trying again later")
+                return 0
+            self._save_units(data)
         sent = 0
         for mid, m in list(self.messages.items()):
             if "units" not in m:
@@ -12256,6 +12288,15 @@ class Trackers:
             for a in (self.evs, self.outs, self.prop_evs, self.prop_outs, self.parlays, self.period_evs,
                       self.period_outs):
                 a.on_posted = self.reactions.add
+        # INTERACTIONS: the live gateway (slash commands, buttons) and the /feed DM copies of each new card.
+        self.feed_dms = self.gateway = None
+        if cfg.routes() and cfg.interactions and not off:
+            self.feed_dms, self.gateway = FeedDMs(cfg, self.reactions), Gateway(cfg, self.reactions)
+            for a in (self.evs, self.outs, self.prop_evs, self.prop_outs, self.parlays, self.period_evs,
+                      self.period_outs):
+                a.on_card = self.feed_dms.card
+            self.feed_dms.start()
+            self.gateway.start()
         # Bets that came close and what happened to them (CANDIDATE_LOG_FILE; not for --once, --demo or --dry-run).
         self.candidates = CandidateLog(replace(cfg, candidate_log_file="") if off else cfg)
         for a in (self.evs, self.outs, self.prop_evs, self.prop_outs, self.period_evs, self.period_outs):
@@ -13643,6 +13684,461 @@ def send_recap(cfg: Config, day: date, now: datetime) -> str:
     return note
 
 
+# --------------------------------------------------------------------------- slash commands, /feed and buttons
+# (INTERACTIONS=true with ROUTING: a live connection to Discord's gateway, standard library only.)
+
+def ws_connect(url: str, timeout: float = 15) -> ssl.SSLSocket:
+    """Open a WebSocket (wss://) connection: the HTTP upgrade, checked."""
+    u = urllib.parse.urlparse(url)
+    raw = socket.create_connection((u.hostname, u.port or 443), timeout=timeout)
+    sock = ssl.create_default_context().wrap_socket(raw, server_hostname=u.hostname)
+    key = base64.b64encode(os.urandom(16)).decode()
+    path = (u.path or "/") + (f"?{u.query}" if u.query else "")
+    sock.sendall((f"GET {path} HTTP/1.1\r\nHost: {u.hostname}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                  f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n").encode())
+    head = b""
+    while b"\r\n\r\n" not in head:
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise ConnectionError("the gateway closed the connection during the upgrade")
+        head += chunk
+    want = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
+    if b" 101 " not in head.split(b"\r\n", 1)[0] or want.encode() not in head:
+        raise ConnectionError(f"the gateway refused the upgrade: {head.split(chr(13).encode(), 1)[0]!r}")
+    return sock
+
+
+def ws_frame(opcode: int, data: bytes) -> bytes:
+    """One masked client frame (FIN set)."""
+    n, mask = len(data), os.urandom(4)
+    head = bytes([0x80 | opcode])
+    head += (bytes([0x80 | n]) if n < 126 else bytes([0x80 | 126]) + struct.pack(">H", n) if n < 65536
+             else bytes([0x80 | 127]) + struct.pack(">Q", n))
+    return head + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+
+
+def _recv_exact(sock, n: int) -> bytes:
+    out = b""
+    while len(out) < n:
+        chunk = sock.recv(n - len(out))
+        if not chunk:
+            raise ConnectionError("the gateway closed the connection")
+        out += chunk
+    return out
+
+
+def ws_recv(sock) -> str | None:
+    """The next text message (fragments joined; pings answered). None: the server closed the connection.
+    A socket timeout passes through (the caller's chance to send a heartbeat)."""
+    parts = b""
+    while True:
+        b1, b2 = _recv_exact(sock, 2)
+        op, n = b1 & 0x0F, b2 & 0x7F
+        if n == 126:
+            n = struct.unpack(">H", _recv_exact(sock, 2))[0]
+        elif n == 127:
+            n = struct.unpack(">Q", _recv_exact(sock, 8))[0]
+        mask = _recv_exact(sock, 4) if b2 & 0x80 else b""
+        data = _recv_exact(sock, n) if n else b""
+        if mask:
+            data = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+        if op == 8:
+            return None
+        if op == 9:
+            sock.sendall(ws_frame(10, data))
+            continue
+        if op == 10:
+            continue
+        parts += data
+        if b1 & 0x80:
+            return parts.decode("utf-8", "replace")
+
+
+TIER_KEYS = [t[3] for t in TIERS]   # most likely first: elite, very, confident, somewhat, slight
+FEED_DB = "feeds.sqlite3"
+
+
+def feed_db(cfg: Config) -> sqlite3.Connection | None:
+    """The members' /feed settings (state/feeds.sqlite3): one row per member."""
+    if not cfg.state_dir:
+        return None
+    path = data_path(cfg.state_dir) / FEED_DB
+    path.parent.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(path, timeout=10)
+    db.execute("CREATE TABLE IF NOT EXISTS feeds (user_id TEXT PRIMARY KEY, sports TEXT, books TEXT, "
+               "min_tier TEXT, min_ev REAL, updated TEXT)")
+    return db
+
+
+def set_feed(cfg: Config, uid: str, sports: str = "", books: str = "", min_tier: str = "", min_ev: float = 0.0) -> dict:
+    """Save (or replace) a member's /feed. Sports and books are lists ("NBA,NHL", "fanduel,draftkings"); empty = all."""
+    sp = ",".join(x for x in (s.strip().upper() for s in sports.replace(" ", ",").split(",")) if x in SPORTS8)
+    bk = ",".join(dict.fromkeys(book_slug(b) for b in books.replace(" ", ",").split(",") if b.strip()))
+    tier = min_tier if min_tier in TIER_KEYS else "slight"
+    with contextlib_closing(feed_db(cfg)) as db:
+        db.execute("REPLACE INTO feeds VALUES (?, ?, ?, ?, ?, ?)",
+                   (uid, sp, bk, tier, float(min_ev or 0), datetime.now(timezone.utc).isoformat()))
+        db.commit()
+    return {"sports": sp, "books": bk, "min_tier": tier, "min_ev": float(min_ev or 0)}
+
+
+def clear_feed(cfg: Config, uid: str) -> None:
+    with contextlib_closing(feed_db(cfg)) as db:
+        db.execute("DELETE FROM feeds WHERE user_id = ?", (uid,))
+        db.commit()
+
+
+def feeds(cfg: Config) -> dict[str, dict]:
+    """{user id: {"sports", "books", "min_tier", "min_ev"}} for every member with a /feed."""
+    db = feed_db(cfg)
+    if db is None:
+        return {}
+    with contextlib_closing(db):
+        return {u: {"sports": s or "", "books": b or "", "min_tier": t or "slight", "min_ev": e or 0.0}
+                for u, s, b, t, e, _ in db.execute("SELECT * FROM feeds")}
+
+
+class contextlib_closing:   # (contextlib.closing, without one more import line for one use)
+    def __init__(self, thing):
+        self.thing = thing
+
+    def __enter__(self):
+        return self.thing
+
+    def __exit__(self, *exc):
+        self.thing.close()
+        return False
+
+
+def feed_matches(pref: dict, item) -> bool:
+    """Does an alert fit a member's /feed: its sport and book (when they picked some), its tier at least min_tier,
+    its edge at least min_ev?"""
+    sport = sport_of(getattr(item, "sport_key", ""))
+    if pref.get("sports") and sport not in pref["sports"].split(","):
+        return False
+    if pref.get("books") and book_slug(getattr(item, "book", "") or "") not in pref["books"].split(","):
+        return False
+    if getattr(item, "fair_prob", 0) > 0 and not isinstance(item, Arb):
+        want = TIER_KEYS.index(pref.get("min_tier") or "slight")
+        if bet_tier(item) > want:
+            return False
+    ev = getattr(item, "ev_pct", None)
+    return ev is None or ev >= float(pref.get("min_ev") or 0)
+
+
+FEED_DM_GAP = 1.1        # seconds between DMs (well under Discord's limits)
+FEED_DM_MAX = 200        # DMs for one alert at most
+FEED_CLOSED_HOURS = 24   # a member whose DMs are closed is skipped this long
+
+
+class FeedDMs:
+    """The /feed DM copies: queued as each new card goes out, sent one at a time from a background thread."""
+
+    def __init__(self, cfg: Config, units: "BetReactions | None" = None):
+        self.cfg, self.units = cfg, units
+        self.q: "queue.Queue[tuple[str, dict]]" = queue.Queue()
+        self.closed: dict[str, float] = {}
+        self.dm_channels: dict[str, str] = {}
+        self.thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self.thread is None:
+            self.thread = threading.Thread(target=self._run, name="feed-dms", daemon=True)
+            self.thread.start()
+
+    def card(self, item, payload: dict, row: dict) -> int:
+        """A new card went out: queue its DM copy for every member whose /feed it fits. Returns how many."""
+        try:
+            prefs = feeds(self.cfg)
+        except sqlite3.Error as e:
+            print(f"  ! /feed: couldn't read the settings ({e})", file=sys.stderr, flush=True)
+            return 0
+        my_units = self.units.read_units()["units"] if self.units and self.units.units_on else {}
+        n = 0
+        now = time.time()
+        for uid, pref in prefs.items():
+            if n >= FEED_DM_MAX or now - self.closed.get(uid, 0) < FEED_CLOSED_HOURS * 3600:
+                continue
+            if feed_matches(pref, item):
+                units = row_units(row, self.cfg) if row else 0.0
+                unit = my_units.get(uid)
+                note = (f"💵 **{money(units * unit)}** at your {money(unit)} unit ({units:g}u)" if unit and units
+                        else f"📏 {units:g}u · set your unit with `/unit`" if units else "")
+                self.q.put((uid, {"content": note, "embeds": payload.get("embeds", [])[:1],
+                                  "allowed_mentions": {"parse": []}}))
+                n += 1
+        return n
+
+    def send(self, uid: str, body: dict) -> bool:
+        tok = self.cfg.discord_bot_token
+        try:
+            if uid not in self.dm_channels:
+                self.dm_channels[uid] = (_bot_api(tok, "POST", "/users/@me/channels", {"recipient_id": uid}) or {})["id"]
+            _bot_api(tok, "POST", f"/channels/{self.dm_channels[uid]}/messages", body)
+            return True
+        except urllib.error.HTTPError as e:
+            if e.code in (400, 403):   # (DMs closed to server members, or blocked the bot)
+                self.closed[uid] = time.time()
+            return False
+        except (KeyError, OSError):
+            return False
+
+    def _run(self) -> None:
+        while True:
+            uid, body = self.q.get()
+            self.send(uid, body)
+            time.sleep(FEED_DM_GAP)
+
+
+BUTTONS = {"on": False}   # INTERACTIONS: new routed cards get 🔄 Refresh / ✅ I bet this / 🙈 Hide
+
+
+def card_buttons() -> list[dict]:
+    """The buttons under a bet card. Their ids name what they do, not the bet (that's the message's own id), so they
+    work for every card ever posted, through restarts."""
+    return [{"type": 1, "components": [
+        {"type": 2, "style": 2, "label": "Refresh", "emoji": {"name": "🔄"}, "custom_id": "bb:refresh"},
+        {"type": 2, "style": 3, "label": "I bet this", "emoji": {"name": "✅"}, "custom_id": "bb:bet"},
+        {"type": 2, "style": 2, "label": "Hide", "emoji": {"name": "🙈"}, "custom_id": "bb:hide"}]}]
+
+
+def buttons_path(cfg: Config) -> Path | None:
+    return data_path(cfg.state_dir) / "bet_buttons.json" if cfg.state_dir else None
+
+
+def log_button_bet(cfg: Config, bet: str, start: str, uid: str, name: str, price: float) -> None:
+    """✅ I bet this: the member took this bet at this price (merged into who took what: read_taken)."""
+    path = buttons_path(cfg)
+    if not path:
+        return
+    with BUTTONS_LOCK:
+        try:
+            data = json.loads(path.read_text()) if path.exists() else {}
+        except (OSError, ValueError):
+            data = {}
+        e = data.setdefault(bet, {"start": start, "users": {}})
+        e["users"][uid] = {"name": name, "price": price, "at": datetime.now(timezone.utc).isoformat()}
+        _save_state(path, data)
+
+
+BUTTONS_LOCK = threading.Lock()
+
+
+SLASH_COMMANDS = [
+    {"name": "unit", "description": "Set or see your unit size (dollars per unit)", "options": [
+        {"type": 10, "name": "amount", "description": "Dollars per unit, like 25", "required": False,
+         "min_value": 1, "max_value": 100000}]},
+    {"name": "mybets", "description": "Your record from the bets you tracked"},
+    {"name": "record", "description": "The desk's record", "options": [
+        {"type": 3, "name": "period", "description": "day, week or all", "required": False,
+         "choices": [{"name": n, "value": n} for n in ("day", "week", "all")]}]},
+    {"name": "feed", "description": "Get a DM copy of the alerts you want", "options": [
+        {"type": 3, "name": "sports", "description": "Like NBA,NHL (empty: all)", "required": False},
+        {"type": 3, "name": "books", "description": "Like FanDuel,DraftKings (empty: all)", "required": False},
+        {"type": 3, "name": "min_tier", "description": "The least likely tier you want", "required": False,
+         "choices": [{"name": name, "value": key} for _, _, name, key in TIERS]},
+        {"type": 10, "name": "min_ev", "description": "Smallest edge in %, like 5", "required": False},
+        {"type": 5, "name": "off", "description": "Stop the DMs", "required": False}]},
+]
+
+
+def record_text(cfg: Config, period: str, now: datetime) -> str:
+    """/record: the desk's record today, the last 7 days or all time (in units with NEW_CARDS)."""
+    local = now.astimezone(ZoneInfo(cfg.timezone))
+    since = {"day": datetime.combine(local.date(), dtime.min, ZoneInfo(cfg.timezone)),
+             "week": now - timedelta(days=7)}.get(period)
+    rows = bettable(cfg, _graded(cfg, since))
+    label = {"day": "Today", "week": "Last 7 days"}.get(period, "All time")
+    rec = units_record(rows, cfg) if cfg.new_cards else record_line(rows)
+    return f"📊 **{label}:** {rec}" + (f"\n{clv_record(cfg, 7 if period == 'week' else None)}" if period != "day" else "")
+
+
+class Gateway:
+    """The live connection (INTERACTIONS): slash commands and card buttons. Runs in its own thread, reconnects by
+    itself, and never touches the alerters: it reads the logs and state files the main loop writes."""
+
+    def __init__(self, cfg: Config, reactions: "BetReactions | None" = None):
+        self.cfg, self.reactions = cfg, reactions
+        self.app_id, self.seq = "", None
+        self.pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="interaction")
+        self.thread: threading.Thread | None = None
+        self.api: "OddsAPI | None" = None
+
+    def start(self) -> None:
+        if self.thread is None:
+            self.thread = threading.Thread(target=self._forever, name="gateway", daemon=True)
+            self.thread.start()
+
+    def _forever(self) -> None:
+        wait = 5
+        while True:
+            try:
+                self._session()
+                wait = 5
+            except Exception as e:  # noqa: BLE001 - reconnect, slower each time (to 5 minutes)
+                print(f"  ! Gateway: {e!r:.120}; reconnecting in {wait}s", file=sys.stderr, flush=True)
+                time.sleep(wait)
+                wait = min(300, wait * 2)
+
+    def _session(self) -> None:
+        tok = self.cfg.discord_bot_token
+        url = (_bot_api(tok, "GET", "/gateway/bot") or {}).get("url", "wss://gateway.discord.gg")
+        sock = ws_connect(f"{url}/?v=10&encoding=json")
+        hello = json.loads(ws_recv(sock) or "{}")
+        beat = hello.get("d", {}).get("heartbeat_interval", 41250) / 1000
+        sock.sendall(ws_frame(1, json.dumps({"op": 2, "d": {
+            "token": tok, "intents": 1, "properties": {"os": "linux", "browser": "arbbot", "device": "arbbot"}}}).encode()))
+        sock.settimeout(1.0)
+        next_beat = time.time() + beat
+        while True:
+            if time.time() >= next_beat:
+                sock.sendall(ws_frame(1, json.dumps({"op": 1, "d": self.seq}).encode()))
+                next_beat = time.time() + beat
+            try:
+                text = ws_recv(sock)
+            except socket.timeout:
+                continue
+            if text is None:
+                raise ConnectionError("the gateway closed the connection")
+            msg = json.loads(text)
+            if msg.get("s") is not None:
+                self.seq = msg["s"]
+            if msg.get("op") in (7, 9):
+                raise ConnectionError("the gateway asked to reconnect")
+            if msg.get("op") == 1:
+                next_beat = 0
+            if msg.get("t") == "READY":
+                self.app_id = msg["d"]["application"]["id"]
+                self.register()
+            elif msg.get("t") == "INTERACTION_CREATE":
+                self.pool.submit(self._safe, msg["d"])
+
+    def register(self) -> None:
+        """The slash commands, in this server only (they show up at once)."""
+        try:
+            _bot_api(self.cfg.discord_bot_token, "PUT",
+                     f"/applications/{self.app_id}/guilds/{self.cfg.guild_id}/commands", SLASH_COMMANDS)
+            print("  ⌨️ Slash commands registered: /unit /mybets /record /feed", flush=True)
+        except urllib.error.HTTPError as e:
+            print(f"  ! Gateway: couldn't register the slash commands (Discord said {e.code}): re-invite the bot "
+                  "with the applications.commands scope", file=sys.stderr, flush=True)
+
+    def reply(self, it: dict, text: str, kind: int = 4) -> None:
+        _bot_api(self.cfg.discord_bot_token, "POST", f"/interactions/{it['id']}/{it['token']}/callback",
+                 {"type": kind, "data": {"content": text[:2000], "flags": 64, "allowed_mentions": {"parse": []}}})
+
+    def followup(self, it: dict, text: str) -> None:
+        _bot_api(self.cfg.discord_bot_token, "PATCH", f"/webhooks/{self.app_id}/{it['token']}/messages/@original",
+                 {"content": text[:2000], "allowed_mentions": {"parse": []}})
+
+    def _safe(self, it: dict) -> None:
+        try:
+            self.handle(it)
+        except Exception as e:  # noqa: BLE001 - one bad interaction never stops the others
+            print(f"  ! Gateway: an interaction failed ({e!r:.150})", file=sys.stderr, flush=True)
+
+    def handle(self, it: dict) -> None:
+        user = (it.get("member") or {}).get("user") or it.get("user") or {}
+        uid, name = user.get("id", ""), user.get("global_name") or user.get("username") or ""
+        if it.get("type") == 2:
+            data = it.get("data", {})
+            opts = {o["name"]: o.get("value") for o in data.get("options", [])}
+            self.reply(it, self.command(data.get("name", ""), opts, uid))
+        elif it.get("type") == 3:
+            self.button(it, it.get("data", {}).get("custom_id", ""), uid, name)
+
+    def command(self, name: str, opts: dict, uid: str, now: datetime | None = None) -> str:
+        """The answer to a slash command (the same as its "!" command where there is one)."""
+        now = now or datetime.now(timezone.utc)
+        r = self.reactions
+        if name == "unit":
+            if not (r and r.units_on):
+                return "Units aren't set up on this server yet."
+            if opts.get("amount"):
+                with UNITS_LOCK:
+                    data = r.read_units()
+                    data["units"][uid] = float(opts["amount"])
+                    r._save_units(data)
+                return f"✅ Your unit is now **{money(float(opts['amount']))}**. DMs show each bet in dollars at it."
+            mine = r.read_units()["units"].get(uid)
+            return (f"Your unit is **{money(mine)}**." if mine else
+                    f"You haven't set one: cards use {money(self.cfg.unit() or 10)}.") + " Change it: `/unit 25`."
+        if name == "mybets":
+            unit = r.read_units()["units"].get(uid) if r and r.units_on else None
+            return mybets_text(self.cfg, uid, unit, now)
+        if name == "record":
+            return record_text(self.cfg, opts.get("period") or "day", now)
+        if name == "feed":
+            if opts.get("off"):
+                clear_feed(self.cfg, uid)
+                return "🔕 Your /feed DMs are off."
+            if not any(k in opts for k in ("sports", "books", "min_tier", "min_ev")):
+                mine = feeds(self.cfg).get(uid)
+                return (f"📬 Your feed: sports {mine['sports'] or 'all'} · books {mine['books'] or 'all'} · "
+                        f"{dict((k, n) for _, _, n, k in TIERS)[mine['min_tier']]} or better · {mine['min_ev']:g}%+ EV"
+                        if mine else "You have no /feed yet. Try `/feed sports:NBA min_tier:confident min_ev:5`.")
+            f = set_feed(self.cfg, uid, opts.get("sports") or "", opts.get("books") or "",
+                         opts.get("min_tier") or "", opts.get("min_ev") or 0)
+            tier = dict((k, n) for _, _, n, k in TIERS)[f["min_tier"]]
+            return (f"📬 Saved. You'll get a DM of every alert: sports {f['sports'] or 'all'} · books "
+                    f"{f['books'] or 'all'} · {tier} or better · {f['min_ev']:g}%+ EV. Turn it off: `/feed off:true`."
+                    " (Your DMs must be open to server members.)")
+        return "I don't know that command."
+
+    def card_row(self, message_id: str) -> dict | None:
+        """The logged bet a card's message is (BetReactions' cards: every copy)."""
+        m = (self.reactions.messages.get(message_id) if self.reactions else None) or {}
+        if not m.get("bet"):
+            return None
+        bets = logged_bets(self.cfg, since=datetime.now(timezone.utc) - timedelta(days=3))
+        return bets.get(m["bet"])
+
+    def button(self, it: dict, cid: str, uid: str, name: str) -> None:
+        msg = it.get("message", {})
+        if cid == "bb:hide":
+            self.reply(it, "🙈 Hidden. (Discord can't hide a message for one person: mute the channel to see fewer.)")
+            return
+        row = self.card_row(msg.get("id", ""))
+        if row is None:
+            self.reply(it, "I can't find this bet any more (it's more than 3 days old).")
+            return
+        if cid == "bb:bet":
+            if _parse_time(row["commence_time"]) + timedelta(seconds=TAKEN_GRACE) < datetime.now(timezone.utc):
+                self.reply(it, "This game has started: it can't be tracked now.")
+                return
+            log_button_bet(self.cfg, _bet_id(row), row["commence_time"], uid, name, float(row["price"]))
+            self.reply(it, f"✅ Tracked: {row_pick(row)} {odds(float(row['price']))} at {row['book']}. "
+                           "It counts in `/mybets` once it's graded.")
+        elif cid == "bb:refresh":
+            self.reply(it, "", kind=5)   # (thinking: the odds call can take a few seconds)
+            self.followup(it, self.refresh(row, msg))
+
+    def refresh(self, row: dict, msg: dict) -> str:
+        """🔄: pull this game's odds for the bet's market again, and edit the card if it's still good."""
+        if row.get("kind") == "parlay" or row.get("market") == "parlay":
+            return "Parlays refresh by themselves with every check."
+        if self.api is None:
+            self.api = OddsAPI(replace(self.cfg, state_dir=""))
+        ev = self.api.event_odds(row["sport_key"], row["event_id"], row["market"])
+        if not ev:
+            return "The book doesn't list this game any more."
+        cfg = self.cfg.for_props() if row.get("player") else self.cfg
+        cfg = replace(cfg, min_ev_pct=0.0, prop_min_ev_pct=0.0)
+        want = leg_id(row["event_id"], row["market"], row.get("player"), row["outcome"], row.get("point"))
+        found = [b for b in find_evs([ev], cfg, datetime.now(timezone.utc))
+                 if bet_leg_id(b) == want and book_slug(b.book) == book_slug(row["book"])]
+        if not found:
+            return f"⚠️ Not good value at {row['book']} right now. Wait for a new alert."
+        b = found[0]
+        card = new_card(b) if self.cfg.new_cards else ev_payload(b)
+        try:
+            _webhook(CHANNEL_URL + msg["channel_id"], {"embeds": card["embeds"], "components": card_buttons()},
+                     "PATCH", msg["id"])
+        except (urllib.error.HTTPError, KeyError):
+            pass
+        return f"🔄 Now **{odds(b.price)}** at {b.book} · **+{b.ev_pct:.1f}% EV** (fair {odds(b.fair_odds)}). Card updated."
+
+
 HEARTBEAT_SECONDS = 300
 
 
@@ -13898,6 +14394,7 @@ def main() -> None:
     PROP_GRADING = cfg.prop_grading != "off"
     BOT_AUTH["token"] = cfg.discord_bot_token   # (ROUTING: channel posts go out as the bot)
     cfg = cfg.with_channels()
+    BUTTONS["on"] = cfg.routes() and cfg.interactions and not (args.dry_run or args.demo or args.once)
 
     if args.check_props:
         check_props(cfg)

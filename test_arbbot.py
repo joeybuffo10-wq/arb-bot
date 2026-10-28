@@ -15299,3 +15299,112 @@ class LineupAlerts(unittest.TestCase):
         self.assertTrue(p["content"].startswith("<@&70> <@&71>\n📋 Boston Celtics · Derrick White Out"))
         self.assertEqual(p["allowed_mentions"]["roles"], ["70", "71"])
         self.assertEqual(_arbbot.lineup_pass(replace(self.cfg, routing=False), now, fetch=lambda path: page), 0)
+
+
+class Interactions(unittest.TestCase):
+    """INTERACTIONS: the gateway's WebSocket, slash commands, /feed and its DMs, and the card buttons."""
+
+    def setUp(self):
+        import tempfile
+        self.dir = tempfile.mkdtemp()
+        self.cfg = Config(routing=True, interactions=True, guild_id="g", discord_bot_token="t",
+                          channels={"main": "1"}, state_dir=self.dir, unit_channel_id="9", unit_size=10,
+                          ev_bankroll=1000, ev_log_file="", ev_results_file=self.dir + "/res.csv",
+                          closing_file=self.dir + "/closing.csv")
+
+    def bet(self, sport="basketball_nba", book="DraftKings"):
+        ev = ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {book: [("Home", 2.10, None)]})
+        ev["sport_key"] = sport
+        return find_evs([ev], Config(min_ev_pct=0.1, round_stakes=0), NOW)[0]
+
+    def test_websocket_frames(self):
+        class Sock:
+            def __init__(self, data):
+                self.data, self.sent = data, b""
+
+            def recv(self, n):
+                out, self.data = self.data[:n], self.data[n:]
+                return out
+
+            def sendall(self, b):
+                self.sent += b
+        frame = _arbbot.ws_frame(1, b'{"op":1}')
+        self.assertEqual(frame[0], 0x81)
+        self.assertTrue(frame[1] & 0x80)                                   # client frames are masked
+        server = bytes([0x89, 2]) + b"hi" + bytes([0x01, 3]) + b'{"a' + bytes([0x80, 4]) + b'":1}'
+        s = Sock(server)
+        self.assertEqual(_arbbot.ws_recv(s), '{"a":1}')                    # fragments joined
+        self.assertEqual(s.sent[0], 0x8A)                                  # the ping got its pong
+        long = b"x" * 300
+        self.assertEqual(_arbbot.ws_recv(Sock(bytes([0x81, 126]) + struct_pack(300) + long)), "x" * 300)
+        self.assertIsNone(_arbbot.ws_recv(Sock(bytes([0x88, 0]))))          # closed
+
+    def test_feed_settings_and_matching(self):
+        f = _arbbot.set_feed(self.cfg, "u1", "nba, nhl, xyz", "FanDuel,DraftKings", "confident", 5)
+        self.assertEqual(f, {"sports": "NBA,NHL", "books": "fanduel,draftkings", "min_tier": "confident", "min_ev": 5.0})
+        self.assertEqual(_arbbot.feeds(self.cfg)["u1"]["sports"], "NBA,NHL")
+        b = self.bet()
+        pref = _arbbot.feeds(self.cfg)["u1"]
+        self.assertEqual(_arbbot.feed_matches(pref, b), _arbbot.bet_tier(b) <= 2 and b.ev_pct >= 5)
+        self.assertTrue(_arbbot.feed_matches({"sports": "", "books": "", "min_tier": "slight", "min_ev": 0}, b))
+        self.assertFalse(_arbbot.feed_matches({"sports": "NFL", "books": "", "min_tier": "slight", "min_ev": 0}, b))
+        self.assertFalse(_arbbot.feed_matches({"sports": "", "books": "fanduel", "min_tier": "slight", "min_ev": 0}, b))
+        self.assertFalse(_arbbot.feed_matches({"sports": "", "books": "", "min_tier": "slight", "min_ev": 50}, b))
+        _arbbot.clear_feed(self.cfg, "u1")
+        self.assertEqual(_arbbot.feeds(self.cfg), {})
+
+    def test_the_slash_commands(self):
+        r = _arbbot.BetReactions(self.cfg)
+        g = _arbbot.Gateway(self.cfg, r)
+        self.assertIn("haven't set one", g.command("unit", {}, "u1"))
+        self.assertIn("**$25**", g.command("unit", {"amount": 25}, "u1"))
+        self.assertEqual(r.read_units()["units"]["u1"], 25.0)
+        self.assertIn("Your unit is **$25**", g.command("unit", {}, "u1"))
+        self.assertIn("No tracked", g.command("mybets", {}, "u1") + "No tracked")
+        self.assertTrue(g.command("record", {"period": "week"}, "u1").startswith("📊 **Last 7 days:**"))
+        self.assertIn("no /feed yet", g.command("feed", {}, "u1"))
+        self.assertIn("📬 Saved", g.command("feed", {"sports": "NBA", "min_tier": "very"}, "u1"))
+        self.assertIn("Very confident or better", g.command("feed", {}, "u1"))
+        self.assertIn("off", g.command("feed", {"off": True}, "u1"))
+        self.assertEqual({c["name"] for c in _arbbot.SLASH_COMMANDS}, {"unit", "mybets", "record", "feed"})
+
+    def test_i_bet_this_counts_like_a_check_mark(self):
+        _arbbot.log_button_bet(self.cfg, "bet1", "2026-10-28T23:00:00Z", "u1", "Ann", 2.1)
+        taken = _arbbot.read_taken(self.cfg)
+        self.assertEqual(taken["bet1"]["users"], {"u1": "Ann"})
+
+    def test_cards_get_buttons_and_gone_ones_lose_them(self):
+        from unittest import mock
+        calls = []
+
+        def fake(url, payload, method="POST", message_id=None, max_wait=0):
+            calls.append((method, payload))
+            return {"id": "m1"}
+        _arbbot.BUTTONS["on"] = True
+        try:
+            with mock.patch("arbbot._webhook", fake):
+                url = _arbbot.route_url([("1", "main")])
+                mid = _arbbot.route_send({"embeds": [{"title": "📈 +5% EV"}]}, url)
+                _arbbot.route_send({"embeds": [{"title": "❌ GONE after 1m"}]}, url, mid)
+        finally:
+            _arbbot.BUTTONS["on"] = False
+        ids = [c["custom_id"] for c in calls[0][1]["components"][0]["components"]]
+        self.assertEqual(ids, ["bb:refresh", "bb:bet", "bb:hide"])
+        self.assertEqual(calls[1][1]["components"], [])
+
+    def test_feed_dms_queue_and_skip_closed_dms(self):
+        _arbbot.set_feed(self.cfg, "u1")
+        _arbbot.set_feed(self.cfg, "u2", "NFL")
+        dms = _arbbot.FeedDMs(self.cfg)
+        row = {"units": 1.5, "stake": 15}
+        self.assertEqual(dms.card(self.bet(), {"embeds": [{"title": "x"}]}, row), 1)   # u2 wants NFL only
+        uid, body = dms.q.get_nowait()
+        self.assertEqual(uid, "u1")
+        self.assertIn("1.5u", body["content"])
+        dms.closed["u1"] = time.time()
+        self.assertEqual(dms.card(self.bet(), {"embeds": []}, row), 0)                  # closed DMs: skipped
+
+
+def struct_pack(n):
+    import struct
+    return struct.pack(">H", n)
