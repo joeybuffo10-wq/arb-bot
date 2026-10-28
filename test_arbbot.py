@@ -15257,3 +15257,45 @@ class RecapAndGraveyard(unittest.TestCase):
         wins = _arbbot.free_wins(cfg, now)
         self.assertEqual([w["event_id"] for w in wins], ["e5", "e4", "e3"])      # the day's best three
         self.assertEqual(_arbbot.free_wins(cfg, now), [])                       # and no more that day
+
+
+class LineupAlerts(unittest.TestCase):
+    """ROUTING's lineup channels: ESPN injury statuses, new or changed ones only, pinging Lineup Alerts + the sport."""
+    PAGE = {"injuries": [{"displayName": "Boston Celtics", "injuries": [
+        {"status": "Out", "date": "2026-10-28T15:00Z", "shortComment": "knee",
+         "athlete": {"displayName": "Jayson Tatum"}},
+        {"type": {"description": "questionable"}, "date": "2026-10-28T16:00Z",
+         "athlete": {"displayName": "Derrick White", "team": {"displayName": "Boston Celtics"}}},
+        {"status": "Out", "athlete": {}}]}]}
+
+    def setUp(self):
+        import tempfile
+        _arbbot.ROLE_CACHE.update(at=time.time(), guild="g", ids={"extra:lineups": "70", "sport:NBA": "71"})
+        self.cfg = Config(routing=True, guild_id="g", discord_bot_token="t", channels={"main": "1"},
+                          lineup_channels={"NBA": "500"}, sports="basketball_nba", state_dir=tempfile.mkdtemp())
+
+    def tearDown(self):
+        _arbbot.ROLE_CACHE.update(at=0.0, guild="", ids={})
+
+    def test_reads_espns_report(self):
+        ups = _arbbot.espn_injuries(self.PAGE)
+        self.assertEqual([(u["team"], u["player"], u["status"]) for u in ups],
+                         [("Boston Celtics", "Jayson Tatum", "Out"), ("Boston Celtics", "Derrick White", "Questionable")])
+        self.assertTrue(_arbbot.lineup_line("NBA", ups[0]).startswith("📋 Boston Celtics · Jayson Tatum Out · ESPN · <t:"))
+        self.assertEqual(_arbbot.espn_injuries({}), [])
+
+    def test_only_changes_after_the_first_read_and_it_pings_lineups_and_the_sport(self):
+        from unittest import mock
+        now = datetime(2026, 10, 28, 17, tzinfo=timezone.utc)
+        page = json.loads(json.dumps(self.PAGE))
+        sent = []
+        with mock.patch("arbbot._webhook", lambda url, p, *a, **k: sent.append((url, p))):
+            self.assertEqual(_arbbot.lineup_pass(self.cfg, now, fetch=lambda path: page), 0)   # learns, posts nothing
+            self.assertEqual(_arbbot.lineup_pass(self.cfg, now, fetch=lambda path: page), 0)   # same again: nothing
+            page["injuries"][0]["injuries"][1]["status"] = "Out"                          # White: now out
+            self.assertEqual(_arbbot.lineup_pass(self.cfg, now, fetch=lambda path: page), 1)
+        url, p = sent[0]
+        self.assertEqual(url, "discord://channel/500")
+        self.assertTrue(p["content"].startswith("<@&70> <@&71>\n📋 Boston Celtics · Derrick White Out"))
+        self.assertEqual(p["allowed_mentions"]["roles"], ["70", "71"])
+        self.assertEqual(_arbbot.lineup_pass(replace(self.cfg, routing=False), now, fetch=lambda path: page), 0)

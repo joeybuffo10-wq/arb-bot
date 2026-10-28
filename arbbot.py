@@ -12610,6 +12610,7 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
     backup_tried = 0.0                  # last nightly backup attempt (DISCORD_BACKUP_WEBHOOK_URL)
     site_tried = 0.0                    # last public results page update (RESULTS_SITE_*)
     teased = 0.0                        # last free-channel teaser pass (DISCORD_FREE_WEBHOOK_URL)
+    lineups_read = 0.0                  # last read of the ESPN injury reports (ROUTING's lineup channels)
 
     def update_parlays() -> int:
         open_bets = parlay_bets(ev_alerter, prop_evs, out_alerter, prop_outs)
@@ -12927,6 +12928,13 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
                     send_graveyard(cfg, losses)
             except Exception as e:  # noqa: BLE001
                 results_warned = results_trouble(status, e, results_warned, what="post to the graveyard")
+        if not (args.once or args.dry_run) and cfg.routes() and time.time() - lineups_read > LINEUP_SECONDS:
+            lineups_read = time.time()
+            try:
+                if n := lineup_pass(cfg, now):
+                    print(f"  📋 {n} lineup / injury update(s) posted", flush=True)
+            except Exception as e:  # noqa: BLE001 - never stops the bot
+                results_warned = results_trouble(status, e, results_warned, what="post the lineup alerts")
         if not (args.once or args.dry_run) and (day := recap_due(cfg, now)):
             try:
                 note = send_recap(cfg, day, now)
@@ -13397,6 +13405,93 @@ def send_graveyard(cfg: Config, losses: list[dict]) -> None:
             chunk = [line] if line else []
         else:
             chunk.append(line)
+
+
+# --------------------------------------------------------------------------- lineup alerts (ESPN injuries, ROUTING)
+
+LINEUP_SECONDS = 600   # how often the injury reports are read
+LINEUP_SPORTS = {"NFL": "americanfootball_nfl", "NCAAF": "americanfootball_ncaaf", "NBA": "basketball_nba",
+                 "NCAAB": "basketball_ncaab", "MLB": "baseball_mlb", "NHL": "icehockey_nhl"}   # (ESPN has these)
+LINEUP_MAX_AGE = timedelta(days=2)   # an update older than this isn't news
+
+
+def espn_injuries(data: dict) -> list[dict]:
+    """ESPN's injuries page -> [{"team", "player", "status", "date", "note"}] (anything it can't read is skipped)."""
+    out = []
+    for team in (data or {}).get("injuries", []) or []:
+        tname = team.get("displayName") or team.get("name") or ""
+        for inj in team.get("injuries", []) or []:
+            ath = inj.get("athlete") or {}
+            status = inj.get("status") or (inj.get("type") or {}).get("description", "")
+            player = ath.get("displayName") or ath.get("fullName") or ""
+            if not (player and status):
+                continue
+            out.append({"team": (ath.get("team") or {}).get("displayName") or tname, "player": player,
+                        "status": status.strip().title() if status.islower() else status.strip(),
+                        "date": inj.get("date", ""), "note": inj.get("shortComment", "")})
+    return out
+
+
+def lineup_line(sport: str, u: dict) -> str:
+    """📋 {team} · {player} {status} · ESPN · <t:...:R>"""
+    try:
+        when = f" · <t:{int(_parse_time(u['date']).timestamp())}:R>" if u.get("date") else ""
+    except ValueError:
+        when = ""
+    return f"📋 {u['team']} · {u['player']} {u['status']} · ESPN{when}"
+
+
+def lineup_updates(cfg: Config, sport: str, data: dict, now: datetime, seen: dict) -> list[dict]:
+    """The new or changed statuses in one sport's report (seen: {"<sport>|<team>|<player>": status}, updated in place).
+    The first read of a sport only learns what's there: nothing is posted for it (no flood of old news)."""
+    first = not any(k.startswith(f"{sport}|") for k in seen)
+    new = []
+    for u in espn_injuries(data):
+        key = f"{sport}|{u['team']}|{u['player']}"
+        if seen.get(key) == u["status"]:
+            continue
+        seen[key] = u["status"]
+        try:
+            fresh = not u["date"] or now - _parse_time(u["date"]) <= LINEUP_MAX_AGE
+        except ValueError:
+            fresh = True
+        if not first and fresh:
+            new.append(u)
+    return new
+
+
+def lineup_pass(cfg: Config, now: datetime, fetch=None, post: bool = True) -> int:
+    """Read each sport's ESPN injury report (the sports in SPORTS with a LINEUP_CHANNELS channel) and post every
+    new or changed status there, pinging 📋 Lineup Alerts and the sport's role. Returns how many went out.
+    post=False: print them instead (tools/lineup_check.py)."""
+    if not (cfg.routes() and cfg.lineup_channels):
+        return 0
+    fetch = fetch or (lambda path: _get_json(f"{ESPN_BASE}/{path}/injuries"))
+    path, seen = _posted_state(cfg, "lineups_seen.json")
+    roles = route_roles(cfg)
+    sent = 0
+    for sport, key in LINEUP_SPORTS.items():
+        cid = cfg.lineup_channels.get(sport)
+        if not cid or key not in _csv(cfg.sports):
+            continue
+        try:
+            data = fetch(ESPN_LEAGUES[key][0])
+        except Exception as e:  # noqa: BLE001 - one sport's report failing never stops the rest
+            print(f"  ! Lineups: couldn't read ESPN's {sport} injuries ({e!r:.80})", file=sys.stderr, flush=True)
+            continue
+        news = lineup_updates(cfg, sport, data, now, seen)
+        pings = [roles[k] for k in ("extra:lineups", f"sport:{sport}") if roles.get(k)]
+        mention = " ".join(f"<@&{r}>" for r in pings)
+        lines = [lineup_line(sport, u) for u in news]
+        for i in range(0, len(lines), 15):   # (15 a message: one ping per message, under 2,000 characters)
+            text = (mention + "\n" if mention else "") + "\n".join(lines[i:i + 15])
+            if post:
+                _webhook(CHANNEL_URL + cid, {"content": text[:2000], "allowed_mentions": {"parse": [], "roles": pings}})
+            else:
+                print(f"#{sport.lower()}-lineups:\n{text}")
+            sent += len(lines[i:i + 15])
+    _save_state(path if post else None, seen)
+    return sent
 
 
 RECAP_HOUR = 10   # Mondays, New York time: the weekly recap
