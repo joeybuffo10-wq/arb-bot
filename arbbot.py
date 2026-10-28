@@ -2313,7 +2313,10 @@ def _plain(x: float) -> str:
 
 def units(stake: float, unit: float) -> str:
     """A stake in units, at most one decimal: '1.5u', '12.5u', '105u' (a sliver under 0.05u: '<0.1u')."""
-    s = f"{stake / unit:.1f}"
+    q = stake / unit
+    if abs(q * 4 - round(q * 4)) < 1e-6 and q < 10:   # a quarter step (NEW_CARDS): '0.75u', '1.25u'
+        return f"{round(q * 4) / 4:g}u"
+    s = f"{q:.1f}"
     if float(s) == 0 and stake > 0:
         return "<0.1u"
     return (s[:-2] if s.endswith(".0") else s) + "u"
