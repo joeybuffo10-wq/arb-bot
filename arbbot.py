@@ -12320,6 +12320,8 @@ class Trackers:
                 a.on_posted = self.reactions.add
         # INTERACTIONS: the live gateway (slash commands, buttons) and the /feed DM copies of each new card.
         self.feed_dms = self.gateway = None
+        if not cfg.interactions and cfg.guild_id and cfg.discord_bot_token and not off:
+            threading.Thread(target=clear_slash_commands, args=(cfg,), daemon=True).start()
         if cfg.routes() and cfg.interactions and not off:
             self.feed_dms, self.gateway = FeedDMs(cfg, self.reactions), Gateway(cfg, self.reactions)
             for a in (self.evs, self.outs, self.prop_evs, self.prop_outs, self.parlays, self.period_evs,
@@ -13982,6 +13984,17 @@ def record_text(cfg: Config, period: str, now: datetime) -> str:
     label = {"day": "Today", "week": "Last 7 days"}.get(period, "All time")
     rec = units_record(rows, cfg) if cfg.new_units else record_line(rows)
     return f"📊 **{label}:** {rec}" + (f"\n{clv_record(cfg, 7 if period == 'week' else None)}" if period != "day" else "")
+
+
+def clear_slash_commands(cfg: Config) -> None:
+    """INTERACTIONS off: take the bot's slash commands out of the server, so nobody types one the bot won't answer."""
+    try:
+        app = (_bot_api(cfg.discord_bot_token, "GET", "/applications/@me") or {}).get("id")
+        if app and _bot_api(cfg.discord_bot_token, "GET", f"/applications/{app}/guilds/{cfg.guild_id}/commands"):
+            _bot_api(cfg.discord_bot_token, "PUT", f"/applications/{app}/guilds/{cfg.guild_id}/commands", [])
+            print("  ⌨️ Slash commands taken out of the server (INTERACTIONS is off)", flush=True)
+    except (urllib.error.HTTPError, OSError) as e:
+        print(f"  ! Couldn't take the slash commands out ({e!r:.80})", file=sys.stderr, flush=True)
 
 
 class Gateway:
