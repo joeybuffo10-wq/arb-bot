@@ -5276,6 +5276,9 @@ def new_card(b: EVBet, mention: str = "", gone_after: float | None = None, statu
              f"📏 **{b.stake / b.unit_size if b.unit_size > 0 else kelly_units(b.fair_prob, b.price):g}u** "
              f"(¼ Kelly, capped at 2u)",
              f"🏷️ Trigger: `{trigger_name(b, outlier)}` · tier {tier}"]
+    if b.sharp_move is not None and b.sharp_move >= SHARP_MOVE_POINTS:   # (a bonus note, never required)
+        lines.append(f"🔥 **Sharp money:** {b.sharp_name or 'Pinnacle'} moved toward it "
+                     f"(+{b.sharp_move:.1f}% win chance this hour)")
     body = "\n".join(lines) + "".join(f"\n\n{x}" for x in (status_line(status, b.book), note) if x)
     return _card(f"📈 +{b.ev_pct:.1f}% EV · {b.book} · {icon} {tier}", body, TIER_COLORS[key], url=b.link,
                  footer=f"{CARD_FOOTER} · alert #{alert_id(b)}", mention=mention)

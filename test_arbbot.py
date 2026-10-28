@@ -15147,6 +15147,9 @@ class NewCards(unittest.TestCase):
         self.assertEqual(lines[5], f"🏷️ Trigger: `sharp_ev` · tier {tier}")
         self.assertEqual(card["color"], _arbbot.TIER_COLORS[key])
         self.assertEqual(card["footer"]["text"], f"21+ · bet only where legal · 1-800-GAMBLER · alert #{_arbbot.alert_id(b)}")
+        self.assertNotIn("🔥", card["description"])
+        hot = _arbbot.new_card(replace(b, sharp_move=2.5, sharp_name="Pinnacle"))["embeds"][0]["description"]
+        self.assertIn("🔥 **Sharp money:** Pinnacle moved toward it (+2.5% win chance this hour)", hot)
         gone = _arbbot.new_card(b, gone_after=95)["embeds"][0]
         self.assertTrue(gone["title"].startswith("❌ GONE after 1m 35s · ~~Home"))
         self.assertEqual(gone["color"], _arbbot.GREY)
