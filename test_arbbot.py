@@ -1062,6 +1062,15 @@ class Props(unittest.TestCase):
         few = prop_event({"A": (1.91, 1.91), "E": (2.20, 1.68)})
         self.assertEqual(find_evs([few], Config().for_props(), NOW), [])   # needs 4+ books
 
+    def test_sharp_only_drops_bets_no_sharp_book_priced(self):
+        ev = prop_event({"A": (1.87, 1.95), "B": (1.91, 1.91), "C": (1.95, 1.87), "D": (1.89, 1.93),
+                         "E": (2.20, 1.68)})
+        self.assertEqual(find_evs([ev], replace(Config(), sharp_only=True).for_props(), NOW), [])   # median: out
+        pin = prop_event({"Pinnacle": (1.91, 1.91), "DK": (2.15, 1.70)})
+        pin["bookmakers"][0]["key"] = "pinnacle"
+        [b] = find_evs([pin], replace(Config(), sharp_only=True).for_props(), NOW)       # Pinnacle's price: in
+        self.assertEqual(b.sharp_book, "Pinnacle")
+
     def test_prop_arb(self):
         ev = prop_event({"A": (2.15, 1.70), "B": (1.70, 2.15)})
         [arb] = find_arbs([ev], Config(min_profit_pct=0), NOW)

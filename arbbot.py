@@ -612,6 +612,9 @@ class Config:
     # SHARP_WEIGHTS' kalshi, else 0.15), when both teams have a usable quote. Only the edge, the stake and
     # the card use it: every check (Kalshi's gap, confirmed bets, the sharp's history, CLV) uses the sharp's.
     kalshi_blend: bool = True
+    # SHARP_ONLY=true: every bet priced off a sharp book (SHARP_BOOKS: Pinnacle on this feed); none off the other
+    # books' median (props Pinnacle doesn't price) or Kalshi alone.
+    sharp_only: bool = False
     # A pre-game moneyline no sharp book lists at all (while it lists other games in that sport) can be
     # priced by Kalshi alone: the other sportsbooks must roughly agree, it's at most medium confidence
     # (never in locks mode) and the stake is cut to KALSHI_ONLY_STAKE.
@@ -922,6 +925,7 @@ class Config:
             kalshi_min_size=num("KALSHI_MIN_SIZE", d.kalshi_min_size, float),
             kalshi_live=e("KALSHI_LIVE", "false").lower() in ("1", "true", "yes"),
             kalshi_blend=(e("KALSHI_BLEND") or "true").strip().lower() in ("1", "true", "yes"),
+            sharp_only=e("SHARP_ONLY", "false").lower() in ("1", "true", "yes"),
             kalshi_only=(e("KALSHI_ONLY") or "true").strip().lower() in ("1", "true", "yes"),
             kalshi_only_stake=num("KALSHI_ONLY_STAKE", d.kalshi_only_stake, float),
             pregame_confirmed_ev_pct=num("PREGAME_CONFIRMED_EV_PCT", None, float),
@@ -4765,6 +4769,8 @@ def find_evs(events: list[dict], cfg: Config, now: datetime | None = None,
                 lst = [o for o in lst if (low_p(o[6]) * o[0] - 1) * 100 >= min_ev]
             kalshi_alone = k in alone
             from_sharp = cons is None and not kalshi_alone
+            if cfg.sharp_only and not from_sharp:
+                continue   # (SHARP_ONLY: no sharp book priced this line: the other books' median or Kalshi alone)
             blended = from_sharp and k in blend and book_key != "kalshi"
             left_out = None   # a reference left out of the fair price as the odd one out: (key, points off)
             if from_sharp:
