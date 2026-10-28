@@ -15120,7 +15120,7 @@ class NewCards(unittest.TestCase):
         self.assertEqual([_arbbot.snap_units(x) for x in (0.1, 0.374, 0.375, 1.0, 2.6)], [0.25, 0.25, 0.5, 1.0, 2.0])
 
     def test_stakes_are_units_times_the_unit_and_cuts_stay_on_the_steps(self):
-        cfg = Config(new_cards=True, unit_size=20, ev_bankroll=2000, round_stakes=5)
+        cfg = Config(new_units=True, unit_size=20, ev_bankroll=2000, round_stakes=5)
         self.assertEqual(_arbbot.kelly_stake(0.5, 2.10, cfg, mult=0.5), 25.0)   # 1.25u x $20 (no confidence cut)
         self.assertEqual(_arbbot.round_stake(25.0 * 0.5, 9999, cfg), 15.0)     # halved: 0.625u -> 0.75u
         self.assertEqual(_arbbot.round_stake(1.0, 9999, cfg), 5.0)             # never under 0.25u
@@ -15130,7 +15130,7 @@ class NewCards(unittest.TestCase):
     def bet(self):
         ev = ev_event([("Home", 1.91, None), ("Away", 1.91, None)], {"DraftKings": [("Home", 2.10, None)]})
         ev["sport_key"] = "basketball_nba"
-        return find_evs([ev], Config(min_ev_pct=0.1, round_stakes=0, new_cards=True, unit_size=10,
+        return find_evs([ev], Config(min_ev_pct=0.1, round_stakes=0, new_units=True, unit_size=10,
                                      ev_bankroll=1000), NOW)[0]
 
     def test_the_card(self):
@@ -15170,7 +15170,7 @@ class RecapAndGraveyard(unittest.TestCase):
         import tempfile
         self.dir = Path(tempfile.mkdtemp())
         _arbbot.ROLE_CACHE.update(at=time.time(), guild="g", ids={"extra:heater": "91", "extra:icecold": "92"})
-        self.cfg = Config(routing=True, guild_id="g", discord_bot_token="t", new_cards=True, unit_size=10,
+        self.cfg = Config(routing=True, guild_id="g", discord_bot_token="t", new_units=True, unit_size=10,
                           ev_bankroll=1000, channels={"main": "1", "graveyard": "2", "weekly": "3", "free": "4"},
                           state_dir=str(self.dir / "state"), ev_results_file=str(self.dir / "res.csv"))
 

@@ -442,6 +442,9 @@ class Config:
     # trigger, tier colors) and stakes in units: ¼ Kelly x 100, to the nearest 0.25u, 0.25u-2u (kelly_units). The
     # same-game, STAKE_BOOST and TUNE cuts still apply, then the 0.25u steps and the 0.25u-2u range again.
     new_cards: bool = False
+    # NEW_UNITS=true: those stakes and the results card in units (a running P/L), with the old card or the new one.
+    # (Empty: as NEW_CARDS.)
+    new_units: bool = False
     # INTERACTIONS=true (with ROUTING): a live gateway connection for /unit /mybets /record /feed and the cards'
     # 🔄 Refresh / ✅ I bet this / 🙈 Hide buttons; /feed members get a DM copy of the alerts that fit.
     interactions: bool = False
@@ -825,6 +828,7 @@ class Config:
             tier_roles=parse_tier_roles(e("TIER_ROLES", "")),
             routing=e("ROUTING", "false").lower() in ("1", "true", "yes"),
             new_cards=e("NEW_CARDS", "false").lower() in ("1", "true", "yes"),
+            new_units=(e("NEW_UNITS") or e("NEW_CARDS") or "false").strip().lower() in ("1", "true", "yes"),
             interactions=e("INTERACTIONS", "false").lower() in ("1", "true", "yes"),
             guild_id=e("GUILD_ID", "").strip(),
             channels=parse_id_map(e("CHANNELS", ""), "CHANNELS", lower=True),
@@ -4114,7 +4118,7 @@ def kelly_stake(fair_prob: float, price: float, cfg: Config, mult: float = 1.0) 
     """Fractional Kelly, capped at EV_MAX_STAKE_PCT of EV_BANKROLL, then scaled by mult
     (confidence, single source) so smaller-confidence bets are smaller even at the cap.
     NEW_CARDS: kelly_units x the unit instead (no mult: the formula alone)."""
-    if cfg.new_cards:
+    if cfg.new_units:
         return round(kelly_units(fair_prob, price) * (cfg.unit() or 1.0), 2)
     edge = (fair_prob * price - 1) / (price - 1)
     cap = cfg.ev_bankroll * cfg.ev_max_stake_pct / 100
@@ -4124,7 +4128,7 @@ def kelly_stake(fair_prob: float, price: float, cfg: Config, mult: float = 1.0) 
 def round_stake(stake: float, cap: float, cfg: Config) -> float:
     """Round to ROUND_STAKES (else whole dollars, else cents) without ever going over cap.
     NEW_CARDS: to 0.25u steps, 0.25u-2u, whatever the cap."""
-    if cfg.new_cards:
+    if cfg.new_units:
         unit = cfg.unit() or 1.0
         return round(snap_units(stake / unit) * unit, 2)
     stake = min(stake, cap)
@@ -8177,7 +8181,7 @@ def results_payload(cfg: Config, title_prefix: str, rows: list[dict], day_rows: 
                     day, now: datetime | None = None) -> dict:
     """A results card: the given bets one by one, then the day's record (NEW_CARDS: in units, units_results_payload)."""
     now = now or datetime.now(timezone.utc)
-    if cfg.new_cards:
+    if cfg.new_units:
         return units_results_payload(cfg, title_prefix, rows, day_rows, day, now)
     shown = rows[:20]
     body = "\n".join(result_line(r, cfg, now) for r in shown)
@@ -13979,7 +13983,7 @@ def record_text(cfg: Config, period: str, now: datetime) -> str:
              "week": now - timedelta(days=7)}.get(period)
     rows = bettable(cfg, _graded(cfg, since))
     label = {"day": "Today", "week": "Last 7 days"}.get(period, "All time")
-    rec = units_record(rows, cfg) if cfg.new_cards else record_line(rows)
+    rec = units_record(rows, cfg) if cfg.new_units else record_line(rows)
     return f"📊 **{label}:** {rec}" + (f"\n{clv_record(cfg, 7 if period == 'week' else None)}" if period != "day" else "")
 
 
