@@ -8062,10 +8062,74 @@ def day_clv_line(rows: list[dict]) -> str:
             f"({len(clvs)} bet{'s' if len(clvs) != 1 else ''})")
 
 
+def row_units(r: dict, cfg: Config) -> float:
+    """The stake in units, as the card showed it (a parlay or an old row: its stake over the unit)."""
+    try:
+        return float(r["units"]) if r.get("units") not in ("", None) else float(r["stake"]) / (cfg.unit() or 1.0)
+    except (KeyError, ValueError):
+        return 0.0
+
+
+def row_profit_units(r: dict, cfg: Config) -> float:
+    """What a graded bet won or lost in units (its dollars over its own unit)."""
+    stake, u = float(r.get("stake") or 0), row_units(r, cfg)
+    return float(r.get("profit") or 0) * (u / stake if stake else 1 / (cfg.unit() or 1.0))
+
+
+def units_record(rows: list[dict], cfg: Config) -> str:
+    """"13-12-1 · +3.6u on 30.5u (ROI +11.8%)" for the graded rows ("no graded bets yet")."""
+    g = [r for r in rows if r.get("result") in ("win", "loss", "push") and not r.get("manual_legs")]
+    if not g:
+        return "no graded bets yet"
+    w, l = sum(r["result"] == "win" for r in g), sum(r["result"] == "loss" for r in g)
+    pu, staked = len(g) - w - l, sum(row_units(r, cfg) for r in g if r["result"] != "push")
+    won = sum(row_profit_units(r, cfg) for r in g)
+    return (f"{w}-{l}" + (f"-{pu}" if pu else "") + f" · {won:+.1f}u on {staked:g}u"
+            + (f" (ROI {won / staked * 100:+.1f}%)" if staked else ""))
+
+
+def units_table(rows: list[dict], cfg: Config) -> str:
+    """NEW_CARDS results: Bet | Odds @ Book | Units | Result | +/−u | Running P/L, one bet a line (monospace)."""
+    lines, run = [f"{'Bet':<27} {'Odds @ Book':<16} {'Units':>5} {'Res':<4} {'+/−u':>6} {'P/L':>6}"], 0.0
+    for r in rows:
+        res = r.get("result", "")
+        pl = row_profit_units(r, cfg) if res in ("win", "loss", "push") and not r.get("manual_legs") else None
+        run += pl or 0.0
+        book = BOOK_SHORT.get(book_slug(r.get("book", "")), r.get("book", "")[:8])
+        lines.append(f"{row_pick(r)[:27]:<27} {odds(float(r['price'])) + ' @ ' + book:<16} {row_units(r, cfg):>5g} "
+                     f"{({'win': 'W', 'loss': 'L', 'push': 'P'}.get(res, '…')):<4} "
+                     + (f"{pl:>+6.2f} {run:>+6.2f}" if pl is not None else f"{'':>6} {run:>+6.2f}"))
+    return "```\n" + "\n".join(lines) + "\n```"
+
+
+BOOK_SHORT = {"draftkings": "DK", "fanduel": "FD", "betmgm": "MGM", "williamhillus": "CZR", "caesars": "CZR",
+              "kalshi": "Kalshi", "espnbet": "ESPN", "betrivers": "BR", "fanatics": "FAN", "hardrockbet": "HR"}
+
+
+def units_results_payload(cfg: Config, title_prefix: str, rows: list[dict], day_rows: list[dict], day,
+                          now: datetime) -> dict:
+    """NEW_CARDS: the results card in units with a running P/L, then the day's record, ROI, CLV and the members."""
+    shown = rows[:25]
+    body = units_table(shown, cfg)
+    if len(rows) > len(shown):
+        body += f"…and {len(rows) - len(shown)} more (all of them: arbbot.py --results {day})"
+    g = [r for r in rows if r.get("result") in ("win", "loss", "push")]
+    won = sum(row_profit_units(r, cfg) for r in g if not r.get("manual_legs"))
+    title = title_prefix + (f" · {units_record(rows, cfg).split(' on ')[0]}" if g else "")
+    clv, members, link = day_clv_line(day_rows), members_lines(cfg, day_rows), site_link(cfg, day=day)
+    desc = (body + DIVIDER + f"**{day:%a %b %-d}** (every alert at the units it showed)\n**All:** "
+            + units_record(day_rows, cfg) + (f"\n{clv}" if clv else "") + (f"\n\n{members}" if members else "")
+            + (f"\n\n{link}" if link else ""))
+    return _card(title, desc, 0x2ECC71 if won > 0 else (0xE74C3C if won < 0 else GREY),
+                 footer="Results assume every alert was bet at the units shown. " + CARD_FOOTER)
+
+
 def results_payload(cfg: Config, title_prefix: str, rows: list[dict], day_rows: list[dict],
                     day, now: datetime | None = None) -> dict:
-    """A results card: the given bets one by one, then the day's record."""
+    """A results card: the given bets one by one, then the day's record (NEW_CARDS: in units, units_results_payload)."""
     now = now or datetime.now(timezone.utc)
+    if cfg.new_cards:
+        return units_results_payload(cfg, title_prefix, rows, day_rows, day, now)
     shown = rows[:20]
     body = "\n".join(result_line(r, cfg, now) for r in shown)
     if len(rows) > len(shown):
@@ -12851,13 +12915,25 @@ def run(cfg: Config, args: argparse.Namespace, status: Status) -> None:
                 print(f"  🚀 Boosts post: {send_boosts(cfg, t.boost_pool, day, now)} bets", flush=True)
             except Exception as e:  # noqa: BLE001 - never stops the bot
                 results_warned = results_trouble(status, e, results_warned, what="post the profit boosts")
-        if not (args.once or args.dry_run) and cfg.free_webhook_url and time.time() - teased > 300:
+        if not (args.once or args.dry_run) and (cfg.free_webhook_url or cfg.routes()) and time.time() - teased > 300:
             teased = time.time()
             try:
                 if wins := free_wins(cfg, now):
                     send_free_wins(cfg, wins)
             except Exception as e:  # noqa: BLE001
                 results_warned = results_trouble(status, e, results_warned, what="post to the free channel")
+            try:
+                if losses := graveyard_losses(cfg, now):
+                    send_graveyard(cfg, losses)
+            except Exception as e:  # noqa: BLE001
+                results_warned = results_trouble(status, e, results_warned, what="post to the graveyard")
+        if not (args.once or args.dry_run) and (day := recap_due(cfg, now)):
+            try:
+                note = send_recap(cfg, day, now)
+                print(f"  📅 Weekly recap posted for the week before {day}" + (f" (roles skipped: {note})" if note else ""),
+                      flush=True)
+            except Exception as e:  # noqa: BLE001 - never stops the bot
+                results_warned = results_trouble(status, e, results_warned, what="post the weekly recap")
         if not (args.once or args.dry_run) and (day := site_due(cfg, now)) and time.time() - site_tried > 3600:
             site_tried = time.time()
             try:
@@ -13199,6 +13275,9 @@ def send_digest(cfg: Config, t: "Trackers", day: date, now: datetime) -> int:
 FREE_WIN_HOURS = 36   # a winning prop is shown in the free channel if its game started within this many hours
 
 
+FREE_PER_DAY = 3   # ROUTING: winning alerts a day in the free preview
+
+
 def free_wins(cfg: Config, now: datetime) -> list[dict]:
     """DISCORD_FREE_WEBHOOK_URL: player props that won and haven't been shown yet (each once: state/free_posted.json).
     Only graded bets, so nothing a free member could still bet."""
@@ -13211,11 +13290,19 @@ def free_wins(cfg: Config, now: datetime) -> list[dict]:
         posted = {}
     cutoff = now - timedelta(hours=FREE_WIN_HOURS)
     wins = []
-    for r in _read_csv(cfg.ev_results_file) if cfg.ev_results_file else []:
+    rows = _read_csv(cfg.ev_results_file) if cfg.ev_results_file else []
+    if cfg.routes():   # ROUTING: any settled single that won, the day's best FREE_PER_DAY at most
+        rows = sorted(rows, key=lambda r: -float(r.get("profit") or 0))
+    for r in rows:
         bid = _bet_id(r)
-        if (r.get("result") != "win" or not r.get("player") or bid in posted or not cfg.counts(r.get("book", ""))
+        if (r.get("result") != "win" or not (r.get("player") or cfg.routes()) or r.get("market") == "parlay"
+                or bid in posted or not cfg.counts(r.get("book", ""))
                 or _parse_time(r["commence_time"]) < cutoff or str(r.get("live")).lower() == "true"):
             continue
+        if cfg.routes():
+            day = local_day(cfg, r["commence_time"])
+            if sum(local_day(cfg, v) == day for v in posted.values()) >= FREE_PER_DAY:
+                continue
         posted[bid] = r["commence_time"]
         wins.append(r)
     posted = {k: v for k, v in posted.items() if _parse_time(v) > now - timedelta(days=4)}
@@ -13243,6 +13330,222 @@ def send_free_wins(cfg: Config, wins: list[dict]) -> None:
         if last and cfg.free_cta:
             payload["content"] = cfg.free_cta[:1990]
         _webhook(cfg.free_webhook_url, payload)
+
+
+# --------------------------------------------------------------------------- graveyard and weekly recap (ROUTING)
+
+def _posted_state(cfg: Config, name: str) -> tuple[Path | None, dict]:
+    path = data_path(cfg.state_dir) / name if cfg.state_dir else None
+    try:
+        return path, (json.loads(path.read_text()) if path and path.exists() else {})
+    except (OSError, ValueError):
+        return path, {}
+
+
+def _save_state(path: Path | None, data) -> None:
+    if path:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data))
+        tmp.replace(path)
+
+
+def how_it_lost(r: dict) -> str:
+    """"final 101-98" / "finished with 3" / "a leg missed": what sank a graded loss, for its graveyard line."""
+    if r.get("kind") == "parlay" or r.get("market") == "parlay":
+        return "a leg missed"
+    if r.get("actual") not in ("", None, "DNP"):
+        return f"finished with {r['actual']}"
+    if r.get("home_score") not in ("", None):
+        return (f"final {r.get('away_team', '')} {float(r['away_score']):g}, "
+                f"{r.get('home_team', '')} {float(r['home_score']):g}")
+    return "lost"
+
+
+def graveyard_line(r: dict, cfg: Config) -> str:
+    """🪦 {bet} {odds} @ {book} · −{units}u · {how it lost}"""
+    return (f"🪦 {row_pick(r)} {odds(float(r['price']))} @ {r.get('book', '')} · −{abs(row_profit_units(r, cfg)):.2f}u"
+            f" · {how_it_lost(r)}")
+
+
+def graveyard_losses(cfg: Config, now: datetime) -> list[dict]:
+    """ROUTING's graveyard: graded losses not posted there yet (each once: state/graveyard_posted.json)."""
+    if not (cfg.routes() and cfg.channels.get("graveyard") and cfg.ev_results_file):
+        return []
+    path, posted = _posted_state(cfg, "graveyard_posted.json")
+    cutoff, out = now - timedelta(days=2), []
+    for r in _read_csv(cfg.ev_results_file):
+        bid = _bet_id(r)
+        if (r.get("result") != "loss" or r.get("manual_legs") or bid in posted or not cfg.counts(r.get("book", ""))
+                or _parse_time(r["commence_time"]) < cutoff):
+            continue
+        posted[bid] = r["commence_time"]
+        out.append(r)
+    _save_state(path, {k: v for k, v in posted.items() if _parse_time(v) > now - timedelta(days=4)})
+    return out
+
+
+def send_graveyard(cfg: Config, losses: list[dict]) -> None:
+    """The graveyard lines, as few messages as fit (2,000 characters each), no pings."""
+    lines = [graveyard_line(r, cfg) for r in losses]
+    chunk: list[str] = []
+    for line in lines + [None]:
+        if line is None or len("\n".join(chunk + [line])) > 1990:
+            if chunk:
+                _webhook(CHANNEL_URL + cfg.channels["graveyard"], {"content": "\n".join(chunk),
+                                                                     "allowed_mentions": {"parse": []}})
+            chunk = [line] if line else []
+        else:
+            chunk.append(line)
+
+
+RECAP_HOUR = 10   # Mondays, New York time: the weekly recap
+RECAP_MIN_BETS = 10   # tracked bets a member needs for 🔥 On a Heater / 🧊 Ice Cold
+
+
+def recap_due(cfg: Config, now: datetime) -> date | None:
+    """The Monday the weekly recap is owed for (10:00 New York, once a week), or None."""
+    local = now.astimezone(ZoneInfo(cfg.timezone))
+    if not (cfg.routes() and cfg.channels.get("weekly")) or local.weekday() != 0 or local.hour < RECAP_HOUR:
+        return None
+    path, data = _posted_state(cfg, "recap_week.json")
+    return None if data.get("day") == local.date().isoformat() else local.date()
+
+
+def leaderboard(cfg: Config, rows: list[dict]) -> list[tuple[str, str, float, int]]:
+    """(user id, name, units won, tracked bets) of every member who ✅'d a graded bet among rows, best first."""
+    taken, by_id = read_taken(cfg), {_bet_id(r): r for r in rows}
+    people: dict[str, list] = {}
+    for bid, e in taken.items():
+        r = by_id.get(bid)
+        if not r:
+            continue
+        for uid, name in e.get("users", {}).items():
+            p = people.setdefault(uid, [name, 0.0, 0])
+            p[1] += row_profit_units(r, cfg)
+            p[2] += 1
+    return sorted(((uid, n, u, k) for uid, (n, u, k) in people.items()), key=lambda x: -x[2])
+
+
+def pick_heat(board: list[tuple[str, str, float, int]], min_bets: int = RECAP_MIN_BETS) -> tuple[str, str]:
+    """(🔥 On a Heater, 🧊 Ice Cold): the top and the bottom member by units among those with min_bets tracked
+    bets ("" when nobody qualifies; one member alone is only On a Heater)."""
+    ok = [x for x in board if x[3] >= min_bets]
+    if not ok:
+        return "", ""
+    top = max(ok, key=lambda x: x[2])
+    bottom = min(ok, key=lambda x: x[2])
+    return top[0], (bottom[0] if bottom[0] != top[0] else "")
+
+
+def set_heat_roles(cfg: Config, heater: str, cold: str) -> str:
+    """Take 🔥 On a Heater and 🧊 Ice Cold off everyone, then give them to heater and cold. Returns "" when done, else
+    why it was skipped (the bot's role too low, no Manage Roles...): said in the recap and logged."""
+    roles = route_roles(cfg)
+    hot_id, cold_id = roles.get("extra:heater"), roles.get("extra:icecold")
+    if not (hot_id and cold_id):
+        return "the 🔥 On a Heater / 🧊 Ice Cold roles aren't in the server"
+    path, last = _posted_state(cfg, "heat_roles.json")
+    tok, gid = cfg.discord_bot_token, cfg.guild_id
+    try:
+        holders: dict[str, set] = {hot_id: set(last.get(hot_id, [])), cold_id: set(last.get(cold_id, []))}
+        try:   # everyone who has them now (needs the Server Members intent; else the ones the bot gave last time)
+            after = "0"
+            while True:
+                page = _bot_api(tok, "GET", f"/guilds/{gid}/members?limit=1000&after={after}") or []
+                for m in page:
+                    for rid in (hot_id, cold_id):
+                        if rid in m.get("roles", []):
+                            holders[rid].add(m["user"]["id"])
+                if len(page) < 1000:
+                    break
+                after = page[-1]["user"]["id"]
+        except urllib.error.HTTPError:
+            pass
+        def role(method: str, uid: str, rid: str) -> None:
+            try:
+                _bot_api(tok, method, f"/guilds/{gid}/members/{uid}/roles/{rid}")
+            except urllib.error.HTTPError as e:
+                if e.code != 404:   # (a member who left the server: nothing to do)
+                    raise
+        for rid, users in holders.items():
+            for uid in users:
+                role("DELETE", uid, rid)
+        for rid, uid in ((hot_id, heater), (cold_id, cold)):
+            if uid:
+                role("PUT", uid, rid)
+    except urllib.error.HTTPError as e:
+        why = ("the bot's role is below those roles (or it lacks Manage Roles)" if e.code == 403
+               else f"Discord said {e.code}")
+        print(f"  ! Weekly recap: role step skipped: {why}", file=sys.stderr, flush=True)
+        return why
+    _save_state(path, {hot_id: [heater] if heater else [], cold_id: [cold] if cold else []})
+    return ""
+
+
+def _group_lines(rows: list[dict], cfg: Config, key) -> list[str]:
+    groups: dict[str, list] = {}
+    for r in rows:
+        groups.setdefault(key(r), []).append(r)
+    return [f"{name}: {units_record(g, cfg)}" for name, g in sorted(groups.items(), key=lambda t: -len(t[1]))]
+
+
+def recap_payload(cfg: Config, day: date, now: datetime, heat_note: str | None = None,
+                  board: list | None = None) -> dict:
+    """The weekly recap: last week's record, units, ROI and CLV; by play type and sport; the best hit and worst beat;
+    the members' leaderboard (✅ tracked bets) and who's 🔥 / 🧊."""
+    start = datetime.combine(day - timedelta(days=7), dtime.min, ZoneInfo(cfg.timezone))
+    end = datetime.combine(day, dtime.min, ZoneInfo(cfg.timezone))
+    rows = [r for r in bettable(cfg, _graded(cfg, start)) if _parse_time(r["commence_time"]) < end]
+    clvs = [float(r["clv_pct"]) for r in rows if r.get("clv_pct") not in ("", None)]
+    parts = [f"**Desk:** {units_record(rows, cfg)}"
+             + (f"\n📐 CLV avg {sum(clvs) / len(clvs):+.1f}% · beat the close {sum(c > 0 for c in clvs) / len(clvs):.0%}"
+                if clvs else "")]
+    kind_name = {"ev": "📈 +EV", "prop": "🎲 Props", "outlier": "📏 Line discrepancies", "parlay": "📦 Parlays"}
+    if rows:
+        parts.append("__**By play type**__\n" + "\n".join(_group_lines(rows, cfg, lambda r: kind_name.get(
+            "prop" if r.get("player") and _kind(r) == "ev" else _kind(r), _kind(r)))))
+        parts.append("__**By sport**__\n" + "\n".join(_group_lines(
+            rows, cfg, lambda r: f"{sport_icon(r.get('sport_key', ''))} {sport_of(r.get('sport_key', '')) or r.get('sport', 'Other')}")))
+        wins = [r for r in rows if r["result"] == "win"]
+        losses = [r for r in rows if r["result"] == "loss"]
+        if wins:
+            best = max(wins, key=lambda r: row_profit_units(r, cfg))
+            parts.append(f"🏆 **Best hit:** {row_pick(best)} {odds(float(best['price']))} @ {best['book']} · "
+                         f"{row_profit_units(best, cfg):+.2f}u")
+        if losses:   # the one that hurt most: the biggest loss, the likeliest to win first
+            worst = max(losses, key=lambda r: (-row_profit_units(r, cfg), 1 / float(r.get("fair_odds") or 99)))
+            parts.append(f"💀 **Worst beat:** {row_pick(worst)} {odds(float(worst['price']))} @ {worst['book']} · "
+                         f"{row_profit_units(worst, cfg):+.2f}u · {how_it_lost(worst)}")
+    board = leaderboard(cfg, rows) if board is None else board
+    if board:
+        top = [f"{i}. {name} {u:+.1f}u ({n} bets)" for i, (_, name, u, n) in enumerate(board[:10], 1)]
+        parts.append("__**Leaderboard** (✅ tracked bets)__\n" + "\n".join(top))
+    hot, cold = pick_heat(board)
+    if heat_note:
+        parts.append(f"⚠️ Roles not updated: {heat_note}.")
+    elif hot or cold:
+        parts.append(" · ".join(x for x in (f"🔥 On a Heater: <@{hot}>" if hot else "",
+                                            f"🧊 Ice Cold: <@{cold}>" if cold else "") if x))
+    elif board:
+        parts.append(f"(🔥 / 🧊 need {RECAP_MIN_BETS}+ tracked bets: nobody this week)")
+    return _card(f"📅 Weekly recap · {day - timedelta(days=7):%b %-d} – {day - timedelta(days=1):%b %-d}",
+                 "\n\n".join(parts)[:4000], 0x5865F2, footer="21+ · only bet where legal · 1-800-GAMBLER")
+
+
+def send_recap(cfg: Config, day: date, now: datetime) -> str:
+    """Post the weekly recap (after the 🔥 / 🧊 roles), and remember the week went. Returns the role note."""
+    start = datetime.combine(day - timedelta(days=7), dtime.min, ZoneInfo(cfg.timezone))
+    end = datetime.combine(day, dtime.min, ZoneInfo(cfg.timezone))
+    rows = [r for r in bettable(cfg, _graded(cfg, start)) if _parse_time(r["commence_time"]) < end]
+    board = leaderboard(cfg, rows)
+    note = set_heat_roles(cfg, *pick_heat(board))
+    payload = recap_payload(cfg, day, now, note or None, board)
+    payload["allowed_mentions"] = {"parse": []}   # (names the 🔥 / 🧊 members without pinging them)
+    _webhook(CHANNEL_URL + cfg.channels["weekly"], payload)
+    path, _ = _posted_state(cfg, "recap_week.json")
+    _save_state(path, {"day": day.isoformat()})
+    return note
 
 
 HEARTBEAT_SECONDS = 300

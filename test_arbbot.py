@@ -15149,3 +15149,111 @@ class NewCards(unittest.TestCase):
         self.assertIn("🏷️ Trigger", on["description"])
         self.assertNotIn("🏷️ Trigger", off["description"])
         self.assertIn("`outlier`", _arbbot.OutlierAlerter(Config(new_cards=True), dry_run=True).payload(b)["embeds"][0]["description"])
+
+
+class RecapAndGraveyard(unittest.TestCase):
+    """NEW_CARDS results in units; ROUTING's graveyard, weekly recap (🔥 / 🧊 roles) and free preview cap."""
+
+    def setUp(self):
+        import tempfile
+        self.dir = Path(tempfile.mkdtemp())
+        _arbbot.ROLE_CACHE.update(at=time.time(), guild="g", ids={"extra:heater": "91", "extra:icecold": "92"})
+        self.cfg = Config(routing=True, guild_id="g", discord_bot_token="t", new_cards=True, unit_size=10,
+                          ev_bankroll=1000, channels={"main": "1", "graveyard": "2", "weekly": "3", "free": "4"},
+                          state_dir=str(self.dir / "state"), ev_results_file=str(self.dir / "res.csv"))
+
+    def tearDown(self):
+        _arbbot.ROLE_CACHE.update(at=0.0, guild="", ids={})
+
+    def row(self, i, result, profit, stake=10.0, units=1.0, player="", **kw):
+        r = {"first_seen": "2026-10-26T20:00:00+00:00", "event_id": f"e{i}", "sport": "NBA",
+             "sport_key": "basketball_nba", "matchup": "A @ B", "home_team": "B", "away_team": "A",
+             "commence_time": "2026-10-26T23:00:00+00:00", "live": "False", "market": "player_points" if player else "h2h",
+             "outcome": "Over" if player else "B", "point": 20.5 if player else "", "n_outcomes": 2,
+             "book": "DraftKings", "price": 2.0, "fair_odds": 1.9, "best_ev_pct": 5, "stake": stake, "player": player,
+             "units": units, "result": result, "profit": profit, "home_score": 101, "away_score": 98, "actual": ""}
+        r.update(kw)
+        return r
+
+    def test_units_table_has_a_running_total(self):
+        rows = [self.row(1, "win", 10.0), self.row(2, "loss", -15.0, stake=15, units=1.5), self.row(3, "", "")]
+        t = _arbbot.units_table(rows, self.cfg).split("\n")
+        self.assertTrue(t[1].startswith("Bet"))
+        self.assertTrue(t[2].rstrip().endswith("+1.00  +1.00"))
+        self.assertTrue(t[3].rstrip().endswith("-1.50  -0.50"))
+        self.assertIn("…", t[4])
+        self.assertEqual(_arbbot.units_record(rows, self.cfg), "1-1 · -0.5u on 2.5u (ROI -20.0%)")
+        card = _arbbot.results_payload(self.cfg, "📋 Results", rows, rows, NOW.date(), NOW)["embeds"][0]
+        self.assertIn("```", card["description"])
+        self.assertIn("every alert at the units it showed", card["description"])
+
+    def test_each_loss_goes_to_the_graveyard_once(self):
+        from unittest import mock
+        rows = [self.row(1, "loss", -10.0, player="Jay Huff", actual="3"), self.row(2, "win", 10.0),
+                self.row(3, "loss", -10.0)]
+        for r in rows:
+            _arbbot.append_csv(self.cfg.ev_results_file, list(r), r)
+        now = datetime(2026, 10, 27, 12, tzinfo=timezone.utc)
+        losses = _arbbot.graveyard_losses(self.cfg, now)
+        self.assertEqual(len(losses), 2)
+        self.assertEqual(_arbbot.graveyard_line(losses[0], self.cfg),
+                         "🪦 Jay Huff Over 20.5 Points +100 @ DraftKings · −1.00u · finished with 3")
+        self.assertEqual(_arbbot.graveyard_line(losses[1], self.cfg),
+                         "🪦 B ML +100 @ DraftKings · −1.00u · final A 98, B 101")
+        self.assertEqual(_arbbot.graveyard_losses(self.cfg, now), [])          # once each
+        sent = []
+        with mock.patch("arbbot._webhook", lambda url, p, *a, **k: sent.append((url, p))):
+            _arbbot.send_graveyard(self.cfg, losses)
+        self.assertEqual(sent[0][0], "discord://channel/2")
+        self.assertEqual(sent[0][1]["content"].count("🪦"), 2)
+        self.assertEqual(_arbbot.graveyard_losses(replace(self.cfg, routing=False), now), [])
+
+    def test_the_weekly_role_picker(self):
+        board = [("a", "Ann", 12.0, 15), ("b", "Bo", 30.0, 4), ("c", "Cy", -8.0, 11), ("d", "Di", 1.0, 10)]
+        self.assertEqual(_arbbot.pick_heat(board), ("a", "c"))       # Bo is up most but has only 4 tracked bets
+        self.assertEqual(_arbbot.pick_heat([("a", "Ann", 5.0, 12)]), ("a", ""))   # alone: just On a Heater
+        self.assertEqual(_arbbot.pick_heat(board, min_bets=50), ("", ""))
+
+    def test_roles_move_and_a_low_bot_role_is_skipped_and_said(self):
+        from unittest import mock
+        calls = []
+
+        def api(tok, method, path, body=None):
+            calls.append((method, path))
+            if path.startswith("/guilds/g/members?"):
+                return [{"user": {"id": "old"}, "roles": ["91"]}]
+            return None
+        with mock.patch("arbbot._bot_api", api):
+            self.assertEqual(_arbbot.set_heat_roles(self.cfg, "a", "c"), "")
+        self.assertIn(("DELETE", "/guilds/g/members/old/roles/91"), calls)
+        self.assertIn(("PUT", "/guilds/g/members/a/roles/91"), calls)
+        self.assertIn(("PUT", "/guilds/g/members/c/roles/92"), calls)
+
+        def low(tok, method, path, body=None):
+            if method in ("PUT", "DELETE"):
+                raise urllib.error.HTTPError(path, 403, "Missing Permissions", {}, None)
+            return []
+        with mock.patch("arbbot._bot_api", low):
+            note = _arbbot.set_heat_roles(self.cfg, "a", "c")
+        self.assertIn("below those roles", note)
+        card = _arbbot.recap_payload(self.cfg, date(2026, 11, 2), NOW, note, [])["embeds"][0]
+        self.assertIn("⚠️ Roles not updated: the bot's role is below", card["description"])
+        self.assertEqual(card["footer"]["text"], "21+ · only bet where legal · 1-800-GAMBLER")
+
+    def test_recap_is_due_mondays_at_10_once(self):
+        mon = datetime(2026, 11, 2, 15, 30, tzinfo=timezone.utc)     # 10:30 New York
+        self.assertEqual(_arbbot.recap_due(self.cfg, mon), date(2026, 11, 2))
+        self.assertIsNone(_arbbot.recap_due(self.cfg, datetime(2026, 11, 2, 14, 0, tzinfo=timezone.utc)))   # 9am
+        self.assertIsNone(_arbbot.recap_due(self.cfg, datetime(2026, 11, 3, 15, 30, tzinfo=timezone.utc)))  # Tue
+        _arbbot._save_state(self.dir / "state" / "recap_week.json", {"day": "2026-11-02"})
+        self.assertIsNone(_arbbot.recap_due(self.cfg, mon))
+
+    def test_free_preview_takes_three_winners_a_day_never_unsettled(self):
+        cfg = replace(self.cfg, free_webhook_url="discord://channel/4")
+        rows = [self.row(i, "win", float(i)) for i in range(1, 6)] + [self.row(9, "", "")]
+        for r in rows:
+            _arbbot.append_csv(cfg.ev_results_file, list(r), r)
+        now = datetime(2026, 10, 27, 3, tzinfo=timezone.utc)
+        wins = _arbbot.free_wins(cfg, now)
+        self.assertEqual([w["event_id"] for w in wins], ["e5", "e4", "e3"])      # the day's best three
+        self.assertEqual(_arbbot.free_wins(cfg, now), [])                       # and no more that day
