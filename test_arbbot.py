@@ -14939,3 +14939,159 @@ class NtfyPush(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Routing(unittest.TestCase):
+    """ROUTING: every card to the main feed, its sport's channel (the only copy that pings), elite and play type."""
+    CH = {"main": "100", "elite": "101", "arbs": "102", "props": "103", "lines": "104", "results": "105",
+          "boosts": "106", "free": "107"}
+    SPORTS = {"NBA": "200", "NHL": "201", "NFL": "202"}
+    ROLES = {"sport:NBA": "1", "sport:NHL": "2", "book:draftkings": "3", "tier:confident": "4", "tier:elite": "5",
+             "tier:very": "6", "tier:somewhat": "7", "tier:slight": "8", "extra:props": "9", "extra:arbs": "10"}
+
+    def setUp(self):
+        _arbbot.ROLE_CACHE.update(at=time.time(), guild="g", ids=dict(self.ROLES))
+        self.cfg = Config(routing=True, guild_id="g", discord_bot_token="t", channels=dict(self.CH),
+                          sport_channels=dict(self.SPORTS), min_ev_pct=0.1, round_stakes=0, ev_log_file="",
+                          state_dir="", one_alert_per_bet=False)
+
+    def tearDown(self):
+        _arbbot.ROLE_CACHE.update(at=0.0, guild="", ids={})
+
+    def bet(self, sport="basketball_nba", book="DraftKings", fair=0.5):
+        ev = ev_event([("Home", 1 / fair * 0.955, None), ("Away", 1 / (1 - fair) * 0.955, None)],
+                      {book: [("Home", 2.10 if fair == 0.5 else 1 / fair * 1.05, None)]})
+        ev["sport_key"] = sport
+        return find_evs([ev], Config(min_ev_pct=0.1, round_stakes=0), NOW)[0]
+
+    def test_sport_classifier(self):
+        for key, want in (("americanfootball_nfl", "NFL"), ("americanfootball_ncaaf", "NCAAF"),
+                          ("basketball_nba", "NBA"), ("basketball_ncaab", "NCAAB"), ("baseball_mlb", "MLB"),
+                          ("icehockey_nhl", "NHL"), ("soccer_epl", "SOCCER"), ("soccer_usa_mls", "SOCCER"),
+                          ("mma_mixed_martial_arts", "UFC"), ("basketball_wnba", ""), ("tennis_atp", ""),
+                          ("parlay", ""), ("", "")):
+            self.assertEqual(_arbbot.sport_of(key), want, key)
+
+    def test_roles_are_matched_by_name_without_emoji_or_spaces(self):
+        ids, missing = _arbbot.match_roles([{"id": "11", "name": "🏀 NBA"}, {"id": "12", "name": "🟢Very  Confident"},
+                                            {"id": "13", "name": "draftkings"}, {"id": "14", "name": "📋 Lineup Alerts"}])
+        self.assertEqual((ids["sport:NBA"], ids["tier:very"], ids["book:draftkings"], ids["extra:lineups"]),
+                         ("11", "12", "13", "14"))
+        self.assertIn("🏒 NHL", missing)
+        self.assertNotIn("🏀 NBA", missing)
+
+    def test_a_card_goes_to_main_and_its_sport_and_only_the_sport_copy_pings(self):
+        b = self.bet()
+        targets, pings = _arbbot.route(self.cfg, b, "")
+        self.assertEqual([c for c, _ in targets], ["100", "200"])
+        self.assertEqual([n for _, n in targets], ["main", "nba!"])
+        tier = self.ROLES["tier:" + _arbbot.TIERS[_arbbot.bet_tier(b)][3]]
+        self.assertEqual(pings, f"<@&1> <@&3> <@&{tier}>")               # @NBA @DraftKings @its tier
+        prop_targets, prop_pings = _arbbot.route(self.cfg, b, "prop")
+        self.assertEqual([c for c, _ in prop_targets], ["100", "200", "103"])   # + #player-props
+        self.assertTrue(prop_pings.endswith("<@&9>"))                    # + @Props
+        only_sport = _arbbot.route(replace(self.cfg, route_pings="sport"), b, "prop")[1]
+        self.assertEqual(only_sport, "<@&1>")                            # ROUTE_PINGS=sport
+
+    def test_elite_also_goes_to_the_elite_channel_and_unknown_sports_to_main_only(self):
+        elite = replace(self.bet(fair=0.75), confidence="high", sharp_prob=0.75)
+        self.assertTrue(_arbbot.is_elite(elite))
+        self.assertEqual([c for c, _ in _arbbot.route(self.cfg, elite, "")[0]], ["100", "200", "101"])
+        self.assertIn("<@&5>", _arbbot.route(self.cfg, elite, "")[1])      # @Elite, in the sport copy
+        tennis = self.bet(sport="tennis_atp")
+        targets, pings = _arbbot.route(self.cfg, tennis, "")
+        self.assertEqual(([c for c, _ in targets], pings), (["100"], ""))
+        no_sport_channel = _arbbot.route(replace(self.cfg, sport_channels={}), self.bet(), "")
+        self.assertEqual(([c for c, _ in no_sport_channel[0]], no_sport_channel[1]), (["100"], ""))
+
+    def test_route_send_pings_one_copy_and_edits_every_copy(self):
+        from unittest import mock
+        calls = []
+
+        def fake(url, payload, method="POST", message_id=None, max_wait=0):
+            calls.append((url, method, message_id, payload))
+            return {"id": f"m{len(calls)}"} if method == "POST" else None
+        url = _arbbot.route_url([("100", "main"), ("200", "nba!"), ("103", "props")])
+        card = {"content": "<@&1>", "embeds": [{"title": "x"}], "allowed_mentions": {"roles": ["1"]}}
+        with mock.patch("arbbot._webhook", fake):
+            mid = _arbbot.route_send(card, url)
+            self.assertEqual(mid, "100:m1|200:m2|103:m3")
+            self.assertNotIn("content", calls[0][3])                   # the main feed copy: no ping
+            self.assertEqual(calls[0][3]["allowed_mentions"], {"parse": []})
+            self.assertEqual(calls[1][3]["content"], "<@&1>")           # the sport copy pings
+            self.assertNotIn("content", calls[2][3])
+            calls.clear()
+            _arbbot.route_send({"embeds": [{"title": "❌ GONE"}]}, url, mid)
+        self.assertEqual([(u, m, i) for u, m, i, _ in calls],
+                         [("discord://channel/100", "PATCH", "m1"), ("discord://channel/200", "PATCH", "m2"),
+                          ("discord://channel/103", "PATCH", "m3")])
+
+    def test_a_moved_line_marks_every_copy_gone(self):
+        from unittest import mock
+        calls = []
+
+        def fake(url, payload, method="POST", message_id=None, max_wait=0):
+            calls.append((url, method, message_id, payload))
+            return {"id": f"m{len(calls)}"} if method == "POST" else None
+        a = EVAlerter(self.cfg, dry_run=False)
+        b = self.bet()
+        with mock.patch("arbbot._webhook", fake), mock.patch("arbbot.ntfy_push", lambda *a, **k: None):
+            a.handle([b], now=1000)
+            self.assertEqual([(u, m) for u, m, _, _ in calls], [("discord://channel/100", "POST"),
+                                                                ("discord://channel/200", "POST")])
+            tier = self.ROLES["tier:" + _arbbot.TIERS[_arbbot.bet_tier(b)][3]]
+            self.assertEqual(calls[1][3]["content"], f"<@&1> <@&3> <@&{tier}>")
+            calls.clear()
+            a.handle([], now=1100)
+        gone = [(u, m, i) for u, m, i, p in calls if "GONE" in p["embeds"][0]["title"]]
+        self.assertEqual(gone, [("discord://channel/100", "PATCH", "m1"), ("discord://channel/200", "PATCH", "m2")])
+
+    def test_channel_posts_go_out_as_the_bot(self):
+        import io
+        from unittest import mock
+        seen = {}
+
+        class Resp(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def opener(req, timeout=10):
+            seen.update(url=req.full_url, auth=req.headers.get("Authorization"), body=json.loads(req.data))
+            return Resp(b'{"id": "9"}')
+        _arbbot.BOT_AUTH["token"] = "tok"
+        try:
+            with mock.patch("urllib.request.urlopen", opener):
+                self.assertEqual(_arbbot._webhook("discord://channel/55", {"username": "Bot", "content": "hi"}),
+                                 {"id": "9"})
+        finally:
+            _arbbot.BOT_AUTH["token"] = ""
+        self.assertEqual(seen["url"], "https://discord.com/api/v10/channels/55/messages")
+        self.assertEqual((seen["auth"], seen["body"]), ("Bot tok", {"content": "hi"}))   # (no webhook username)
+
+    def test_off_or_without_a_token_it_is_the_webhooks_as_before(self):
+        self.assertFalse(replace(self.cfg, routing=False).routes())
+        self.assertFalse(replace(self.cfg, discord_bot_token="").routes())
+        a = EVAlerter(replace(self.cfg, routing=False, ev_webhook_url="https://ev"), dry_run=True)
+        self.assertEqual(a.target_for(self.bet()), "https://ev")
+        routed = self.cfg.with_channels()
+        self.assertEqual((routed.results_webhook_url, routed.boosts_webhook_url, routed.free_webhook_url),
+                         ("discord://channel/105", "discord://channel/106", "discord://channel/107"))
+        self.assertEqual(replace(self.cfg, routing=False).with_channels().results_webhook_url, "")
+
+    def test_channel_ids_load_from_the_settings(self):
+        import os
+        os.environ.update(ROUTING="true", GUILD_ID="1556001523887243277",
+                          CHANNELS="main=1556016821562376192,elite=1559346215978795008",
+                          SPORT_CHANNELS="nba=1564976110062542898")
+        try:
+            c = Config.from_env()
+        finally:
+            for k in ("ROUTING", "GUILD_ID", "CHANNELS", "SPORT_CHANNELS"):
+                os.environ.pop(k, None)
+        self.assertEqual(c.channels, {"main": "1556016821562376192", "elite": "1559346215978795008"})
+        self.assertEqual(c.sport_channels, {"NBA": "1564976110062542898"})   # (whole: no float rounding)
+        with self.assertRaises(ValueError):
+            _arbbot.parse_id_map("main=abc", "CHANNELS")

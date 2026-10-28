@@ -426,6 +426,18 @@ class Config:
     # Discord role ids by tier (TIER_ROLES=very=1,confident=2,somewhat=3,slight=4): a new bet card also pings its tier's
     # role. Members who only want the likeliest bets hold just those roles (and no book roles). Empty = off.
     tier_roles: dict = field(default_factory=dict)
+    # Channel routing (ROUTING=true; off = the webhooks as before). Every bet card goes to the main feed, its sport's
+    # channel, the elite channel when it's 💎 Elite and its play type's channel, posted by the bot (DISCORD_BOT_TOKEN)
+    # by channel id. Only the sport channel's copy pings (ROUTE_PINGS: sport, book, tier, type roles, looked up by
+    # name in GUILD_ID); a moved line marks every copy GONE. CHANNELS=main=..,elite=..,arbs=..,props=..,boosts=..,
+    # results=..,graveyard=..,weekly=..,free=..,lines=..,middles=..,freebets=..,sgps=..; SPORT_CHANNELS and
+    # LINEUP_CHANNELS: NFL=..,NCAAF=..,NBA=..,NCAAB=..,MLB=..,NHL=..,SOCCER=..,UFC=..
+    routing: bool = False
+    guild_id: str = ""
+    channels: dict = field(default_factory=dict)
+    sport_channels: dict = field(default_factory=dict)
+    lineup_channels: dict = field(default_factory=dict)
+    route_pings: str = "sport,book,tier,type"
     # With DIGEST_HOUR: a "Top 3 of the day" post first, today's three most confident bets still good (TOP3=true).
     top3: bool = False
     # The top picks' own channel: every 💎 Elite bet (+EV, props, halves: not outliers or parlays) goes there INSTEAD
@@ -796,6 +808,12 @@ class Config:
             arbs_enabled=e("ARBS_ENABLED", "true").lower() in ("1", "true", "yes"),
             book_roles=parse_book_roles(e("BOOK_ROLES", "")),
             tier_roles=parse_tier_roles(e("TIER_ROLES", "")),
+            routing=e("ROUTING", "false").lower() in ("1", "true", "yes"),
+            guild_id=e("GUILD_ID", "").strip(),
+            channels=parse_id_map(e("CHANNELS", ""), "CHANNELS", lower=True),
+            sport_channels=parse_id_map(e("SPORT_CHANNELS", ""), "SPORT_CHANNELS"),
+            lineup_channels=parse_id_map(e("LINEUP_CHANNELS", ""), "LINEUP_CHANNELS"),
+            route_pings=e("ROUTE_PINGS", "sport,book,tier,type").strip().lower(),
             top3=e("TOP3", "false").lower() in ("1", "true", "yes"),
             top3_webhook_url=e("DISCORD_TOP3_WEBHOOK_URL", ""),
             boosts_webhook_url=e("DISCORD_BOOSTS_WEBHOOK_URL", ""),
@@ -1088,6 +1106,9 @@ class Config:
         """Settings that load but probably aren't what you meant, in plain English (the bot says
         them at startup, in the console and the health channel)."""
         out = []
+        if self.routing and not (self.channels.get("main") and self.discord_bot_token and self.guild_id):
+            out.append("ROUTING=true needs CHANNELS (with main=...), DISCORD_BOT_TOKEN and GUILD_ID: cards still go "
+                       "to the webhooks until all three are set")
         if self.unit_size > 0 and not math.isclose(self.unit_size * 100, self.ev_bankroll):
             unit = _plain(self.unit_size)
             out.append(f"UNIT_SIZE={unit} but EV_BANKROLL={_plain(self.ev_bankroll)}: cards say 1u = "
@@ -1154,6 +1175,19 @@ class Config:
             prop_sides=self.prop_sides or L["prop_sides"],
         )
 
+    def routes(self) -> bool:
+        """ROUTING is on and can work: a main feed channel and the bot token to post with."""
+        return self.routing and bool(self.channels.get("main") and self.discord_bot_token)
+
+    def with_channels(self) -> "Config":
+        """ROUTING: the results, boosts and free preview posts go to CHANNELS' results / boosts / free channels."""
+        if not self.routes():
+            return self
+        ch = {k: CHANNEL_URL + v for k, v in self.channels.items()}
+        return replace(self, results_webhook_url=ch.get("results", self.results_webhook_url),
+                       boosts_webhook_url=ch.get("boosts", self.boosts_webhook_url),
+                       free_webhook_url=ch.get("free", self.free_webhook_url))
+
     def bad_webhooks(self) -> list[str]:
         """Clear any webhook setting that isn't a URL (e.g. a leftover placeholder) and name it,
         so those alerts fall back to the main channel instead of failing silently."""
@@ -1171,7 +1205,7 @@ class Config:
                           ("top3_webhook_url", "DISCORD_TOP3_WEBHOOK_URL"),
                           ("boosts_webhook_url", "DISCORD_BOOSTS_WEBHOOK_URL")):
             value = getattr(self, attr)
-            if value and not value.startswith(("https://", "http://")):
+            if value and not value.startswith(("https://", "http://", CHANNEL_URL)):
                 bad.append(env)
                 setattr(self, attr, "")
         return bad
@@ -2488,12 +2522,17 @@ def _webhook(url: str, payload: dict, method: str = "POST", message_id: str | No
     (429) is waited out up to 3 times, each wait at most max_wait seconds (0 = as long as it asks): a longer
     one returns None at once. Only a new alert's post sets max_wait (DISCORD_MAX_WAIT_SECONDS): it has a
     retry, at the next check. Edits (GONE marks, refreshes) and status messages have none, so they wait."""
-    target = f"{url}/messages/{message_id}" if message_id else f"{url}?wait=true"
+    headers = {"Content-Type": "application/json", "User-Agent": "arbbot/3.0"}
+    if url.startswith(CHANNEL_URL):   # (ROUTING: posted by the bot to a channel id, not a webhook)
+        cid = url[len(CHANNEL_URL):]
+        target = DISCORD_API + f"/channels/{cid}/messages" + (f"/{message_id}" if message_id else "")
+        payload = {k: v for k, v in payload.items() if k not in ("username", "avatar_url")}
+        headers.update({"Authorization": f"Bot {BOT_AUTH['token']}",
+                        "User-Agent": "DiscordBot (https://github.com/joeybuffo10-wq/arb-bot, 3.0)"})
+    else:
+        target = f"{url}/messages/{message_id}" if message_id else f"{url}?wait=true"
     limit = max_wait
-    req = urllib.request.Request(
-        target, data=json.dumps(payload).encode(), method=method,
-        headers={"Content-Type": "application/json", "User-Agent": "arbbot/3.0"},
-    )
+    req = urllib.request.Request(target, data=json.dumps(payload).encode(), method=method, headers=headers)
     for _ in range(3):
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
@@ -2511,6 +2550,193 @@ def _webhook(url: str, payload: dict, method: str = "POST", message_id: str | No
                 continue
             raise
     return None
+
+
+# --------------------------------------------------------------------------- channel routing (ROUTING)
+
+CHANNEL_URL = "discord://channel/"   # a "webhook URL" that is a channel id: the bot posts there itself
+ROUTE_URL = "discord://route/"       # several channels at once: "<id>!,<id>,..." ("!": the copy that pings)
+BOT_AUTH = {"token": ""}             # the bot token those posts use (set once the settings are read)
+SPORTS8 = ("NFL", "NCAAF", "NBA", "NCAAB", "MLB", "NHL", "SOCCER", "UFC")
+SPORT_OF = (("americanfootball_nfl", "NFL"), ("americanfootball_ncaaf", "NCAAF"), ("basketball_nba", "NBA"),
+            ("basketball_ncaab", "NCAAB"), ("baseball_mlb", "MLB"), ("icehockey_nhl", "NHL"), ("soccer_", "SOCCER"),
+            ("mma_mixed_martial_arts", "UFC"))
+SPORT_ROLE_NAMES = {"NFL": "🏈 NFL", "NCAAF": "🎓 NCAAF", "NBA": "🏀 NBA", "NCAAB": "🏫 NCAAB", "MLB": "⚾ MLB",
+                    "NHL": "🏒 NHL", "SOCCER": "⚽ Soccer", "UFC": "🥊 UFC"}
+BOOK_ROLE_NAMES = {"draftkings": "DraftKings", "fanduel": "FanDuel", "betmgm": "BetMGM", "caesars": "Caesars",
+                   "kalshi": "Kalshi"}
+TIER_ROLE_NAMES = {"elite": "💎 Elite", "very": "🟢 Very confident", "confident": "🔵 Confident",
+                   "somewhat": "🟡 Somewhat confident", "slight": "🟠 Slight chance"}
+EXTRA_ROLE_NAMES = {"arbs": "💸 Arbs", "props": "🎲 Props", "sgps": "🧩 SGPs", "middles": "🎯 Middles",
+                    "promos": "🚀 Promos", "lineups": "📋 Lineup Alerts", "heater": "🔥 On a Heater",
+                    "icecold": "🧊 Ice Cold"}
+# Play type -> (its channel in CHANNELS, its ping role in EXTRA_ROLE_NAMES, "" = none)
+PLAY_TYPES = {"arb": ("arbs", "arbs"), "prop": ("props", "props"), "sgp": ("sgps", "sgps"),
+              "middle": ("middles", "middles"), "line": ("lines", ""), "freebet": ("freebets", ""),
+              "boost": ("boosts", "promos")}
+
+
+def parse_id_map(text: str, key: str, lower: bool = False) -> dict[str, str]:
+    """"main=1556...,elite=1559...": {name: id} (ids stay strings: they're too long for a float)."""
+    out = {}
+    for x in (text or "").replace(";", ",").split(","):
+        if not x.strip():
+            continue
+        k, sep, v = x.partition("=")
+        if not sep or not k.strip() or not v.strip().isdigit():
+            raise ValueError(f"{key}: '{x.strip()}' should look like name=channel id")
+        out[k.strip().lower() if lower else k.strip().upper()] = v.strip()
+    return out
+
+
+def sport_of(sport_key: str) -> str:
+    """One of SPORTS8 for an odds feed league key ("" = none of them: such alerts go to the main feed only)."""
+    return next((name for prefix, name in SPORT_OF if (sport_key or "").startswith(prefix)), "")
+
+
+def role_key(name: str) -> str:
+    """A role name for matching: emoji, spaces and punctuation gone, lowercase ("🟢 Very confident" -> "veryconfident")."""
+    return "".join(c for c in unicodedata.normalize("NFKD", name or "") if c.isascii() and c.isalnum()).lower()
+
+
+ROLE_CACHE: dict = {"at": 0.0, "ids": {}, "guild": ""}   # {"sport:NBA" / "book:fanduel" / "tier:elite" / ...: id}
+ROLE_REFRESH = 3600
+
+
+def wanted_roles() -> dict[str, str]:
+    """{our key: the role's name in the server} for every role routing uses."""
+    return {**{f"sport:{k}": v for k, v in SPORT_ROLE_NAMES.items()},
+            **{f"book:{k}": v for k, v in BOOK_ROLE_NAMES.items()},
+            **{f"tier:{k}": v for k, v in TIER_ROLE_NAMES.items()},
+            **{f"extra:{k}": v for k, v in EXTRA_ROLE_NAMES.items()}}
+
+
+def match_roles(guild_roles: list[dict]) -> tuple[dict[str, str], list[str]]:
+    """Our keys -> role ids, from the server's roles by name (emoji and spaces stripped); and the names not found."""
+    by_name = {role_key(r.get("name", "")): r["id"] for r in guild_roles}
+    ids, missing = {}, []
+    for key, name in wanted_roles().items():
+        if role_key(name) in by_name:
+            ids[key] = by_name[role_key(name)]
+        else:
+            missing.append(name)
+    return ids, missing
+
+
+def route_roles(cfg: "Config", now: float | None = None) -> dict[str, str]:
+    """The server's role ids (match_roles), looked up with the bot token and kept for ROLE_REFRESH seconds. A missing
+    role is warned about once per lookup; BOOK_ROLES / TIER_ROLES fill in a book or tier not found by name."""
+    now = time.time() if now is None else now
+    if ROLE_CACHE["guild"] != cfg.guild_id or now - ROLE_CACHE["at"] > ROLE_REFRESH:
+        ROLE_CACHE.update(at=now, guild=cfg.guild_id)
+        if cfg.guild_id and cfg.discord_bot_token:
+            try:
+                ids, missing = match_roles(_bot_api(cfg.discord_bot_token, "GET", f"/guilds/{cfg.guild_id}/roles") or [])
+                ROLE_CACHE["ids"] = ids
+                if missing:
+                    print(f"  ! Routing: no role named {', '.join(missing)} in the server (those pings are skipped)",
+                          file=sys.stderr, flush=True)
+            except (urllib.error.HTTPError, OSError) as e:
+                print(f"  ! Routing: couldn't read the server's roles ({e!r:.80}); using the last ones",
+                      file=sys.stderr, flush=True)
+    ids = dict(ROLE_CACHE["ids"])
+    for slug, rid in cfg.book_roles.items():
+        ids.setdefault(f"book:{slug}", rid)
+    for tier, rid in cfg.tier_roles.items():
+        ids.setdefault(f"tier:{tier}", rid)
+    return ids
+
+
+def play_type(item, props: bool = False) -> str:
+    """The alert's play type (PLAY_TYPES; "" = only the main feed and its sport's channel)."""
+    if isinstance(item, Arb):
+        return "arb"
+    if getattr(item, "outlier", False):
+        return "line"
+    if props and getattr(item, "player", ""):
+        return "prop"
+    return ""
+
+
+def route(cfg: "Config", item, kind: str, roles: dict[str, str] | None = None) -> tuple[list[tuple[str, str]], str]:
+    """Where a new card goes: [(channel id, name)], the copy that pings marked "!" in its name, and that copy's pings.
+    The main feed always; its sport's channel (with the pings: sport, book, tier and play-type roles, ROUTE_PINGS);
+    the elite channel when it's 💎 Elite; its play type's channel. A sport we don't know: the main feed only."""
+    roles = route_roles(cfg) if roles is None else roles
+    want = set(_csv(cfg.route_pings))
+    out: list[tuple[str, str]] = []
+
+    def add(cid: str, name: str) -> None:
+        if cid and cid not in {c for c, _ in out}:
+            out.append((cid, name))
+
+    add(cfg.channels.get("main", ""), "main")
+    sport = sport_of(getattr(item, "sport_key", ""))
+    pings = []
+    if sport and cfg.sport_channels.get(sport):
+        add(cfg.sport_channels[sport], f"{sport.lower()}!")
+        book = book_slug(getattr(item, "book", "") or "")
+        tier = TIERS[bet_tier(item)][3] if getattr(item, "fair_prob", 0) > 0 and not isinstance(item, Arb) else ""
+        extra = PLAY_TYPES.get(kind, ("", ""))[1]
+        for what, key in (("sport", f"sport:{sport}"), ("book", f"book:{book}"), ("tier", f"tier:{tier}"),
+                          ("type", f"extra:{extra}")):
+            if what in want and roles.get(key):
+                pings.append(f"<@&{roles[key]}>")
+    if not isinstance(item, Arb) and getattr(item, "fair_prob", 0) > 0 and is_elite(item):
+        add(cfg.channels.get("elite", ""), "elite")
+    if kind in PLAY_TYPES:
+        add(cfg.channels.get(PLAY_TYPES[kind][0], ""), PLAY_TYPES[kind][0])
+    return out, " ".join(dict.fromkeys(pings))
+
+
+def route_url(targets: list[tuple[str, str]]) -> str:
+    return ROUTE_URL + ",".join(cid + ("!" if name.endswith("!") else "") for cid, name in targets)
+
+
+def route_targets(url: str) -> list[tuple[str, bool]]:
+    """[(channel id, pings?)] of a ROUTE_URL."""
+    return [(x.rstrip("!"), x.endswith("!")) for x in url[len(ROUTE_URL):].split(",") if x]
+
+
+def quiet_copy(payload: dict) -> dict:
+    """The same card without its pings (every copy but the sport channel's)."""
+    return {**{k: v for k, v in payload.items() if k != "content"}, "allowed_mentions": {"parse": []}}
+
+
+def route_send(payload: dict, url: str, message_id: str | None = None, max_wait: float = 0) -> str | None:
+    """Post a card to every channel of a ROUTE_URL (only the "!" copy keeps its pings), or edit every copy
+    (message_id "channel:message|..."; edits never ping). Returns the copies' ids that way, None if none went out."""
+    if message_id:
+        for pair in message_id.split("|"):
+            cid, _, mid = pair.partition(":")
+            try:
+                _webhook(CHANNEL_URL + cid, quiet_copy(payload), "PATCH", mid)
+            except urllib.error.HTTPError as e:
+                if e.code != 404:   # (a copy someone deleted: the others still get the edit)
+                    raise
+        return message_id
+    done = []
+    for i, (cid, ping) in enumerate(route_targets(url)):
+        try:
+            msg = _webhook(CHANNEL_URL + cid, payload if ping else quiet_copy(payload), max_wait=max_wait)
+        except Exception:   # noqa: BLE001
+            if not done and i == 0:
+                raise   # (the main feed's copy: as for one webhook, the caller decides about a retry)
+            print(f"  ! Discord: a copy for channel {cid} didn't go out", file=sys.stderr, flush=True)
+            continue
+        if msg and msg.get("id"):
+            done.append(f"{cid}:{msg['id']}")
+    return "|".join(done) or None
+
+
+def route_preview(targets: list[tuple[str, str]], pings: str, roles: dict[str, str]) -> str:
+    """Where a card would go, for --dry-run: "→ #main · #nba (pings @🏀 NBA @FanDuel) · #props"."""
+    names = {rid: wanted_roles().get(key, key) for key, rid in roles.items()}
+    label = {"main": "ev-bets", "elite": "elite-bets", "props": "player-props", "lines": "line-discrepancies",
+             "boosts": "boosts-promos", "freebets": "free-bet-plays"}
+    shown = re.sub(r"<@&(\d+)>", lambda m: "@" + names.get(m.group(1), m.group(1)), pings)
+    return "  → " + " · ".join(f"#{label.get(name.rstrip('!'), name.rstrip('!'))}"
+                               + (f" (pings {shown})" if name.endswith("!") and pings else "") for _, name in targets)
 
 
 # Webhooks Discord refused a new card on (webhook URL -> HTTP code), for the main loop to report (discord_trouble).
@@ -2849,7 +3075,7 @@ class Alerter:
         self.props = props   # player props' +EV and outlier cards: DISCORD_PROPS_WEBHOOK_URL when it's set
         if noun:
             self.noun = noun  # before loading state: it names the state file
-        self.dry_run = dry_run or not cfg.webhook_url
+        self.dry_run = dry_run or not (cfg.webhook_url or cfg.routes())
         self.open: dict[str, OpenArb] = {}
         self.restored: dict[str, dict] = {}
         self.started = time.time()
@@ -2990,9 +3216,28 @@ class Alerter:
     def mention(self) -> str:
         return self.cfg.discord_mention
 
+    def route_kind(self, item) -> str:
+        """Its play type for ROUTING (PLAY_TYPES): arbs, props; outliers say "line"; others ""."""
+        return play_type(item, self.props)
+
+    def routing(self) -> bool:
+        return self.cfg.routes()
+
+    def target_for(self, item) -> str:
+        """Where a new card for this item goes: ROUTING's channels (route), else its webhook as before."""
+        if self.routing():
+            targets, _ = route(self.cfg, item, self.route_kind(item))
+            if self.dry_run:
+                pings = route(self.cfg, item, self.route_kind(item))[1]
+                print(route_preview(targets, pings, route_roles(self.cfg)), flush=True)
+            return route_url(targets)
+        return self.webhook_for(item)
+
     def mention_for(self, item) -> str:
-        """Who a new card for this item pings: its book's role (BOOK_ROLES; nobody when its book has none),
-        or else this alert type's mention."""
+        """Who a new card for this item pings: with ROUTING, the sport channel copy's roles (route); else its book's
+        role (BOOK_ROLES; nobody when its book has none), or else this alert type's mention."""
+        if self.routing():
+            return route(self.cfg, item, self.route_kind(item))[1]
         if self.book_pings and (self.cfg.book_roles or self.cfg.tier_roles):
             pings = [book_role_mention(self.cfg, getattr(item, "book", "")) if self.cfg.book_roles else ""]
             if self.cfg.tier_roles and getattr(item, "fair_prob", 0) > 0:   # (and its tier's role: TIER_ROLES)
@@ -3136,6 +3381,12 @@ class Alerter:
             return None
         url = url or self.cfg.webhook_url
         try:
+            if url.startswith(ROUTE_URL):   # (ROUTING: every copy of the card at once)
+                msg_id = route_send(payload, url, message_id, max_wait=0 if message_id else self.cfg.discord_max_wait_seconds)
+                self.send_retryable = not message_id and not msg_id
+                if msg_id and not message_id and payload.get("content"):
+                    ntfy_push(self.cfg, payload)
+                return msg_id or message_id
             if message_id:   # (an edit has no retry: a long "slow down" is waited out, as for status messages)
                 _webhook(url, payload, "PATCH", message_id)
                 return message_id
@@ -3252,7 +3503,7 @@ class Alerter:
                 # (A handed-over bet whose other card went out was logged and followed then.)
                 op = OpenArb(arb, first, now, self.value(arb),
                              alerted_pct=self.value(arb) if jumped else last_pct,
-                             url=self.webhook_for(arb), checks=found[1] if found else 1,
+                             url=self.target_for(arb), checks=found[1] if found else 1,
                              spotted=found[0] if found else first, quiet=quiet,
                              sent=handed is not None and arb.key not in self.handed_unsent,
                              pinged_pct=last_pct, slots=tuple(self._slots) if handed is None else (),
@@ -6117,6 +6368,9 @@ class OutlierAlerter(EVAlerter):
     def mention(self) -> str:
         return self.cfg.outlier_mention
 
+    def route_kind(self, item) -> str:
+        return "line"
+
     def log_path(self) -> str:
         return self.cfg.outlier_log_file
 
@@ -8157,6 +8411,9 @@ class BetReactions:
 
     def channel(self, webhook: str) -> str:
         """The channel a webhook posts in (asked once: a webhook's own URL says, no token needed)."""
+        if webhook.startswith(CHANNEL_URL):   # (ROUTING: the bot posted it to that channel itself)
+            self.guilds.setdefault(webhook, self.cfg.guild_id)
+            return webhook[len(CHANNEL_URL):]
         if webhook not in self.channels:
             req = urllib.request.Request(webhook, headers={"User-Agent": "arbbot/3.0"})
             with urllib.request.urlopen(req, timeout=10) as resp:
@@ -8165,8 +8422,13 @@ class BetReactions:
         return self.channels[webhook]
 
     def add(self, row: dict, message_id: str, webhook: str) -> None:
-        """A bet card went up: put the ✅ under it and start reading it."""
+        """A bet card went up: put the ✅ under it and start reading it (ROUTING: every copy of it)."""
         if not self.on:
+            return
+        if webhook.startswith(ROUTE_URL):
+            for pair in message_id.split("|"):
+                cid, _, mid = pair.partition(":")
+                self.add(row, mid, CHANNEL_URL + cid)
             return
         channel = self.channel(webhook)
         self.messages[message_id] = {"bet": row_bet_id(row), "channel": channel,
@@ -8770,8 +9032,11 @@ def send_boosts(cfg: Config, pool: BoostPool, day: date, now: datetime) -> int:
             embeds.append({"title": f"🚀 {title} profit boosts · {day:%a %b %-d}", "color": 0x1493FF if book == "fanduel" else 0x53D337,
                            "description": "\n".join(lines).replace("**1.** ", "")[:4000]})
     if embeds:
-        _webhook(cfg.boosts_webhook_url, {"username": BOT_NAME, "embeds": embeds, "allowed_mentions": {"parse": []},
-                                          "content": "Got a profit boost? These turn it into the most expected value right now. "
+        promos = route_roles(cfg).get("extra:promos", "") if cfg.routes() else ""   # (ROUTING: pings @Promos)
+        _webhook(cfg.boosts_webhook_url, {"username": BOT_NAME, "embeds": embeds,
+                                          "allowed_mentions": {"parse": [], "roles": [promos] if promos else []},
+                                          "content": (f"<@&{promos}> " if promos else "")
+                                                     + "Got a profit boost? These turn it into the most expected value right now. "
                                                      "Your own boost size: `!boost 50 fanduel` in #units. 21+."})
     marker = _day_marker(cfg, "boosts_day.txt")
     if marker:
@@ -13140,6 +13405,8 @@ def main() -> None:
     global ODDS_FORMAT, PROP_GRADING
     ODDS_FORMAT = cfg.odds_format
     PROP_GRADING = cfg.prop_grading != "off"
+    BOT_AUTH["token"] = cfg.discord_bot_token   # (ROUTING: channel posts go out as the bot)
+    cfg = cfg.with_channels()
 
     if args.check_props:
         check_props(cfg)
